@@ -1,0 +1,32 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# Built binaries: the bot (and any copy of it) and the C helpers in utils/
+/ircbot
+/ircbot.rs
+utils/bot-auth
+utils/keygen
+utils/encrypt_config
+utils/decrypt_config
+*.o
+
+# Runtime state, logs and secrets
+*.log
+*.b64
+.ircbot
+.ircbot.cnf
+.ircbot.cnf.tmp
+.ircbot.log
+.ircbot.pid
+.ircbot.pass
+upgrade.sh
+bot_build_tmp/
+
+# Local tooling and notes
+.claude
+CLAUDE.md
+compile_commands.json
+docs/*
+releases/
