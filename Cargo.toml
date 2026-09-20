@@ -1,35 +1,58 @@
 [package]
 name = "ircbot"
 version = "2.3.0"
-edition = "2021"
+edition = "2024"
 rust-version = "1.89"
 description = "IRC bot with an encrypted hub mesh (safe-Rust port of ircbot.c)"
 license = "MIT"
+publish = false
 
 [dependencies]
 # Cryptography (RustCrypto + dalek): AES-256-GCM, HKDF/PBKDF2-SHA256,
 # Ed25519 signatures and X25519 key agreement.
-aes-gcm = "0.10"
-ed25519-dalek = "2.1"
-x25519-dalek = { version = "2.0", features = ["static_secrets"] }
-hkdf = "0.12"
-pbkdf2 = "0.12"
-sha2 = "0.10"
-getrandom = "0.3"
-zeroize = "1.8"
-base64 = "0.22"
+aes-gcm = "0.11"
+ed25519-dalek = "3.0"
+x25519-dalek = { version = "3.0", features = ["static_secrets"] }
+hkdf = "0.13"
+pbkdf2 = "0.13"
+sha2 = "0.11"
+getrandom = "0.4"
+zeroize = "1.9"
+base64 = "0.23"
 
 # Networking: poll loop, sockets (VHOST bind), TLS, HTTPS for the updater.
+# rustls runs on the graviola provider: pure Rust with Rust-level asm, no C
+# and no cc(1) at build time, so the self-updater's rebuild needs only rustc.
+# graviola is x86_64/aarch64 only and asserts on its required CPU features.
 mio = { version = "1", features = ["os-poll", "net"] }
 socket2 = "0.6"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-ureq = "3"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-graviola = "0.4"
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots", "gzip"] }
 
 # OS integration through safe wrappers.
-nix = { version = "0.30", features = ["user", "fs", "process", "term", "resource", "feature"] }
-region = "3"
-signal-hook = "0.3"
+nix = { version = "0.31", features = ["user", "fs", "process", "term", "resource", "feature"] }
+region = "4"
+signal-hook = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[lints.clippy]
+# Forgetting a Zeroizing/Locked value skips its wipe.
+mem_forget = "deny"
+
 [profile.release]
-opt-level = 2
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# Keep unwinding: secret wiping is Drop-based (Zeroizing, Locked's mlock
+# guard) and panic = "abort" runs no destructors.  Core dumps are already
+# off via RLIMIT_CORE 0 + set_dumpable(false) in harden_process().
+panic = "unwind"
+# Drops DWARF but keeps the symbol table, so a field backtrace stays readable.
+strip = "debuginfo"
+# A wraparound on hostile input becomes a controlled [FATAL], not a bad index.
+overflow-checks = true

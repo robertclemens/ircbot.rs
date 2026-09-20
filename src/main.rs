@@ -269,7 +269,7 @@ fn run_config_wizard() -> io::Result<()> {
             if state.target_nick.contains('|') {
                 println!("ERROR: Nick cannot contain '|' (reserved as protocol delimiter).");
             } else if !is_valid_bot_nick(&state.target_nick) {
-                println!("ERROR: Invalid nick length (1-{} characters).", MAX_NICK - 1);
+            println!("ERROR: Invalid nick length (1-{} characters).", MAX_NICK - 1);
             } else {
                 println!("ERROR: Not a valid IRC nick: start with a letter or one of []\\`_^{{}}, then letters, digits, those or '-'.");
             }
@@ -418,8 +418,8 @@ fn run_config_wizard() -> io::Result<()> {
             println!("Mode: HUB-MANAGED ({} hub{})", state.hubs.len(), if state.hubs.len() == 1 { "" } else { "s" });
             println!("Admins/channels: managed on the hub");
         } else if let Some((name, key, masks)) = &admin {
-            println!("Mode: STANDALONE");
-            println!("Admin: {} ({} usermask{})", name, masks.len(), if masks.len() == 1 { "" } else { "s" });
+        println!("Mode: STANDALONE");
+        println!("Admin: {} ({} usermask{})", name, masks.len(), if masks.len() == 1 { "" } else { "s" });
             if let Some(raw) = crypto::pubkey_b64_decode(key) {
                 println!("Admin key: {}", crypto::key_fingerprint(&raw));
             }
@@ -434,33 +434,31 @@ fn run_config_wizard() -> io::Result<()> {
 
     // Standalone only: the hub is authoritative for a|/m| records and would
     // replace them on the first sync.
-    if !hub_managed {
-        if let Some((name, key, masks)) = admin {
-            let uuid = crypto::gen_uuid_v4().unwrap_or_default();
-            let t = now();
-            state.user_records.push(UserRecord {
-                uuid: uuid.clone(),
-                name,
-                has_pubkey: !key.is_empty(),
-                pubkey_b64: key,
-                typ: 'a',
-                is_active: true,
-                timestamp: t,
-                ..UserRecord::default()
-            });
-            for m in masks.into_iter().take(MAX_USER_MASKS) {
-                state.mask_records.push(MaskRecord { uuid: uuid.clone(), mask: m, is_active: true, last_used: 0, timestamp: t });
-            }
+    if !hub_managed
+        && let Some((name, key, masks)) = admin {
+        let uuid = crypto::gen_uuid_v4().unwrap_or_default();
+        let t = now();
+        state.user_records.push(UserRecord {
+            uuid: uuid.clone(),
+            name,
+            has_pubkey: !key.is_empty(),
+            pubkey_b64: key,
+            typ: 'a',
+            is_active: true,
+            timestamp: t,
+            ..UserRecord::default()
+        });
+        for m in masks.into_iter().take(MAX_USER_MASKS) {
+            state.mask_records.push(MaskRecord { uuid: uuid.clone(), mask: m, is_active: true, last_used: 0, timestamp: t });
         }
     }
     state.server_list.push(server);
-    if !chan.is_empty() {
-        if let Some(ci) = channel::add(&mut state, &chan) {
-            let c = &mut state.chans[ci];
-            c.is_managed = true;
-            c.timestamp = now();
-            c.status = ChanStatus::Out;
-        }
+    if !chan.is_empty()
+        && let Some(ci) = channel::add(&mut state, &chan) {
+        let c = &mut state.chans[ci];
+        c.is_managed = true;
+        c.timestamp = now();
+        c.status = ChanStatus::Out;
     }
 
     println!("\n--- Finalizing Configuration ---");

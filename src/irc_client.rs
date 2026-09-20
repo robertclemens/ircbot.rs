@@ -166,7 +166,10 @@ impl ServerCertVerifier for AcceptAnyCert {
 fn tls_config() -> Option<Arc<ClientConfig>> {
     static CFG: OnceLock<Option<Arc<ClientConfig>>> = OnceLock::new();
     CFG.get_or_init(|| {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        // Also the process default, which is what ureq's rustls-no-provider
+        // build reads for the updater's HTTPS fetches.
+        let _ = rustls_graviola::default_provider().install_default();
+        let provider = Arc::new(rustls_graviola::default_provider());
         let cfg = ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
             .ok()?
@@ -332,11 +335,11 @@ pub fn fmt_secs(s: i64) -> String {
     if s >= 86400 {
         format!("{}d{}h", s / 86400, (s % 86400) / 3600)
     } else if s >= 3600 {
-        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
+    format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
     } else if s >= 60 && s % 60 != 0 {
-        format!("{}m{:02}s", s / 60, s % 60)
+    format!("{}m{:02}s", s / 60, s % 60)
     } else if s >= 60 {
-        format!("{}m", s / 60)
+    format!("{}m", s / 60)
     } else {
         format!("{s}s")
     }
@@ -366,56 +369,55 @@ fn apply_refusal(state: &mut BotState) {
         return;
     }
     let (kind, stated) = refusal_classify(&state.irc_refusal, state.irc_refusal_ban);
-    if let Some(idx) = state.irc_server_idx.filter(|&i| i < state.server_list.len()) {
-        if kind != ServerBlockKind::None {
-            let now = now();
-            let b = &mut state.server_blocks[idx];
-            if b.strikes < 32 {
-                b.strikes += 1;
+    if let Some(idx) = state.irc_server_idx.filter(|&i| i < state.server_list.len())
+        && kind != ServerBlockKind::None {
+        let now = now();
+        let b = &mut state.server_blocks[idx];
+        if b.strikes < 32 {
+            b.strikes += 1;
+        }
+        let hold = match kind {
+            ServerBlockKind::Throttled => refusal_backoff(IRC_THROTTLE_BACKOFF, b.strikes, IRC_THROTTLE_BACKOFF_MAX),
+            ServerBlockKind::Banned => refusal_backoff(IRC_BAN_BACKOFF, b.strikes, IRC_BAN_BACKOFF_MAX),
+            ServerBlockKind::BannedTemp => {
+                // Honour the stated length, but never redial faster than
+                // a throttle would.
+                let floor = refusal_backoff(IRC_THROTTLE_BACKOFF, b.strikes, IRC_BAN_BACKOFF_MAX);
+                (stated + IRC_BAN_GRACE).max(floor)
             }
-            let hold = match kind {
-                ServerBlockKind::Throttled => refusal_backoff(IRC_THROTTLE_BACKOFF, b.strikes, IRC_THROTTLE_BACKOFF_MAX),
-                ServerBlockKind::Banned => refusal_backoff(IRC_BAN_BACKOFF, b.strikes, IRC_BAN_BACKOFF_MAX),
-                ServerBlockKind::BannedTemp => {
-                    // Honour the stated length, but never redial faster than
-                    // a throttle would.
-                    let floor = refusal_backoff(IRC_THROTTLE_BACKOFF, b.strikes, IRC_BAN_BACKOFF_MAX);
-                    (stated + IRC_BAN_GRACE).max(floor)
-                }
-                _ => 0,
-            };
-            b.kind = kind;
-            b.until = if kind == ServerBlockKind::BannedPerm { 0 } else { now + hold };
-            b.reason = state.irc_refusal.clone();
-            let strikes = b.strikes;
-            let srv = state.server_list[idx].clone();
-            match kind {
-                ServerBlockKind::BannedPerm => logm!(
-                    state,
-                    L_INFO,
-                    "[BAN] {}: PERMANENT ban - will not reconnect to it until restart, 'jump {}', or re-adding it.\n",
-                    srv,
-                    srv
-                ),
-                ServerBlockKind::BannedTemp => logm!(
-                    state,
-                    L_INFO,
-                    "[BAN] {}: temporary ban, server says {} - holding {} (strike {}).\n",
-                    srv,
-                    fmt_secs(stated),
-                    fmt_secs(hold),
-                    strikes
-                ),
-                _ => logm!(
-                    state,
-                    L_INFO,
-                    "[BAN] {}: {} - holding {} (strike {}).\n",
-                    srv,
-                    if kind == ServerBlockKind::Throttled { "throttled" } else { "banned, no length given" },
-                    fmt_secs(hold),
-                    strikes
-                ),
-            }
+            _ => 0,
+        };
+        b.kind = kind;
+        b.until = if kind == ServerBlockKind::BannedPerm { 0 } else { now + hold };
+        b.reason = state.irc_refusal.clone();
+        let strikes = b.strikes;
+        let srv = state.server_list[idx].clone();
+        match kind {
+            ServerBlockKind::BannedPerm => logm!(
+                state,
+                L_INFO,
+                "[BAN] {}: PERMANENT ban - will not reconnect to it until restart, 'jump {}', or re-adding it.\n",
+                srv,
+                srv
+            ),
+            ServerBlockKind::BannedTemp => logm!(
+                state,
+                L_INFO,
+                "[BAN] {}: temporary ban, server says {} - holding {} (strike {}).\n",
+                srv,
+                fmt_secs(stated),
+                fmt_secs(hold),
+                strikes
+            ),
+            _ => logm!(
+                state,
+                L_INFO,
+                "[BAN] {}: {} - holding {} (strike {}).\n",
+                srv,
+                if kind == ServerBlockKind::Throttled { "throttled" } else { "banned, no length given" },
+                fmt_secs(hold),
+                strikes
+            ),
         }
     }
     state.irc_refusal.clear();
@@ -535,9 +537,9 @@ pub fn disconnect(state: &mut BotState) {
 fn is_single_line(line: &str) -> bool {
     let b = line.as_bytes();
     b.len() >= 2
-        && b[b.len() - 2] == b'\r'
-        && b[b.len() - 1] == b'\n'
-        && !b[..b.len() - 2].iter().any(|&c| c == b'\r' || c == b'\n' || c == 0)
+            && b[b.len() - 2] == b'\r'
+            && b[b.len() - 1] == b'\n'
+            && !b[..b.len() - 2].iter().any(|&c| c == b'\r' || c == b'\n' || c == 0)
 }
 
 /// irc_printf(): send one formatted line ("...\r\n").  One command per call,
@@ -556,10 +558,9 @@ pub fn irc_printf(state: &mut BotState, line: &str) -> i32 {
         );
         return -1;
     }
-    if state.a2r.active {
-        if let Some(r) = a2r_seal_reply(state, line) {
-            return r;
-        }
+    if state.a2r.active
+        && let Some(r) = a2r_seal_reply(state, line) {
+        return r;
     }
     send_line(state, line)
 }
@@ -580,33 +581,33 @@ fn a2r_seal_reply(state: &mut BotState, line: &str) -> Option<i32> {
     let verb = if line.starts_with("PRIVMSG ") {
         "PRIVMSG"
     } else if line.starts_with("NOTICE ") {
-        "NOTICE"
-    } else {
-        return None;
-    };
-    let lb = line.as_bytes();
-    let vl = verb.len() + 1;
-    let nick = state.a2r.nick.clone();
-    let nl = nick.len();
-    let head = vl + nl + 2;
-    if lb.len() < head + 2 || &lb[vl..vl + nl] != nick.as_bytes() || &lb[vl + nl..vl + nl + 2] != b" :" {
-        return None;
-    }
-    let text = &lb[head..lb.len() - 2];
-    if text.first() == Some(&0x01) {
-        return None;
-    }
-    let tlen = text.len();
-    let mut ret;
-    let mut off = 0usize;
-    loop {
-        let mut cut = tlen - off;
-        if cut > A2R_TEXT_MAX {
-            cut = A2R_TEXT_MAX;
-            while cut > 1 && (text[off + cut] & 0xC0) == 0x80 {
-                cut -= 1;
-            }
+    "NOTICE"
+} else {
+    return None;
+};
+let lb = line.as_bytes();
+let vl = verb.len() + 1;
+let nick = state.a2r.nick.clone();
+let nl = nick.len();
+let head = vl + nl + 2;
+if lb.len() < head + 2 || &lb[vl..vl + nl] != nick.as_bytes() || &lb[vl + nl..vl + nl + 2] != b" :" {
+    return None;
+}
+let text = &lb[head..lb.len() - 2];
+if text.first() == Some(&0x01) {
+    return None;
+}
+let tlen = text.len();
+let mut ret;
+let mut off = 0usize;
+loop {
+    let mut cut = tlen - off;
+    if cut > A2R_TEXT_MAX {
+        cut = A2R_TEXT_MAX;
+        while cut > 1 && (text[off + cut] & 0xC0) == 0x80 {
+            cut -= 1;
         }
+    }
         let more = if off + cut < tlen { 1 } else { 0 };
         let mut pt = zeroize::Zeroizing::new(format!("{}:{}:", state.a2r.seq, more).into_bytes());
         let frame = if pt.len() + cut <= A2R_PT_MAX {
@@ -718,10 +719,9 @@ pub fn connect(state: &mut BotState) {
         logm!(state, L_INFO, "[INFO] Attempting to connect to {}:{}...\n", host, port);
         let Ok(addrs) = net::resolve(host, port) else { continue };
         for addr in addrs {
-            if let Some(v) = vhost {
-                if v.is_ipv4() != addr.is_ipv4() {
-                    continue;
-                }
+            if let Some(v) = vhost
+                && v.is_ipv4() != addr.is_ipv4() {
+                continue;
             }
             let sock = match net::new_socket(&addr, vhost) {
                 Ok(s) => s,

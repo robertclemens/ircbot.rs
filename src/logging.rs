@@ -59,13 +59,12 @@ impl Logger {
         let full = format!("[{time_buf}] {clean}");
         let full = trunc(&full, MAX_LOG_LINE_LEN).to_string();
 
-        if let Some(i) = level_index(flag) {
-            if let Ok(mut rings) = self.rings.try_borrow_mut() {
-                let r = &mut rings[i];
-                let at = r.idx;
-                r.entries[at] = full.clone();
-                r.idx = (at + 1) % LOG_BUFFER_LINES;
-            }
+        if let Some(i) = level_index(flag)
+            && let Ok(mut rings) = self.rings.try_borrow_mut() {
+            let r = &mut rings[i];
+            let at = r.idx;
+            r.entries[at] = full.clone();
+            r.idx = (at + 1) % LOG_BUFFER_LINES;
         }
 
         if self.level & flag == 0 {
@@ -73,12 +72,10 @@ impl Logger {
         }
 
         // Past the size cap the file is truncated rather than left to grow.
-        if let Ok(md) = std::fs::metadata(LOGFILE) {
-            if md.len() >= BOT_LOG_FILE_SIZE {
-                if let Ok(mut f) = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(LOGFILE) {
-                    let _ = writeln!(f, "[{time_buf}] Log file truncated (size limit reached)");
-                }
-            }
+        if let Ok(md) = std::fs::metadata(LOGFILE)
+            && md.len() >= BOT_LOG_FILE_SIZE
+            && let Ok(mut f) = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(LOGFILE) {
+            let _ = writeln!(f, "[{time_buf}] Log file truncated (size limit reached)");
         }
         match OpenOptions::new().append(true).create(true).mode(0o600).open(LOGFILE) {
             Ok(mut f) => {

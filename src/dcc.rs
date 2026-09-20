@@ -91,10 +91,9 @@ fn queue(s: &mut DccSession, text: &[u8]) {
 }
 
 fn flush(s: &mut DccSession) {
-    if let Some(sock) = s.sock.as_mut() {
-        if net::flush(sock, &mut s.outbuf).is_err() {
-            s.failed = true;
-        }
+    if let Some(sock) = s.sock.as_mut()
+        && net::flush(sock, &mut s.outbuf).is_err() {
+        s.failed = true;
     }
 }
 
@@ -222,11 +221,11 @@ fn parse_addr(a: &str, port: u16) -> Option<SocketAddr> {
         let v: u64 = a.parse().ok()?;
         IpAddr::V4(Ipv4Addr::from(u32::try_from(v).ok()?))
     } else if a.contains(':') {
-        let v6: Ipv6Addr = a.parse().ok()?;
-        match v6.to_ipv4_mapped() {
-            Some(v4) => IpAddr::V4(v4),
-            None => IpAddr::V6(v6),
-        }
+    let v6: Ipv6Addr = a.parse().ok()?;
+    match v6.to_ipv4_mapped() {
+        Some(v4) => IpAddr::V4(v4),
+        None => IpAddr::V6(v6),
+    }
     } else {
         IpAddr::V4(a.parse::<Ipv4Addr>().ok()?)
     };
@@ -490,9 +489,9 @@ pub fn check_timeouts(state: &mut BotState) {
         if s.phase == DccPhase::Open && s.failed {
             close(state, i, None);
         } else if s.phase == DccPhase::Offered && now - s.phase_since > DCC_OFFER_TIMEOUT {
-            give_up(state, i, "your client did not answer the offer in time.");
-        } else if s.phase == DccPhase::Connecting && now - s.phase_since > DCC_CONNECT_TIMEOUT {
-            let why = format!("connecting to {} timed out. Check that your firewall lets that port in.", s.peer);
+        give_up(state, i, "your client did not answer the offer in time.");
+    } else if s.phase == DccPhase::Connecting && now - s.phase_since > DCC_CONNECT_TIMEOUT {
+    let why = format!("connecting to {} timed out. Check that your firewall lets that port in.", s.peer);
             give_up(state, i, &why);
         } else if s.phase == DccPhase::Open && now - s.last_active > DCC_IDLE_TIMEOUT {
             close(state, i, Some("Idle limit reached; closing."));

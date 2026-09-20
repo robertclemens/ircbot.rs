@@ -74,8 +74,8 @@ fn handle_mode_change(state: &mut BotState, channel: &str, modes: &str, args: &s
                             }
                         }
                     } else if let Some(r) = state.chans[ci].roster.iter_mut().find(|r| eq_ic(&r.nick, arg)) {
-                        r.is_op = adding;
-                        logm!(state, L_DEBUG, "[DEBUG] Roster update: {} is_op={} in {}\n", arg, adding as i32, channel);
+                    r.is_op = adding;
+                    logm!(state, L_DEBUG, "[DEBUG] Roster update: {} is_op={} in {}\n", arg, adding as i32, channel);
                     }
                 }
                 current_arg = toks.next(" ");
@@ -182,10 +182,9 @@ pub fn handle_line(state: &mut BotState, line: &str) {
         state.pong_pending = false;
         return;
     }
-    if command == "004" {
-        if let Some(server_name) = second_tok(params) {
-            state.actual_server_name = trunc_string(server_name, 256);
-        }
+    if command == "004"
+        && let Some(server_name) = second_tok(params) {
+        state.actual_server_name = trunc_string(server_name, 256);
     }
 
     match command {
@@ -211,19 +210,17 @@ pub fn handle_line(state: &mut BotState, line: &str) {
         }
         "405" => {
             // ERR_TOOMANYCHANNELS: stop retrying this channel.
-            if let Some(ch) = second_tok(params) {
-                if let Some(ci) = channel::find(state, ch) {
-                    state.chans[ci].join_disabled = true;
-                    logm!(state, L_INFO, "[405] Channel limit reached, disabling join retry: {}\n", ch);
-                }
+            if let Some(ch) = second_tok(params)
+                && let Some(ci) = channel::find(state, ch) {
+                state.chans[ci].join_disabled = true;
+                logm!(state, L_INFO, "[405] Channel limit reached, disabling join retry: {}\n", ch);
             }
         }
         "473" => {
-            if let Some(ch) = second_tok(params) {
-                if let Some(ci) = channel::find(state, ch).filter(|&ci| state.chans[ci].is_managed) {
-                    logm!(state, L_INFO, "[473] Channel {} is invite-only, requesting invite\n", ch);
-                    channel::access_request(state, ci, ChanReq::Invite);
-                }
+            if let Some(ch) = second_tok(params)
+                && let Some(ci) = channel::find(state, ch).filter(|&ci| state.chans[ci].is_managed) {
+                logm!(state, L_INFO, "[473] Channel {} is invite-only, requesting invite\n", ch);
+                channel::access_request(state, ci, ChanReq::Invite);
             }
         }
         "MODE" => on_mode(state, params),
@@ -264,13 +261,11 @@ pub fn handle_line(state: &mut BotState, line: &str) {
         }
         "KICK" => {
             let mut t = Tok::new(params);
-            if let (Some(ch), Some(kicked)) = (t.next(" "), t.next(" ")) {
-                if eq_ic(kicked, &state.current_nick) {
-                    if let Some(ci) = channel::find(state, ch) {
-                        state.chans[ci].status = ChanStatus::Out;
-                        state.chans[ci].i_am_opped = false;
-                    }
-                }
+            if let (Some(ch), Some(kicked)) = (t.next(" "), t.next(" "))
+                && eq_ic(kicked, &state.current_nick)
+                && let Some(ci) = channel::find(state, ch) {
+                state.chans[ci].status = ChanStatus::Out;
+                state.chans[ci].i_am_opped = false;
             }
         }
         "NICK" => {
@@ -316,17 +311,16 @@ fn on_nick_refused(state: &mut BotState, command: &str, params: &str) {
     }
     state.nick_change_pending = false;
     // 432 is final for that nick on this server: stop re-sending it.
-    if let Some(r) = refused {
-        if command == "432" && eq_ic(r, &state.target_nick) && !eq_ic(&state.nick_refused, r) {
-            state.nick_refused = state.target_nick.clone();
-            logm!(
-                state,
-                L_INFO,
-                "[INFO] Server refuses nick '{}' (432: {}); not retrying it here. Pick another with chnick.\n",
-                state.target_nick,
-                irc_trailing(t.remaining())
-            );
-        }
+    if let Some(r) = refused
+        && command == "432" && eq_ic(r, &state.target_nick) && !eq_ic(&state.nick_refused, r) {
+        state.nick_refused = state.target_nick.clone();
+        logm!(
+            state,
+            L_INFO,
+            "[INFO] Server refuses nick '{}' (432: {}); not retrying it here. Pick another with chnick.\n",
+            state.target_nick,
+            irc_trailing(t.remaining())
+        );
     }
     // Not registered yet: without an accepted nick there is no 001.
     if state.status & S_AUTHED == 0 {
@@ -359,11 +353,10 @@ fn on_mode(state: &mut BotState, params: &str) {
     }
     handle_mode_change(state, target, modes, args);
     // Key / invite-only changes go to the hub.
-    if modes.contains('k') || modes.contains('i') {
-        if let Some(ci) = channel::find(state, target).filter(|&ci| state.chans[ci].is_managed) {
-            state.chans[ci].timestamp = lww_next_ts(state.chans[ci].timestamp);
-            hub_client::push_channel(state, ci);
-        }
+    if (modes.contains('k') || modes.contains('i'))
+        && let Some(ci) = channel::find(state, target).filter(|&ci| state.chans[ci].is_managed) {
+        state.chans[ci].timestamp = lww_next_ts(state.chans[ci].timestamp);
+        hub_client::push_channel(state, ci);
     }
 }
 
@@ -525,16 +518,15 @@ fn on_privmsg(state: &mut BotState, prefix: &str, params: &str) {
         let ctcp = &message[1..message.len() - 1];
         if starts_with_ic(ctcp, "DCC ") {
             // Only ever the reply to this bot's own passive offer.
-            if let (Some(u), Some(h)) = (user, host) {
-                if eq_ic(dest, &state.current_nick) {
-                    let user_host = trunc_string(&format!("{nick}!{u}@{h}"), 256);
-                    dcc::handle_ctcp(state, &user_host, ctcp);
-                }
+            if let (Some(u), Some(h)) = (user, host)
+                && eq_ic(dest, &state.current_nick) {
+                let user_host = trunc_string(&format!("{nick}!{u}@{h}"), 256);
+                dcc::handle_ctcp(state, &user_host, ctcp);
             }
         } else if eq_ic(ctcp, "VERSION") {
-            ircf!(state, "NOTICE {} :\x01VERSION {}\x01\r\n", nick, VERSION_RESPONSE);
+        ircf!(state, "NOTICE {} :\x01VERSION {}\x01\r\n", nick, VERSION_RESPONSE);
         } else if starts_with_ic(ctcp, "PING ") {
-            ircf!(state, "NOTICE {} :\x01{}\x01\r\n", nick, ctcp);
+        ircf!(state, "NOTICE {} :\x01{}\x01\r\n", nick, ctcp);
         }
     } else {
         commands::handle_private_message(state, nick, user.unwrap_or("(null)"), host.unwrap_or("(null)"), dest, message);

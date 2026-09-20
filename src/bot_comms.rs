@@ -109,41 +109,38 @@ fn open_and_dispatch(state: &mut BotState, ti: usize, b64: &str, sender_nick: Op
             ircf!(state, "MODE {} +o {}\r\n", arg1, n);
         }
     } else if eq_ic(verb, "SETNICK") {
-        if is_rfc_nick(arg1) {
-            state.target_nick = arg1.to_string();
-            state.current_nick_ts = crate::cstr::now();
-            let ts = state.current_nick_ts;
-            hub_client::push_delta(state, "n", arg1, ts);
-            config::write_with_state_pass(state);
-        } else {
+    if is_rfc_nick(arg1) {
+        state.target_nick = arg1.to_string();
+        state.current_nick_ts = crate::cstr::now();
+        let ts = state.current_nick_ts;
+        hub_client::push_delta(state, "n", arg1, ts);
+        config::write_with_state_pass(state);
+    } else {
             logm!(state, L_INFO, "[BOT-COMM] SETNICK from {} refused: '{}' is not a valid IRC nick\n", sender.uuid, arg1);
         }
     } else if eq_ic(verb, "INVITE") {
-        if let Some(arg2) = t.next(" ") {
-            if let Some(ci) = channel::find(state, arg1) {
-                if state.chans[ci].status == ChanStatus::In && state.chans[ci].i_am_opped {
-                    logm!(state, L_INFO, "[BOT-COMMS] Inviting {} to {} (bot req)\n", arg2, arg1);
-                    ircf!(state, "INVITE {} {}\r\n", arg2, arg1);
-                }
-            }
-        }
+        if let Some(arg2) = t.next(" ")
+            && let Some(ci) = channel::find(state, arg1)
+            && state.chans[ci].status == ChanStatus::In && state.chans[ci].i_am_opped {
+        logm!(state, L_INFO, "[BOT-COMMS] Inviting {} to {} (bot req)\n", arg2, arg1);
+        ircf!(state, "INVITE {} {}\r\n", arg2, arg1);
+    }
     } else if eq_ic(verb, "UNBAN") {
-        // The mask matched against the ban list is the sender's own b|
-        // record, never anything in the message.
-        channel::access_service(state, "", ChanReq::Unban, arg1, None, Some(&sender.mask), None);
-    } else if eq_ic(verb, "KEY") {
-        match sender_nick {
-            Some(n) => channel::access_service(state, "", ChanReq::Key, arg1, None, None, Some(n)),
-            None => logm!(
-                state,
-                L_DEBUG,
-                "[DEBUG] [BOT-COMM] KEY over hub relay has no reply nick; the hub path answers these\n"
-            ),
-        }
-    } else if eq_ic(verb, "KEYIS") {
-        if let Some(arg2) = t.next(" ") {
-            channel::access_accept_key(state, arg1, arg2);
-        }
+    // The mask matched against the ban list is the sender's own b|
+    // record, never anything in the message.
+    channel::access_service(state, "", ChanReq::Unban, arg1, None, Some(&sender.mask), None);
+} else if eq_ic(verb, "KEY") {
+match sender_nick {
+    Some(n) => channel::access_service(state, "", ChanReq::Key, arg1, None, None, Some(n)),
+    None => logm!(
+        state,
+        L_DEBUG,
+        "[DEBUG] [BOT-COMM] KEY over hub relay has no reply nick; the hub path answers these\n"
+    ),
+}
+    } else if eq_ic(verb, "KEYIS")
+        && let Some(arg2) = t.next(" ") {
+        channel::access_accept_key(state, arg1, arg2);
     }
 }
 

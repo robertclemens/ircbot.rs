@@ -211,27 +211,27 @@ pub fn send_presence(state: &mut BotState, force: bool) {
         if !state.actual_server_name.is_empty() {
             server = trunc_string(&state.actual_server_name, TREE_SERVER_MAX + 1);
         } else if let Some(cfg) = state.irc_server_idx.and_then(|i| state.server_list.get(i)) {
-            server = trunc_string(cfg, TREE_SERVER_MAX + 1);
-        }
+    server = trunc_string(cfg, TREE_SERVER_MAX + 1);
+}
     }
     let now = now();
     let changed = server != state.presence_server;
     if !force && !changed && state.last_presence_sent != 0 && now - state.last_presence_sent < BOT_PRESENCE_REPORT_INTERVAL {
-        return;
+return;
     }
     let payload = format!("{}|{}|{}", BOT_VERSION, server, state.bot_start_time);
     if send_frame(state, CMD_BOT_PRESENCE, payload.as_bytes()) {
-        state.presence_server = server.clone();
-        state.last_presence_sent = now;
-        if changed {
-            logm!(
-                state,
-                L_DEBUG,
-                "[HUB] Presence: {} on {}\n",
-                BOT_VERSION,
-                if server.is_empty() { "(no server)" } else { server.as_str() }
-            );
-        }
+state.presence_server = server.clone();
+state.last_presence_sent = now;
+if changed {
+    logm!(
+state,
+L_DEBUG,
+"[HUB] Presence: {} on {}\n",
+        BOT_VERSION,
+        if server.is_empty() { "(no server)" } else { server.as_str() }
+    );
+}
     }
 }
 
@@ -892,17 +892,15 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
 
     // Keep locally newer last_seen / last_used (auths not yet pushed).
     for u in &mut state.user_records {
-        if let Some(s) = saved_users.iter().find(|s| s.uuid == u.uuid) {
-            if s.last_seen > u.last_seen {
-                u.last_seen = s.last_seen;
-            }
+        if let Some(s) = saved_users.iter().find(|s| s.uuid == u.uuid)
+            && s.last_seen > u.last_seen {
+            u.last_seen = s.last_seen;
         }
     }
     for m in &mut state.mask_records {
-        if let Some(s) = saved_masks.iter().find(|s| s.uuid == m.uuid && eq_ic(&s.mask, &m.mask)) {
-            if s.last_used > m.last_used {
-                m.last_used = s.last_used;
-            }
+        if let Some(s) = saved_masks.iter().find(|s| s.uuid == m.uuid && eq_ic(&s.mask, &m.mask))
+            && s.last_used > m.last_used {
+            m.last_used = s.last_used;
         }
     }
 
@@ -973,11 +971,10 @@ fn handle_response(state: &mut BotState, cmd: u8, payload: &str) {
             let r = sscanf(payload, &[Fmt::Set(9, P), Fmt::Lit("|"), Fmt::Set(64, b"\n")]);
             if r.len() == 2 {
                 let (nick, chan) = (r[0].s(), r[1].s());
-                if let Some(ci) = channel::find(state, chan) {
-                    if state.chans[ci].status == ChanStatus::In && state.chans[ci].i_am_opped {
-                        logm!(state, L_INFO, "[INVITE] Inviting {} into {} (hub request)\n", nick, chan);
-                        ircf!(state, "INVITE {} {}\r\n", nick, chan);
-                    }
+                if let Some(ci) = channel::find(state, chan)
+                    && state.chans[ci].status == ChanStatus::In && state.chans[ci].i_am_opped {
+                    logm!(state, L_INFO, "[INVITE] Inviting {} into {} (hub request)\n", nick, chan);
+                    ircf!(state, "INVITE {} {}\r\n", nick, chan);
                 }
             }
         }

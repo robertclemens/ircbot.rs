@@ -51,10 +51,8 @@ pub fn user_candidates(state: &BotState, user_host: &str) -> Vec<(usize, usize)>
             .user_records
             .iter()
             .position(|u| u.is_active && u.has_pubkey && u.uuid == mr.uuid)
-        {
-            if !out.iter().any(|&(u, _)| u == ui) {
-                out.push((ui, mi));
-            }
+            && !out.iter().any(|&(u, _)| u == ui) {
+            out.push((ui, mi));
         }
     }
     if out.is_empty() {

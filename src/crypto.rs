@@ -14,7 +14,7 @@
 //!
 //! Secrets live in `Zeroizing` buffers and are wiped on drop.
 
-use aes_gcm::aead::{AeadInPlace, KeyInit};
+use aes_gcm::aead::{AeadInOut, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce, Tag};
 use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig, STANDARD};
 use base64::engine::DecodePaddingMode;
@@ -90,7 +90,8 @@ fn cipher(key: &[u8]) -> Option<Aes256Gcm> {
 pub fn gcm_encrypt_detached(key: &[u8], iv: &[u8; GCM_IV_LEN], aad: &[u8], pt: &[u8]) -> Option<(Vec<u8>, [u8; GCM_TAG_LEN])> {
     let c = cipher(key)?;
     let mut buf = pt.to_vec();
-    let tag = c.encrypt_in_place_detached(Nonce::from_slice(iv), aad, &mut buf).ok()?;
+    let nonce = Nonce::try_from(&iv[..]).ok()?;
+    let tag = c.encrypt_inout_detached(&nonce, aad, buf.as_mut_slice().into()).ok()?;
     let mut t = [0u8; GCM_TAG_LEN];
     t.copy_from_slice(&tag);
     Some((buf, t))
@@ -110,8 +111,9 @@ pub fn gcm_decrypt_detached(
     }
     let c = cipher(key)?;
     let mut buf = Zeroizing::new(ct.to_vec());
-    c.decrypt_in_place_detached(Nonce::from_slice(iv), aad, &mut buf, Tag::from_slice(tag))
-        .ok()?;
+    let nonce = Nonce::try_from(iv).ok()?;
+    let tag = Tag::try_from(tag).ok()?;
+    c.decrypt_inout_detached(&nonce, aad, buf.as_mut_slice().into(), &tag).ok()?;
     Some(buf)
 }
 

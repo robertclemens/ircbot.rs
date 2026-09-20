@@ -98,11 +98,10 @@ pub fn parse_bot_line(data: &str) -> Option<TrustedBot> {
         out.ts = atoll(f[2]);
         return Some(out);
     }
-    if !f[2].is_empty() {
-        if let Some(k) = field_pubkey(f[2]).and_then(|b| crypto::pubkey_b64_decode(&b)) {
-            out.pub_key = k;
-            out.has_pub = true;
-        }
+    if !f[2].is_empty()
+        && let Some(k) = field_pubkey(f[2]).and_then(|b| crypto::pubkey_b64_decode(&b)) {
+        out.pub_key = k;
+        out.has_pub = true;
     }
     out.ts = atoll(f[3]);
     Some(out)
@@ -158,21 +157,18 @@ fn parse_cfg_chan(data: &str) -> Option<(String, String, String, i64)> {
         if let Some(c) = sc.set_not(64, b"|") {
             chan = c.to_string();
             parsed = 1;
-            if sc.lit(b'|') {
-                if let Some(k) = sc.set_not(30, b"|") {
-                    key = k.to_string();
-                    parsed = 2;
-                    if sc.lit(b'|') {
-                        if let Some(o) = sc.set_not(15, b"|") {
-                            op = o.to_string();
-                            parsed = 3;
-                            if sc.lit(b'|') {
-                                if let Some(t) = sc.int() {
-                                    ts = t;
-                                    parsed = 4;
-                                }
-                            }
-                        }
+            if sc.lit(b'|')
+                && let Some(k) = sc.set_not(30, b"|") {
+                key = k.to_string();
+                parsed = 2;
+                if sc.lit(b'|')
+                    && let Some(o) = sc.set_not(15, b"|") {
+                    op = o.to_string();
+                    parsed = 3;
+                    if sc.lit(b'|')
+                        && let Some(t) = sc.int() {
+                        ts = t;
+                        parsed = 4;
                     }
                 }
             }
@@ -186,16 +182,14 @@ fn parse_cfg_chan(data: &str) -> Option<(String, String, String, i64)> {
         if let Some(c) = sc.set_not(64, b"|") {
             chan = c.to_string();
             parsed = 1;
-            if sc.lit(b'|') && sc.lit(b'|') {
-                if let Some(o) = sc.set_not(15, b"|") {
-                    op = o.to_string();
-                    parsed = 2;
-                    if sc.lit(b'|') {
-                        if let Some(t) = sc.int() {
-                            ts = t;
-                            parsed = 3;
-                        }
-                    }
+            if sc.lit(b'|') && sc.lit(b'|')
+                && let Some(o) = sc.set_not(15, b"|") {
+                op = o.to_string();
+                parsed = 2;
+                if sc.lit(b'|')
+                    && let Some(t) = sc.int() {
+                    ts = t;
+                    parsed = 3;
                 }
             }
         }
@@ -276,17 +270,16 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
                 }
             }
             b'c' => {
-                if let Some((chan, key, op, ts)) = parse_cfg_chan(data) {
-                    if let Some(ci) = channel::add(state, &chan) {
-                        let c = &mut state.chans[ci];
-                        if !key.is_empty() {
-                            c.key = trunc_string(&key, MAX_KEY);
-                        }
-                        c.is_managed = op != "del";
-                        c.timestamp = if ts > 0 { ts } else { now() };
-                        if !c.is_managed {
-                            c.status = ChanStatus::Out;
-                        }
+                if let Some((chan, key, op, ts)) = parse_cfg_chan(data)
+                    && let Some(ci) = channel::add(state, &chan) {
+                    let c = &mut state.chans[ci];
+                    if !key.is_empty() {
+                        c.key = trunc_string(&key, MAX_KEY);
+                    }
+                    c.is_managed = op != "del";
+                    c.timestamp = if ts > 0 { ts } else { now() };
+                    if !c.is_managed {
+                        c.status = ChanStatus::Out;
                     }
                 }
             }
@@ -424,11 +417,10 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
             None => logm!(state, L_INFO, "[CFG] Could not generate an identity key.\n"),
         }
     }
-    if state.bot_uuid.is_empty() && state.hubs.is_empty() {
-        if let Some(u) = crypto::gen_uuid_v4() {
-            state.bot_uuid = u;
-            identity_minted = true;
-        }
+    if state.bot_uuid.is_empty() && state.hubs.is_empty()
+        && let Some(u) = crypto::gen_uuid_v4() {
+        state.bot_uuid = u;
+        identity_minted = true;
     }
     if !hub_client::self_pub_refresh(state) {
         logm!(
@@ -437,9 +429,9 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
             "[CFG] No usable identity key (k|): admin commands and bot-to-bot messages cannot be decrypted. Re-run -setup.\n"
         );
     } else if identity_minted {
-        let fp = crypto::key_fingerprint(&state.self_pub);
-        eprintln!(
-            "[CFG] Generated this bot's identity key. Public key: {} (fp {})",
+let fp = crypto::key_fingerprint(&state.self_pub);
+eprintln!(
+    "[CFG] Generated this bot's identity key. Public key: {} (fp {})",
             crypto::b64_encode(&state.self_pub),
             fp
         );

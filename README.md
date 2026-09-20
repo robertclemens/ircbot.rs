@@ -13,7 +13,12 @@ There are no admin, oper or bot passwords: bots, admins and opers are each ident
 
 ### System Requirements
     * Rust toolchain: cargo + rustc 1.89 or newer (Tested with: 1.98.0)
-    * A C compiler for the `ring` crate that rustls uses (gcc or clang)
+    * No C compiler needed for the bot itself: TLS runs on the pure-Rust `graviola`
+      provider, so `cargo build --release` needs only rustc (this also means the
+      self-updater's rebuild works on a host with no gcc/clang installed)
+    * x86_64 or aarch64 only, and `graviola` requires the CPU features most x86_64
+      chips since ~2014 have (aes, pclmulqdq, ssse3, avx, avx2, adx, bmi1, bmi2) or,
+      on aarch64, aes/sha2/pmull/neon (Raspberry Pi 5 yes, Pi 4 and earlier no)
     * No OpenSSL or libcurl: crypto, TLS and HTTPS are Rust crates
     * The optional helpers in utils/ (bot-auth, keygen, encrypt_config, decrypt_config) are C and need gcc + libssl-dev
 
