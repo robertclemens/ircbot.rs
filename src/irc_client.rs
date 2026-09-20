@@ -21,14 +21,14 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
+use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme};
 
 use crate::consts::*;
 use crate::cstr::{eq_ic, now, trunc, trunc_string};
 use crate::net::{self, ReadOutcome};
-use crate::state::{is_rfc_nick, BotState, ServerBlock, ServerBlockKind, S_AUTHED, S_CONNECTED};
+use crate::state::{BotState, S_AUTHED, S_CONNECTED, ServerBlock, ServerBlockKind, is_rfc_nick};
 use crate::{channel, crypto, dcc, hub_client, irc_parser, logm};
 
 /// Unsent bytes past which a server that stopped reading is dropped.
@@ -59,7 +59,9 @@ impl IrcConn {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        let IrcConn { sock, tls, wbuf, .. } = self;
+        let IrcConn {
+            sock, tls, wbuf, ..
+        } = self;
         let Some(tls) = tls else {
             return net::flush(sock, wbuf);
         };
@@ -84,7 +86,9 @@ impl IrcConn {
 
     /// Pull whatever arrived into rbuf.
     fn read(&mut self) -> io::Result<ReadOutcome> {
-        let IrcConn { sock, tls, rbuf, .. } = self;
+        let IrcConn {
+            sock, tls, rbuf, ..
+        } = self;
         let Some(tls) = tls else {
             return net::read_available(sock, rbuf, IRC_RBUF_CAP);
         };
@@ -101,7 +105,9 @@ impl IrcConn {
                     Ok(0) => return Ok(ReadOutcome::Eof), // close_notify
                     Ok(n) => rbuf.extend_from_slice(&chunk[..n]),
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(ReadOutcome::Eof),
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                        return Ok(ReadOutcome::Eof);
+                    }
                     Err(e) => return Err(e),
                 }
             }
@@ -146,7 +152,12 @@ impl ServerCertVerifier for AcceptAnyCert {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -155,7 +166,12 @@ impl ServerCertVerifier for AcceptAnyCert {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -182,9 +198,14 @@ fn tls_config() -> Option<Arc<ClientConfig>> {
 }
 
 /// Blocking TLS handshake on a freshly connected socket.
-fn tls_handshake(stream: &mut std::net::TcpStream, host: &str, addr: &std::net::SocketAddr) -> Option<Box<ClientConnection>> {
+fn tls_handshake(
+    stream: &mut std::net::TcpStream,
+    host: &str,
+    addr: &std::net::SocketAddr,
+) -> Option<Box<ClientConnection>> {
     let cfg = tls_config()?;
-    let name = ServerName::try_from(host.to_string()).unwrap_or_else(|_| ServerName::IpAddress(addr.ip().into()));
+    let name = ServerName::try_from(host.to_string())
+        .unwrap_or_else(|_| ServerName::IpAddress(addr.ip().into()));
     let mut conn = ClientConnection::new(cfg, name).ok()?;
     stream.set_read_timeout(Some(TLS_HANDSHAKE_TIMEOUT)).ok()?;
     stream.set_write_timeout(Some(TLS_HANDSHAKE_TIMEOUT)).ok()?;
@@ -202,7 +223,13 @@ fn tls_handshake(stream: &mut std::net::TcpStream, host: &str, addr: &std::net::
 fn refusal_sanitize(src: &str, cap: usize) -> String {
     let s: String = src
         .chars()
-        .map(|c| if (c as u32) < 0x20 || c as u32 == 0x7f { '?' } else { c })
+        .map(|c| {
+            if (c as u32) < 0x20 || c as u32 == 0x7f {
+                '?'
+            } else {
+                c
+            }
+        })
         .collect();
     trunc_string(&s, cap)
 }
@@ -220,7 +247,10 @@ fn find_from(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     if needle.is_empty() || from > hay.len() {
         return None;
     }
-    hay[from..].windows(needle.len()).position(|w| w == needle).map(|p| p + from)
+    hay[from..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|p| p + from)
 }
 
 /// `needle` at a word start (not preceded by a letter), so "unbanned" does
@@ -241,13 +271,35 @@ fn refusal_find(hay: &[u8], needle: &str) -> Option<usize> {
 /// within 48 bytes.  Only a known unit counts; capped at IRC_BAN_STATED_MAX.
 fn refusal_parse_duration(s: &[u8]) -> i64 {
     const UNITS: &[(&str, i64)] = &[
-        ("s", 1), ("sec", 1), ("secs", 1), ("second", 1), ("seconds", 1),
-        ("m", 60), ("min", 60), ("mins", 60), ("minute", 60), ("minutes", 60),
-        ("h", 3600), ("hr", 3600), ("hrs", 3600), ("hour", 3600), ("hours", 3600),
-        ("d", 86400), ("day", 86400), ("days", 86400),
-        ("w", 604800), ("wk", 604800), ("week", 604800), ("weeks", 604800),
-        ("mo", 2592000), ("month", 2592000), ("months", 2592000),
-        ("y", 31536000), ("yr", 31536000), ("year", 31536000), ("years", 31536000),
+        ("s", 1),
+        ("sec", 1),
+        ("secs", 1),
+        ("second", 1),
+        ("seconds", 1),
+        ("m", 60),
+        ("min", 60),
+        ("mins", 60),
+        ("minute", 60),
+        ("minutes", 60),
+        ("h", 3600),
+        ("hr", 3600),
+        ("hrs", 3600),
+        ("hour", 3600),
+        ("hours", 3600),
+        ("d", 86400),
+        ("day", 86400),
+        ("days", 86400),
+        ("w", 604800),
+        ("wk", 604800),
+        ("week", 604800),
+        ("weeks", 604800),
+        ("mo", 2592000),
+        ("month", 2592000),
+        ("months", 2592000),
+        ("y", 31536000),
+        ("yr", 31536000),
+        ("year", 31536000),
+        ("years", 31536000),
     ];
     let mut p = 0usize;
     let at = |i: usize| s.get(i).copied().unwrap_or(0);
@@ -280,7 +332,10 @@ fn refusal_parse_duration(s: &[u8]) -> i64 {
             }
             p += 1;
         }
-        let unit = UNITS.iter().find(|(w, _)| w.as_bytes() == word.as_slice()).map_or(0, |u| u.1);
+        let unit = UNITS
+            .iter()
+            .find(|(w, _)| w.as_bytes() == word.as_slice())
+            .map_or(0, |u| u.1);
         if unit == 0 {
             break;
         }
@@ -296,18 +351,33 @@ fn refusal_parse_duration(s: &[u8]) -> i64 {
 }
 
 fn refusal_classify(text: &str, ban_numeric: bool) -> (ServerBlockKind, i64) {
-    const BAN_WORDS: &[&str] = &["kline", "gline", "zline", "dline", "akill", "autokill", "banned", "not welcome"];
+    const BAN_WORDS: &[&str] = &[
+        "kline",
+        "gline",
+        "zline",
+        "dline",
+        "akill",
+        "autokill",
+        "banned",
+        "not welcome",
+    ];
     const THROTTLE_WORDS: &[&str] = &["throttl", "too fast", "too many"];
     let t = refusal_fold(text);
     // An oper KILL or the echo of our own QUIT is not a ban.
-    if !ban_numeric && (find_from(&t, b"killed (", 0).is_some() || find_from(&t, b"(quit:", 0).is_some()) {
+    if !ban_numeric
+        && (find_from(&t, b"killed (", 0).is_some() || find_from(&t, b"(quit:", 0).is_some())
+    {
         return (ServerBlockKind::None, 0);
     }
     let ban = ban_numeric || BAN_WORDS.iter().any(|w| refusal_find(&t, w).is_some());
     if ban {
         if let Some(after) = refusal_find(&t, "temporar").or_else(|| refusal_find(&t, "expire")) {
             let secs = refusal_parse_duration(&t[after..]);
-            return if secs > 0 { (ServerBlockKind::BannedTemp, secs) } else { (ServerBlockKind::Banned, 0) };
+            return if secs > 0 {
+                (ServerBlockKind::BannedTemp, secs)
+            } else {
+                (ServerBlockKind::Banned, 0)
+            };
         }
         return if refusal_find(&t, "permanent").is_some() {
             (ServerBlockKind::BannedPerm, 0)
@@ -335,11 +405,11 @@ pub fn fmt_secs(s: i64) -> String {
     if s >= 86400 {
         format!("{}d{}h", s / 86400, (s % 86400) / 3600)
     } else if s >= 3600 {
-    format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
+        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
     } else if s >= 60 && s % 60 != 0 {
-    format!("{}m{:02}s", s / 60, s % 60)
+        format!("{}m{:02}s", s / 60, s % 60)
     } else if s >= 60 {
-    format!("{}m", s / 60)
+        format!("{}m", s / 60)
     } else {
         format!("{s}s")
     }
@@ -352,7 +422,17 @@ pub fn note_refusal(state: &mut BotState, text: &str, ban_numeric: bool) {
     if ban_numeric {
         state.irc_refusal_ban = true;
     }
-    logm!(state, L_INFO, "[IRC] Server {}: {}\n", if ban_numeric { "refused registration" } else { "ERROR" }, clean);
+    logm!(
+        state,
+        L_INFO,
+        "[IRC] Server {}: {}\n",
+        if ban_numeric {
+            "refused registration"
+        } else {
+            "ERROR"
+        },
+        clean
+    );
     // A 465 is usually followed by an ERROR; keep both for the classifier.
     let cap = IRC_REFUSAL_LEN;
     if !state.irc_refusal.is_empty() && state.irc_refusal.len() + 3 + 1 < cap {
@@ -369,16 +449,23 @@ fn apply_refusal(state: &mut BotState) {
         return;
     }
     let (kind, stated) = refusal_classify(&state.irc_refusal, state.irc_refusal_ban);
-    if let Some(idx) = state.irc_server_idx.filter(|&i| i < state.server_list.len())
-        && kind != ServerBlockKind::None {
+    if let Some(idx) = state
+        .irc_server_idx
+        .filter(|&i| i < state.server_list.len())
+        && kind != ServerBlockKind::None
+    {
         let now = now();
         let b = &mut state.server_blocks[idx];
         if b.strikes < 32 {
             b.strikes += 1;
         }
         let hold = match kind {
-            ServerBlockKind::Throttled => refusal_backoff(IRC_THROTTLE_BACKOFF, b.strikes, IRC_THROTTLE_BACKOFF_MAX),
-            ServerBlockKind::Banned => refusal_backoff(IRC_BAN_BACKOFF, b.strikes, IRC_BAN_BACKOFF_MAX),
+            ServerBlockKind::Throttled => {
+                refusal_backoff(IRC_THROTTLE_BACKOFF, b.strikes, IRC_THROTTLE_BACKOFF_MAX)
+            }
+            ServerBlockKind::Banned => {
+                refusal_backoff(IRC_BAN_BACKOFF, b.strikes, IRC_BAN_BACKOFF_MAX)
+            }
             ServerBlockKind::BannedTemp => {
                 // Honour the stated length, but never redial faster than
                 // a throttle would.
@@ -388,7 +475,11 @@ fn apply_refusal(state: &mut BotState) {
             _ => 0,
         };
         b.kind = kind;
-        b.until = if kind == ServerBlockKind::BannedPerm { 0 } else { now + hold };
+        b.until = if kind == ServerBlockKind::BannedPerm {
+            0
+        } else {
+            now + hold
+        };
         b.reason = state.irc_refusal.clone();
         let strikes = b.strikes;
         let srv = state.server_list[idx].clone();
@@ -414,7 +505,11 @@ fn apply_refusal(state: &mut BotState) {
                 L_INFO,
                 "[BAN] {}: {} - holding {} (strike {}).\n",
                 srv,
-                if kind == ServerBlockKind::Throttled { "throttled" } else { "banned, no length given" },
+                if kind == ServerBlockKind::Throttled {
+                    "throttled"
+                } else {
+                    "banned, no length given"
+                },
                 fmt_secs(hold),
                 strikes
             ),
@@ -426,7 +521,12 @@ fn apply_refusal(state: &mut BotState) {
 
 /// 001: this server took us; forget any hold and strike count it had.
 pub fn note_registered(state: &mut BotState) {
-    let Some(idx) = state.irc_server_idx.filter(|&i| i < state.server_list.len()) else { return };
+    let Some(idx) = state
+        .irc_server_idx
+        .filter(|&i| i < state.server_list.len())
+    else {
+        return;
+    };
     if state.server_blocks[idx].strikes > 0 {
         let srv = state.server_list[idx].clone();
         logm!(state, L_INFO, "[BAN] {} accepted us; hold cleared.\n", srv);
@@ -458,7 +558,9 @@ pub fn server_block_remove(state: &mut BotState, idx: usize) {
 
 /// "banned 42m", "throttled 55s", "banned, permanent", or "" if eligible.
 pub fn server_block_desc(state: &BotState, idx: usize) -> String {
-    let Some(b) = state.server_blocks.get(idx) else { return String::new() };
+    let Some(b) = state.server_blocks.get(idx) else {
+        return String::new();
+    };
     if b.kind == ServerBlockKind::BannedPerm {
         return "banned, permanent".into();
     }
@@ -468,7 +570,11 @@ pub fn server_block_desc(state: &BotState, idx: usize) -> String {
     }
     format!(
         "{} {}",
-        if b.kind == ServerBlockKind::Throttled { "throttled" } else { "banned" },
+        if b.kind == ServerBlockKind::Throttled {
+            "throttled"
+        } else {
+            "banned"
+        },
         fmt_secs(b.until - now)
     )
 }
@@ -479,7 +585,11 @@ fn pick_server(state: &mut BotState, now: i64) -> Option<usize> {
     if n == 0 {
         return None;
     }
-    let start = if state.current_server_index < n { state.current_server_index } else { 0 };
+    let start = if state.current_server_index < n {
+        state.current_server_index
+    } else {
+        0
+    };
     let mut soonest = 0i64;
     for k in 0..n {
         let i = (start + k) % n;
@@ -499,7 +609,12 @@ fn pick_server(state: &mut BotState, now: i64) -> Option<usize> {
     if !state.irc_blocked_logged {
         state.irc_blocked_logged = true;
         if soonest != 0 {
-            logm!(state, L_INFO, "[BAN] Every configured server is refusing this bot; next attempt in {}.\n", fmt_secs(soonest - now));
+            logm!(
+                state,
+                L_INFO,
+                "[BAN] Every configured server is refusing this bot; next attempt in {}.\n",
+                fmt_secs(soonest - now)
+            );
         } else {
             logm!(
                 state,
@@ -537,9 +652,11 @@ pub fn disconnect(state: &mut BotState) {
 fn is_single_line(line: &str) -> bool {
     let b = line.as_bytes();
     b.len() >= 2
-            && b[b.len() - 2] == b'\r'
-            && b[b.len() - 1] == b'\n'
-            && !b[..b.len() - 2].iter().any(|&c| c == b'\r' || c == b'\n' || c == 0)
+        && b[b.len() - 2] == b'\r'
+        && b[b.len() - 1] == b'\n'
+        && !b[..b.len() - 2]
+            .iter()
+            .any(|&c| c == b'\r' || c == b'\n' || c == 0)
 }
 
 /// irc_printf(): send one formatted line ("...\r\n").  One command per call,
@@ -559,7 +676,8 @@ pub fn irc_printf(state: &mut BotState, line: &str) -> i32 {
         return -1;
     }
     if state.a2r.active
-        && let Some(r) = a2r_seal_reply(state, line) {
+        && let Some(r) = a2r_seal_reply(state, line)
+    {
         return r;
     }
     send_line(state, line)
@@ -581,33 +699,36 @@ fn a2r_seal_reply(state: &mut BotState, line: &str) -> Option<i32> {
     let verb = if line.starts_with("PRIVMSG ") {
         "PRIVMSG"
     } else if line.starts_with("NOTICE ") {
-    "NOTICE"
-} else {
-    return None;
-};
-let lb = line.as_bytes();
-let vl = verb.len() + 1;
-let nick = state.a2r.nick.clone();
-let nl = nick.len();
-let head = vl + nl + 2;
-if lb.len() < head + 2 || &lb[vl..vl + nl] != nick.as_bytes() || &lb[vl + nl..vl + nl + 2] != b" :" {
-    return None;
-}
-let text = &lb[head..lb.len() - 2];
-if text.first() == Some(&0x01) {
-    return None;
-}
-let tlen = text.len();
-let mut ret;
-let mut off = 0usize;
-loop {
-    let mut cut = tlen - off;
-    if cut > A2R_TEXT_MAX {
-        cut = A2R_TEXT_MAX;
-        while cut > 1 && (text[off + cut] & 0xC0) == 0x80 {
-            cut -= 1;
-        }
+        "NOTICE"
+    } else {
+        return None;
+    };
+    let lb = line.as_bytes();
+    let vl = verb.len() + 1;
+    let nick = state.a2r.nick.clone();
+    let nl = nick.len();
+    let head = vl + nl + 2;
+    if lb.len() < head + 2
+        || &lb[vl..vl + nl] != nick.as_bytes()
+        || &lb[vl + nl..vl + nl + 2] != b" :"
+    {
+        return None;
     }
+    let text = &lb[head..lb.len() - 2];
+    if text.first() == Some(&0x01) {
+        return None;
+    }
+    let tlen = text.len();
+    let mut ret;
+    let mut off = 0usize;
+    loop {
+        let mut cut = tlen - off;
+        if cut > A2R_TEXT_MAX {
+            cut = A2R_TEXT_MAX;
+            while cut > 1 && (text[off + cut] & 0xC0) == 0x80 {
+                cut -= 1;
+            }
+        }
         let more = if off + cut < tlen { 1 } else { 0 };
         let mut pt = zeroize::Zeroizing::new(format!("{}:{}:", state.a2r.seq, more).into_bytes());
         let frame = if pt.len() + cut <= A2R_PT_MAX {
@@ -618,7 +739,12 @@ loop {
         };
         drop(pt);
         let Some(frame) = frame else {
-            logm!(state, L_INFO, "[CMD] Could not seal a reply to {}; the rest of it is dropped\n", nick);
+            logm!(
+                state,
+                L_INFO,
+                "[CMD] Could not seal a reply to {}; the rest of it is dropped\n",
+                nick
+            );
             return Some(-1);
         };
         let out = format!("{} {} :~A2R {}\r\n", verb, nick, crypto::b64_encode(&frame));
@@ -646,7 +772,9 @@ pub fn line_is_keepalive(line: &str) -> bool {
         l = l.find(' ').map_or("", |i| &l[i..]).trim_start_matches(' ');
     }
     let b = l.as_bytes();
-    if b.len() < 4 || !(b[..4].eq_ignore_ascii_case(b"PING") || b[..4].eq_ignore_ascii_case(b"PONG")) {
+    if b.len() < 4
+        || !(b[..4].eq_ignore_ascii_case(b"PING") || b[..4].eq_ignore_ascii_case(b"PONG"))
+    {
         return false;
     }
     matches!(b.get(4), None | Some(b' ') | Some(b':') | Some(b'\r'))
@@ -691,7 +819,9 @@ pub fn connect(state: &mut BotState) {
         return;
     }
     let attempt_now = now();
-    let Some(pick) = pick_server(state, attempt_now) else { return };
+    let Some(pick) = pick_server(state, attempt_now) else {
+        return;
+    };
     state.current_server_index = pick;
     state.irc_server_idx = Some(pick);
     state.last_irc_attempt = attempt_now;
@@ -708,7 +838,12 @@ pub fn connect(state: &mut BotState) {
     let vhost = match net::vhost_addr(&state.vhost) {
         Some(Ok(ip)) => Some(ip),
         Some(Err(())) => {
-            logm!(state, L_INFO, "[WARN] Invalid VHOST IP '{}'. Ignoring.\n", state.vhost);
+            logm!(
+                state,
+                L_INFO,
+                "[WARN] Invalid VHOST IP '{}'. Ignoring.\n",
+                state.vhost
+            );
             None
         }
         None => None,
@@ -716,17 +851,32 @@ pub fn connect(state: &mut BotState) {
 
     let mut established: Option<(std::net::TcpStream, Option<Box<ClientConnection>>)> = None;
     for port in &ports {
-        logm!(state, L_INFO, "[INFO] Attempting to connect to {}:{}...\n", host, port);
-        let Ok(addrs) = net::resolve(host, port) else { continue };
+        logm!(
+            state,
+            L_INFO,
+            "[INFO] Attempting to connect to {}:{}...\n",
+            host,
+            port
+        );
+        let Ok(addrs) = net::resolve(host, port) else {
+            continue;
+        };
         for addr in addrs {
             if let Some(v) = vhost
-                && v.is_ipv4() != addr.is_ipv4() {
+                && v.is_ipv4() != addr.is_ipv4()
+            {
                 continue;
             }
             let sock = match net::new_socket(&addr, vhost) {
                 Ok(s) => s,
                 Err(e) if vhost.is_some() => {
-                    logm!(state, L_INFO, "[WARN] Failed to bind VHOST {}: {}\n", state.vhost, e);
+                    logm!(
+                        state,
+                        L_INFO,
+                        "[WARN] Failed to bind VHOST {}: {}\n",
+                        state.vhost,
+                        e
+                    );
                     continue;
                 }
                 Err(_) => continue,
@@ -735,7 +885,12 @@ pub fn connect(state: &mut BotState) {
                 Ok(s) => s,
                 Err(e) => {
                     if e.kind() == io::ErrorKind::TimedOut {
-                        logm!(state, L_INFO, "[INFO] Connection timeout after {} seconds.\n", CONNECT_TIMEOUT_SECS);
+                        logm!(
+                            state,
+                            L_INFO,
+                            "[INFO] Connection timeout after {} seconds.\n",
+                            CONNECT_TIMEOUT_SECS
+                        );
                     }
                     continue;
                 }
@@ -746,7 +901,11 @@ pub fn connect(state: &mut BotState) {
                         logm!(state, L_INFO, "[INFO] Secure TLS connection established.\n");
                         established = Some((stream, Some(tls)));
                     }
-                    None => logm!(state, L_INFO, "[INFO] SSL handshake failed. Trying insecure.\n"),
+                    None => logm!(
+                        state,
+                        L_INFO,
+                        "[INFO] SSL handshake failed. Trying insecure.\n"
+                    ),
                 }
             } else {
                 logm!(state, L_INFO, "[INFO] Insecure connection established.\n");
@@ -761,9 +920,20 @@ pub fn connect(state: &mut BotState) {
 
     if let Some((stream, tls)) = established {
         let token = state.new_token(net::SLOT_IRC);
-        match net::into_mio(stream).and_then(|mut s| state.registry.register(&mut s, token, net::INTEREST).map(|_| s)) {
+        match net::into_mio(stream).and_then(|mut s| {
+            state
+                .registry
+                .register(&mut s, token, net::INTEREST)
+                .map(|_| s)
+        }) {
             Ok(sock) => {
-                state.irc = Some(IrcConn { sock, token, tls, rbuf: Vec::new(), wbuf: Vec::new() });
+                state.irc = Some(IrcConn {
+                    sock,
+                    token,
+                    tls,
+                    rbuf: Vec::new(),
+                    wbuf: Vec::new(),
+                });
                 let t = now();
                 state.status = S_CONNECTED;
                 state.last_pong_time = t;
@@ -774,7 +944,12 @@ pub fn connect(state: &mut BotState) {
                 crate::ircf!(state, "NICK {}\r\n", nick);
                 crate::ircf!(state, "USER {} 0 * :{}\r\n", user, gecos);
             }
-            Err(e) => logm!(state, L_INFO, "[INFO] Could not register IRC socket: {}\n", e),
+            Err(e) => logm!(
+                state,
+                L_INFO,
+                "[INFO] Could not register IRC socket: {}\n",
+                e
+            ),
         }
     }
     state.current_server_index += 1;
@@ -788,7 +963,11 @@ pub fn handle_event(state: &mut BotState, token: mio::Token, readable: bool, wri
     if writable {
         let res = state.irc.as_mut().map(|c| c.flush());
         if let Some(Err(_)) = res {
-            logm!(state, L_INFO, "[INFO] Lost connection to server (write error).\n");
+            logm!(
+                state,
+                L_INFO,
+                "[INFO] Lost connection to server (write error).\n"
+            );
             disconnect(state);
             return;
         }
@@ -801,7 +980,9 @@ pub fn handle_event(state: &mut BotState, token: mio::Token, readable: bool, wri
 fn handle_read(state: &mut BotState, token: mio::Token) {
     loop {
         let (outcome, lines) = {
-            let Some(conn) = state.irc.as_mut().filter(|c| c.token == token) else { return };
+            let Some(conn) = state.irc.as_mut().filter(|c| c.token == token) else {
+                return;
+            };
             let outcome = conn.read();
             let _ = conn.flush();
             let mut lines = Vec::new();
@@ -827,10 +1008,16 @@ fn handle_read(state: &mut BotState, token: mio::Token) {
             }
             irc_parser::handle_line(state, &line);
         }
-        let Some(conn) = state.irc.as_mut().filter(|c| c.token == token) else { return };
+        let Some(conn) = state.irc.as_mut().filter(|c| c.token == token) else {
+            return;
+        };
         if conn.rbuf.len() >= IRC_RBUF_CAP {
             conn.rbuf.clear();
-            logm!(state, L_INFO, "[WARN] Receive buffer full (line too long). Flushing buffer.\n");
+            logm!(
+                state,
+                L_INFO,
+                "[WARN] Receive buffer full (line too long). Flushing buffer.\n"
+            );
         }
         match outcome {
             Ok(ReadOutcome::Full) => continue,
@@ -848,8 +1035,16 @@ pub fn check_status(state: &mut BotState) {
     let now = now();
 
     // A hub link with no PONG or data for 120 s has zombied.
-    if !state.hubs.is_empty() && state.hub.is_some() && state.hub_authenticated && now - state.last_hub_activity > 120 {
-        logm!(state, L_INFO, "[HUB] Connection timed out (Watchdog). Reconnecting...\n");
+    if !state.hubs.is_empty()
+        && state.hub.is_some()
+        && state.hub_authenticated
+        && now - state.last_hub_activity > 120
+    {
+        logm!(
+            state,
+            L_INFO,
+            "[HUB] Connection timed out (Watchdog). Reconnecting...\n"
+        );
         hub_client::drop_link(state);
     }
 
@@ -876,11 +1071,18 @@ pub fn check_status(state: &mut BotState) {
     if state.status & S_AUTHED != 0 {
         channel::check_joins(state);
         if !state.nick_change_pending {
-            if !eq_ic(&state.current_nick, &state.target_nick) && !eq_ic(&state.nick_refused, &state.target_nick) {
+            if !eq_ic(&state.current_nick, &state.target_nick)
+                && !eq_ic(&state.nick_refused, &state.target_nick)
+            {
                 if now - state.nick_release_time > NICK_TAKE_TIME {
                     if now - state.last_nick_attempt > NICK_RETRY_TIME {
                         let t = state.target_nick.clone();
-                        logm!(state, L_INFO, "[INFO] Attempting to reclaim primary nick '{}'.\n", t);
+                        logm!(
+                            state,
+                            L_INFO,
+                            "[INFO] Attempting to reclaim primary nick '{}'.\n",
+                            t
+                        );
                         attempt_nick_change(state, &t);
                     }
                 } else {
@@ -893,7 +1095,11 @@ pub fn check_status(state: &mut BotState) {
                 }
             }
         } else {
-            logm!(state, L_INFO, "[INFO] Nick reclaim skipped: nick change pending.\n");
+            logm!(
+                state,
+                L_INFO,
+                "[INFO] Nick reclaim skipped: nick change pending.\n"
+            );
         }
     }
 }
@@ -916,7 +1122,11 @@ pub fn generate_new_nick(state: &mut BotState) {
         }
         let one = ch.to_string();
         let probe = format!("a{ch}");
-        if if base.is_empty() { is_rfc_nick(&one) } else { is_rfc_nick(&probe) } {
+        if if base.is_empty() {
+            is_rfc_nick(&one)
+        } else {
+            is_rfc_nick(&probe)
+        } {
             base.push(ch);
         }
     }
@@ -946,14 +1156,32 @@ mod tests {
 
     #[test]
     fn classify_refusals() {
-        assert_eq!(refusal_classify("Closing Link: (K-Lined: go away)", false).0, ServerBlockKind::Banned);
+        assert_eq!(
+            refusal_classify("Closing Link: (K-Lined: go away)", false).0,
+            ServerBlockKind::Banned
+        );
         let (k, s) = refusal_classify("You are banned. Temporary K-line 60 min.", false);
         assert_eq!((k, s), (ServerBlockKind::BannedTemp, 3600));
-        assert_eq!(refusal_classify("Permanently banned", true).0, ServerBlockKind::BannedPerm);
-        assert_eq!(refusal_classify("Throttled: Reconnecting too fast", false).0, ServerBlockKind::Throttled);
-        assert_eq!(refusal_classify("Closing Link: (Ping timeout)", false).0, ServerBlockKind::None);
-        assert_eq!(refusal_classify("Killed (oper (banned))", false).0, ServerBlockKind::None);
-        assert_eq!(refusal_classify("you were unbanned", false).0, ServerBlockKind::None);
+        assert_eq!(
+            refusal_classify("Permanently banned", true).0,
+            ServerBlockKind::BannedPerm
+        );
+        assert_eq!(
+            refusal_classify("Throttled: Reconnecting too fast", false).0,
+            ServerBlockKind::Throttled
+        );
+        assert_eq!(
+            refusal_classify("Closing Link: (Ping timeout)", false).0,
+            ServerBlockKind::None
+        );
+        assert_eq!(
+            refusal_classify("Killed (oper (banned))", false).0,
+            ServerBlockKind::None
+        );
+        assert_eq!(
+            refusal_classify("you were unbanned", false).0,
+            ServerBlockKind::None
+        );
         assert_eq!(refusal_parse_duration(b" in 1h30m"), 5400);
         assert_eq!(fmt_secs(5400), "1h30m");
         assert_eq!(fmt_secs(90), "1m30s");

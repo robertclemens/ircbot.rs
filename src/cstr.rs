@@ -77,7 +77,13 @@ pub fn strtoll(s: &str) -> (i64, usize) {
     while i < b.len() && b[i].is_ascii_digit() {
         let d = i64::from(b[i] - b'0');
         if !overflow {
-            match v.checked_mul(10).and_then(|x| if neg { x.checked_sub(d) } else { x.checked_add(d) }) {
+            match v.checked_mul(10).and_then(|x| {
+                if neg {
+                    x.checked_sub(d)
+                } else {
+                    x.checked_add(d)
+                }
+            }) {
                 Some(x) => v = x,
                 None => overflow = true,
             }

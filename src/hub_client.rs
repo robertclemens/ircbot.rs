@@ -15,9 +15,14 @@ use zeroize::Zeroizing;
 
 use crate::consts::*;
 use crate::crypto::{self, Key32};
-use crate::cstr::{atoi, atoll, eq_ic, has_uuid_dashes, now, sscanf, trunc_string, until_nul, Conv, Fmt};
+use crate::cstr::{
+    Conv, Fmt, atoi, atoll, eq_ic, has_uuid_dashes, now, sscanf, trunc_string, until_nul,
+};
 use crate::net::{self, ReadOutcome};
-use crate::state::{lww_accepts, opt_accepts, BotState, BotTreeRow, ChanReq, ChanStatus, HubAuthState, MaskRecord, UserRecord, S_CONNECTED};
+use crate::state::{
+    BotState, BotTreeRow, ChanReq, ChanStatus, HubAuthState, MaskRecord, S_CONNECTED, UserRecord,
+    lww_accepts, opt_accepts,
+};
 use crate::{bot_comms, channel, config, ircf, logm};
 
 /// Unsent bytes past which a hub that stopped reading is dropped.
@@ -45,7 +50,11 @@ pub fn bot_key_decode(state: &mut BotState) -> Option<(Key32, Key32)> {
             Some(crypto::split_priv(&raw))
         }
         _ => {
-            logm!(state, L_INFO, "[HUB] hub_key is not a valid 64-byte Curve25519 key\n");
+            logm!(
+                state,
+                L_INFO,
+                "[HUB] hub_key is not a valid 64-byte Curve25519 key\n"
+            );
             None
         }
     }
@@ -58,7 +67,9 @@ pub fn self_pub_refresh(state: &mut BotState) -> bool {
     if state.hub_key.is_empty() && state.hub_key_raw.is_zero() {
         return false;
     }
-    let Some((ed, x)) = bot_key_decode(state) else { return false };
+    let Some((ed, x)) = bot_key_decode(state) else {
+        return false;
+    };
     let mut priv_key = Zeroizing::new([0u8; HUB_KEY_RAW_LEN]);
     priv_key[..32].copy_from_slice(ed.as_ref());
     priv_key[32..].copy_from_slice(x.as_ref());
@@ -123,7 +134,11 @@ fn sign_challenge(state: &mut BotState, challenge: &[u8], hub_eph_pub: &[u8]) ->
 
 /// Session key: HKDF(X25519(bot_x, hub_eph), salt = challenge,
 /// info = "irchub-bot-session-v1|" uuid).
-fn derive_session_key(state: &mut BotState, hub_eph_pub: &[u8; 32], challenge: &[u8]) -> Option<Key32> {
+fn derive_session_key(
+    state: &mut BotState,
+    hub_eph_pub: &[u8; 32],
+    challenge: &[u8],
+) -> Option<Key32> {
     let (_ed, x) = bot_key_decode(state)?;
     let Some(shared) = crypto::x25519_derive(&x, hub_eph_pub) else {
         logm!(state, L_INFO, "[HUB] X25519 derive failed\n");
@@ -178,7 +193,11 @@ fn link_ready(state: &BotState) -> bool {
 
 /// Keepalive every 30 s, plus the self-throttling presence report.
 pub fn heartbeat(state: &mut BotState) {
-    if state.hubs.is_empty() || !state.hub_connected || !state.hub_authenticated || state.hub.is_none() {
+    if state.hubs.is_empty()
+        || !state.hub_connected
+        || !state.hub_authenticated
+        || state.hub.is_none()
+    {
         return;
     }
     let now = now();
@@ -194,7 +213,12 @@ pub fn sync_hostmask(state: &mut BotState) {
     if state.actual_hostname.is_empty() || !link_ready(state) {
         return;
     }
-    logm!(state, L_DEBUG, "[DEBUG] Syncing hostmask via delta: {}\n", state.actual_hostname);
+    logm!(
+        state,
+        L_DEBUG,
+        "[DEBUG] Syncing hostmask via delta: {}\n",
+        state.actual_hostname
+    );
     let (h, ts) = (state.actual_hostname.clone(), state.actual_hostname_ts);
     push_delta(state, "h", &h, ts);
 }
@@ -211,27 +235,35 @@ pub fn send_presence(state: &mut BotState, force: bool) {
         if !state.actual_server_name.is_empty() {
             server = trunc_string(&state.actual_server_name, TREE_SERVER_MAX + 1);
         } else if let Some(cfg) = state.irc_server_idx.and_then(|i| state.server_list.get(i)) {
-    server = trunc_string(cfg, TREE_SERVER_MAX + 1);
-}
+            server = trunc_string(cfg, TREE_SERVER_MAX + 1);
+        }
     }
     let now = now();
     let changed = server != state.presence_server;
-    if !force && !changed && state.last_presence_sent != 0 && now - state.last_presence_sent < BOT_PRESENCE_REPORT_INTERVAL {
-return;
+    if !force
+        && !changed
+        && state.last_presence_sent != 0
+        && now - state.last_presence_sent < BOT_PRESENCE_REPORT_INTERVAL
+    {
+        return;
     }
     let payload = format!("{}|{}|{}", BOT_VERSION, server, state.bot_start_time);
     if send_frame(state, CMD_BOT_PRESENCE, payload.as_bytes()) {
-state.presence_server = server.clone();
-state.last_presence_sent = now;
-if changed {
-    logm!(
-state,
-L_DEBUG,
-"[HUB] Presence: {} on {}\n",
-        BOT_VERSION,
-        if server.is_empty() { "(no server)" } else { server.as_str() }
-    );
-}
+        state.presence_server = server.clone();
+        state.last_presence_sent = now;
+        if changed {
+            logm!(
+                state,
+                L_DEBUG,
+                "[HUB] Presence: {} on {}\n",
+                BOT_VERSION,
+                if server.is_empty() {
+                    "(no server)"
+                } else {
+                    server.as_str()
+                }
+            );
+        }
     }
 }
 
@@ -249,7 +281,10 @@ fn process_tree(state: &mut BotState, payload: &str) {
         }
         let f: Vec<&str> = line[2..].splitn(8, '|').take(7).collect();
         let n = f.len();
-        let mut row = BotTreeRow { kind: (b[0] as char).to_ascii_lowercase(), ..BotTreeRow::default() };
+        let mut row = BotTreeRow {
+            kind: (b[0] as char).to_ascii_lowercase(),
+            ..BotTreeRow::default()
+        };
         match row.kind {
             'h' if n >= 5 => {
                 row.depth = atoi(f[0]);
@@ -305,7 +340,14 @@ pub fn push_delta(state: &mut BotState, key: &str, value: &str, ts: i64) -> bool
         return false;
     }
     if send_frame(state, CMD_BOT_DELTA, payload.as_bytes()) {
-        logm!(state, L_DEBUG, "[HUB] Delta pushed: {}={} ts={}\n", key, value, ts);
+        logm!(
+            state,
+            L_DEBUG,
+            "[HUB] Delta pushed: {}={} ts={}\n",
+            key,
+            value,
+            ts
+        );
         true
     } else {
         logm!(state, L_INFO, "[HUB] Delta push failed, falling back\n");
@@ -357,21 +399,37 @@ pub fn generate_config_payload(state: &BotState) -> String {
     add(format!("v|{}|{}\n", BOT_PROTO_VERSION, 1));
     // Stable timestamps: now() here would make every push look new.
     if !state.actual_hostname.is_empty() && state.actual_hostname_ts > 0 {
-        add(format!("h|{}|{}\n", state.actual_hostname, state.actual_hostname_ts));
+        add(format!(
+            "h|{}|{}\n",
+            state.actual_hostname, state.actual_hostname_ts
+        ));
     }
     if !state.current_nick.is_empty() && state.current_nick_ts > 0 {
-        add(format!("n|{}|{}\n", state.current_nick, state.current_nick_ts));
+        add(format!(
+            "n|{}|{}\n",
+            state.current_nick, state.current_nick_ts
+        ));
     }
     out
 }
 
 /// Ask a bot for ops through the hub; false means fall back to PRIVMSG.
 pub fn request_op(state: &mut BotState, target_uuid: &str, channel: &str) -> bool {
-    if !state.hub_connected || !state.hub_authenticated || state.hub.is_none() || target_uuid == state.bot_uuid {
+    if !state.hub_connected
+        || !state.hub_authenticated
+        || state.hub.is_none()
+        || target_uuid == state.bot_uuid
+    {
         return false;
     }
     let payload = trunc_string(&format!("{target_uuid}|{channel}"), 256);
-    logm!(state, L_INFO, "[HUB] Requesting ops via hub: target={} chan={}\n", target_uuid, channel);
+    logm!(
+        state,
+        L_INFO,
+        "[HUB] Requesting ops via hub: target={} chan={}\n",
+        target_uuid,
+        channel
+    );
     send_frame(state, CMD_OP_REQUEST, payload.as_bytes())
 }
 
@@ -385,7 +443,12 @@ pub fn relay_bot_command(state: &mut BotState, target_uuid: &str, frame_line: &s
     if payload.len() >= MAX_BUFFER || !send_frame(state, CMD_BOT_RELAY, payload.as_bytes()) {
         return false;
     }
-    logm!(state, L_DEBUG, "[BOT-COMM] CMD_BOT_RELAY sent to hub for {}\n", target_uuid);
+    logm!(
+        state,
+        L_DEBUG,
+        "[BOT-COMM] CMD_BOT_RELAY sent to hub for {}\n",
+        target_uuid
+    );
     true
 }
 
@@ -399,7 +462,13 @@ pub fn send_invite_request(state: &mut BotState, nick: &str, channel: &str) -> b
         return false;
     }
     if send_frame(state, CMD_INVITE_REQUEST, payload.as_bytes()) {
-        logm!(state, L_INFO, "[HUB] Sent INVITE_REQUEST for {} in {}\n", nick, channel);
+        logm!(
+            state,
+            L_INFO,
+            "[HUB] Sent INVITE_REQUEST for {} in {}\n",
+            nick,
+            channel
+        );
         return true;
     }
     false
@@ -414,13 +483,26 @@ pub fn send_chan_request(state: &mut BotState, kind: &str, channel: &str) -> boo
     if payload.len() >= MAX_CHAN + 16 || !send_frame(state, CMD_CHAN_REQUEST, payload.as_bytes()) {
         return false;
     }
-    logm!(state, L_INFO, "[CHANREQ] Sent {} request for {} to hub\n", kind, channel);
+    logm!(
+        state,
+        L_INFO,
+        "[CHANREQ] Sent {} request for {} to hub\n",
+        kind,
+        channel
+    );
     true
 }
 
 /// Answer a channel-access request (today only `key`); the payload carries
 /// the key and is wiped.
-pub fn send_chan_reply(state: &mut BotState, request_id: &str, kind: &str, channel: &str, status: &str, data: &str) -> bool {
+pub fn send_chan_reply(
+    state: &mut BotState,
+    request_id: &str,
+    kind: &str,
+    channel: &str,
+    status: &str,
+    data: &str,
+) -> bool {
     if !state.hub_connected || !state.hub_authenticated || state.hub.is_none() {
         return false;
     }
@@ -447,13 +529,22 @@ pub fn push_admin_delta(state: &mut BotState) {
 
     let chunk_cap = MAX_BUFFER - 64;
     let line_cap = CFG_MASK_LINE_MAX.max(CFG_USER_LINE_MAX);
-    let mut lines: Vec<String> = state.user_records.iter().map(config::format_user_line).collect();
+    let mut lines: Vec<String> = state
+        .user_records
+        .iter()
+        .map(config::format_user_line)
+        .collect();
     lines.extend(state.mask_records.iter().map(config::format_mask_line));
     let mut payload = String::new();
     let mut frames = 0;
     for (i, line) in lines.iter().enumerate() {
         if line.len() >= line_cap {
-            logm!(state, L_INFO, "[HUB] Admin delta: record {} too long; skipped\n", i);
+            logm!(
+                state,
+                L_INFO,
+                "[HUB] Admin delta: record {} too long; skipped\n",
+                i
+            );
             continue;
         }
         if payload.len() + line.len() > chunk_cap {
@@ -503,7 +594,12 @@ pub fn push_config(state: &mut BotState) {
         logm!(state, L_DEBUG, "[HUB] No config to push\n");
         return;
     }
-    logm!(state, L_DEBUG, "[HUB-SYNC] Pushing config to hub ({} bytes)\n", payload.len());
+    logm!(
+        state,
+        L_DEBUG,
+        "[HUB-SYNC] Pushing config to hub ({} bytes)\n",
+        payload.len()
+    );
     if send_frame(state, CMD_CONFIG_PUSH, payload.as_bytes()) {
         logm!(state, L_INFO, "[HUB] Config pushed to hub\n");
     } else {
@@ -522,7 +618,13 @@ pub fn push_channel(state: &mut BotState, ci: usize) {
         return;
     }
     if send_frame(state, CMD_CONFIG_PUSH, payload.as_bytes()) {
-        logm!(state, L_INFO, "[HUB] Pushed channel {} modes={} to hub\n", name, modes);
+        logm!(
+            state,
+            L_INFO,
+            "[HUB] Pushed channel {} modes={} to hub\n",
+            name,
+            modes
+        );
     } else {
         logm!(state, L_INFO, "[HUB] Failed to push channel {}\n", name);
     }
@@ -530,7 +632,10 @@ pub fn push_channel(state: &mut BotState, ci: usize) {
 
 /// PURGE|<cutoff>: drop tombstones stamped before cutoff (0: all).
 fn apply_purge(state: &mut BotState, arg: &str) -> usize {
-    let cutoff = match arg.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']).parse::<i64>() {
+    let cutoff = match arg
+        .trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r'])
+        .parse::<i64>()
+    {
         Ok(v) if v >= 0 => v,
         _ => {
             logm!(state, L_INFO, "[HUB] Rejected malformed PURGE line\n");
@@ -540,11 +645,20 @@ fn apply_purge(state: &mut BotState, arg: &str) -> usize {
     let old = |ts: i64| cutoff == 0 || ts < cutoff;
     let before = state.chans.len() + state.user_records.len() + state.mask_records.len();
     state.chans.retain(|c| c.is_managed || !old(c.timestamp));
-    state.user_records.retain(|u| u.is_active || !old(u.timestamp));
-    state.mask_records.retain(|m| m.is_active || !old(m.timestamp));
+    state
+        .user_records
+        .retain(|u| u.is_active || !old(u.timestamp));
+    state
+        .mask_records
+        .retain(|m| m.is_active || !old(m.timestamp));
     let purged = before - (state.chans.len() + state.user_records.len() + state.mask_records.len());
     if purged > 0 {
-        logm!(state, L_INFO, "[HUB] Purged {} tombstoned entries\n", purged);
+        logm!(
+            state,
+            L_INFO,
+            "[HUB] Purged {} tombstoned entries\n",
+            purged
+        );
         config::write_with_state_pass(state);
     }
     purged
@@ -562,47 +676,130 @@ fn parse_hub_chan(data: &str) -> Option<(String, String, u32, String, i64)> {
     let (mut modes, mut ts) = (0i64, 0i64);
     let r = sscanf(
         data,
-        &[Fmt::Set(64, P), Fmt::Lit("|"), Fmt::Set(30, P), Fmt::Lit("|"), Fmt::Int, Fmt::Lit("|"), Fmt::Set(7, P), Fmt::Lit("|"), Fmt::Int],
+        &[
+            Fmt::Set(64, P),
+            Fmt::Lit("|"),
+            Fmt::Set(30, P),
+            Fmt::Lit("|"),
+            Fmt::Int,
+            Fmt::Lit("|"),
+            Fmt::Set(7, P),
+            Fmt::Lit("|"),
+            Fmt::Int,
+        ],
     );
-    if let Some(v) = set(&r, 0) { chan = v.s(); }
-    if let Some(v) = set(&r, 1) { key = v.s(); }
-    if let Some(v) = set(&r, 2) { modes = v.i(); }
-    if let Some(v) = set(&r, 3) { op = v.s(); }
-    if let Some(v) = set(&r, 4) { ts = v.i(); }
+    if let Some(v) = set(&r, 0) {
+        chan = v.s();
+    }
+    if let Some(v) = set(&r, 1) {
+        key = v.s();
+    }
+    if let Some(v) = set(&r, 2) {
+        modes = v.i();
+    }
+    if let Some(v) = set(&r, 3) {
+        op = v.s();
+    }
+    if let Some(v) = set(&r, 4) {
+        ts = v.i();
+    }
     let mut parsed = r.len();
     if parsed < 5 {
         modes = 0;
-        let r = sscanf(data, &[Fmt::Set(64, P), Fmt::Lit("||"), Fmt::Int, Fmt::Lit("|"), Fmt::Set(7, P), Fmt::Lit("|"), Fmt::Int]);
-        if let Some(v) = set(&r, 0) { chan = v.s(); }
-        if let Some(v) = set(&r, 1) { modes = v.i(); }
-        if let Some(v) = set(&r, 2) { op = v.s(); }
-        if let Some(v) = set(&r, 3) { ts = v.i(); }
+        let r = sscanf(
+            data,
+            &[
+                Fmt::Set(64, P),
+                Fmt::Lit("||"),
+                Fmt::Int,
+                Fmt::Lit("|"),
+                Fmt::Set(7, P),
+                Fmt::Lit("|"),
+                Fmt::Int,
+            ],
+        );
+        if let Some(v) = set(&r, 0) {
+            chan = v.s();
+        }
+        if let Some(v) = set(&r, 1) {
+            modes = v.i();
+        }
+        if let Some(v) = set(&r, 2) {
+            op = v.s();
+        }
+        if let Some(v) = set(&r, 3) {
+            ts = v.i();
+        }
         parsed = r.len();
         if parsed >= 4 {
             key = "";
         } else {
             modes = 0;
-            let r = sscanf(data, &[Fmt::Set(64, P), Fmt::Lit("|"), Fmt::Set(30, P), Fmt::Lit("|"), Fmt::Set(7, P), Fmt::Lit("|"), Fmt::Int]);
-            if let Some(v) = set(&r, 0) { chan = v.s(); }
-            if let Some(v) = set(&r, 1) { key = v.s(); }
-            if let Some(v) = set(&r, 2) { op = v.s(); }
-            if let Some(v) = set(&r, 3) { ts = v.i(); }
+            let r = sscanf(
+                data,
+                &[
+                    Fmt::Set(64, P),
+                    Fmt::Lit("|"),
+                    Fmt::Set(30, P),
+                    Fmt::Lit("|"),
+                    Fmt::Set(7, P),
+                    Fmt::Lit("|"),
+                    Fmt::Int,
+                ],
+            );
+            if let Some(v) = set(&r, 0) {
+                chan = v.s();
+            }
+            if let Some(v) = set(&r, 1) {
+                key = v.s();
+            }
+            if let Some(v) = set(&r, 2) {
+                op = v.s();
+            }
+            if let Some(v) = set(&r, 3) {
+                ts = v.i();
+            }
             parsed = r.len();
             if parsed < 3 {
-                let r = sscanf(data, &[Fmt::Set(64, P), Fmt::Lit("||"), Fmt::Set(7, P), Fmt::Lit("|"), Fmt::Int]);
-                if let Some(v) = set(&r, 0) { chan = v.s(); }
-                if let Some(v) = set(&r, 1) { op = v.s(); }
-                if let Some(v) = set(&r, 2) { ts = v.i(); }
+                let r = sscanf(
+                    data,
+                    &[
+                        Fmt::Set(64, P),
+                        Fmt::Lit("||"),
+                        Fmt::Set(7, P),
+                        Fmt::Lit("|"),
+                        Fmt::Int,
+                    ],
+                );
+                if let Some(v) = set(&r, 0) {
+                    chan = v.s();
+                }
+                if let Some(v) = set(&r, 1) {
+                    op = v.s();
+                }
+                if let Some(v) = set(&r, 2) {
+                    ts = v.i();
+                }
                 parsed = r.len();
                 key = "";
             }
         }
     }
-    (parsed >= 3).then(|| (chan.to_string(), key.to_string(), modes as i32 as u32, op.to_string(), ts))
+    (parsed >= 3).then(|| {
+        (
+            chan.to_string(),
+            key.to_string(),
+            modes as i32 as u32,
+            op.to_string(),
+            ts,
+        )
+    })
 }
 
 fn sync_channel_line(state: &mut BotState, data: &str) -> bool {
-    let Some((chan, key, modes, op, ts)) = parse_hub_chan(data) else { return false };
+    let Some((chan, key, modes, op, ts)) = parse_hub_chan(data) else {
+        return false;
+    };
     let is_add = op == "add";
     let ci = channel::find(state, &chan);
     logm!(
@@ -616,7 +813,9 @@ fn sync_channel_line(state: &mut BotState, data: &str) -> bool {
     );
     match ci {
         None if is_add => {
-            let Some(ci) = channel::add(state, &chan) else { return false };
+            let Some(ci) = channel::add(state, &chan) else {
+                return false;
+            };
             let c = &mut state.chans[ci];
             if !key.is_empty() {
                 c.key = trunc_string(&key, MAX_KEY);
@@ -628,13 +827,25 @@ fn sync_channel_line(state: &mut BotState, data: &str) -> bool {
             true
         }
         None => {
-            logm!(state, L_DEBUG, "[HUB-SYNC] Skipped del for non-existent channel: {}\n", chan);
+            logm!(
+                state,
+                L_DEBUG,
+                "[HUB-SYNC] Skipped del for non-existent channel: {}\n",
+                chan
+            );
             false
         }
         Some(ci) => {
             let c = &state.chans[ci];
             if !lww_accepts(ts, is_add, c.timestamp, c.is_managed) {
-                logm!(state, L_DEBUG, "[HUB-SYNC] Rejected channel {}: hub_ts={} local_ts={} (not newer)\n", chan, ts, c.timestamp);
+                logm!(
+                    state,
+                    L_DEBUG,
+                    "[HUB-SYNC] Rejected channel {}: hub_ts={} local_ts={} (not newer)\n",
+                    chan,
+                    ts,
+                    c.timestamp
+                );
                 return false;
             }
             let c = &mut state.chans[ci];
@@ -648,14 +859,24 @@ fn sync_channel_line(state: &mut BotState, data: &str) -> bool {
             let (status, ckey) = (c.status, c.key.clone());
             logm!(state, L_INFO, "[HUB] Updated channel: {} ({})\n", chan, op);
             if was_managed && !is_add && status == ChanStatus::In {
-                logm!(state, L_INFO, "[HUB] Parting channel {} (synced del)\n", chan);
+                logm!(
+                    state,
+                    L_INFO,
+                    "[HUB] Parting channel {} (synced del)\n",
+                    chan
+                );
                 ircf!(state, "PART {} :Hub sync\r\n", chan);
                 if let Some(c) = state.chans.get_mut(ci) {
                     c.status = ChanStatus::Out;
                 }
             }
             if !was_managed && is_add && status != ChanStatus::In {
-                logm!(state, L_INFO, "[HUB] Joining channel {} (synced add)\n", chan);
+                logm!(
+                    state,
+                    L_INFO,
+                    "[HUB] Joining channel {} (synced add)\n",
+                    chan
+                );
                 if ckey.is_empty() {
                     ircf!(state, "JOIN {}\r\n", chan);
                 } else {
@@ -668,7 +889,11 @@ fn sync_channel_line(state: &mut BotState, data: &str) -> bool {
 }
 
 fn sync_mask_line(state: &mut BotState, data: &str) -> bool {
-    let first = data.find('|').map(|p| &data[..p]).filter(|f| f.len() < 40).unwrap_or("");
+    let first = data
+        .find('|')
+        .map(|p| &data[..p])
+        .filter(|f| f.len() < 40)
+        .unwrap_or("");
     if !has_uuid_dashes(first) {
         return false;
     }
@@ -681,9 +906,16 @@ fn sync_mask_line(state: &mut BotState, data: &str) -> bool {
     let act = trunc_string(f[2], 8);
     let (last_used, ts) = (atoll(f[3]), atoll(f[4]));
     let is_active = act.starts_with("add");
-    let mut mi = state.mask_records.iter().position(|m| m.uuid == uuid && eq_ic(&m.mask, &mask));
+    let mut mi = state
+        .mask_records
+        .iter()
+        .position(|m| m.uuid == uuid && eq_ic(&m.mask, &mask));
     if mi.is_none() && state.mask_records.len() < MAX_USER_MASKS {
-        state.mask_records.push(MaskRecord { uuid: uuid.clone(), mask: mask.clone(), ..MaskRecord::default() });
+        state.mask_records.push(MaskRecord {
+            uuid: uuid.clone(),
+            mask: mask.clone(),
+            ..MaskRecord::default()
+        });
         mi = Some(state.mask_records.len() - 1);
     }
     let Some(mi) = mi else { return false };
@@ -702,12 +934,21 @@ fn sync_mask_line(state: &mut BotState, data: &str) -> bool {
 
 fn sync_user_line(state: &mut BotState, typ: char, data: &str) -> bool {
     let Some(ul) = config::parse_user_line(data) else {
-        logm!(state, L_DEBUG, "[HUB-SYNC] Malformed {}| record ignored\n", typ);
+        logm!(
+            state,
+            L_DEBUG,
+            "[HUB-SYNC] Malformed {}| record ignored\n",
+            typ
+        );
         return false;
     };
     let mut ui = state.user_records.iter().position(|u| u.uuid == ul.uuid);
     if ui.is_none() && state.user_records.len() < MAX_USER_RECORDS {
-        state.user_records.push(UserRecord { uuid: ul.uuid.clone(), typ: '\0', ..UserRecord::default() });
+        state.user_records.push(UserRecord {
+            uuid: ul.uuid.clone(),
+            typ: '\0',
+            ..UserRecord::default()
+        });
         ui = Some(state.user_records.len() - 1);
     }
     let Some(ui) = ui else { return false };
@@ -740,7 +981,11 @@ fn sync_user_line(state: &mut BotState, typ: char, data: &str) -> bool {
 fn sync_bot_line(state: &mut BotState, data: &str, listed: &mut Vec<String>) -> bool {
     let Some(mut inb) = config::parse_bot_line(data) else {
         // Never stored truncated: a clipped mask or uuid mis-keys matches.
-        logm!(state, L_INFO, "[HUB] Rejected malformed/oversized trusted-bot line\n");
+        logm!(
+            state,
+            L_INFO,
+            "[HUB] Rejected malformed/oversized trusted-bot line\n"
+        );
         return false;
     };
     if !inb.uuid.is_empty() && listed.len() < MAX_TRUSTED_BOTS {
@@ -781,13 +1026,25 @@ fn sync_bot_line(state: &mut BotState, data: &str, listed: &mut Vec<String>) -> 
                 }
                 let mask = inb.mask.clone();
                 state.trusted_bots[ei] = inb;
-                logm!(state, L_INFO, "[HUB] Updated trusted bot: {}{}\n", mask, if key_is_new { " (new key)" } else { "" });
+                logm!(
+                    state,
+                    L_INFO,
+                    "[HUB] Updated trusted bot: {}{}\n",
+                    mask,
+                    if key_is_new { " (new key)" } else { "" }
+                );
                 return true;
             }
             false
         }
         None if state.trusted_bots.len() < MAX_TRUSTED_BOTS => {
-            logm!(state, L_INFO, "[HUB] Added trusted bot: {}{}\n", inb.mask, if inb.has_pub { "" } else { " (no key yet)" });
+            logm!(
+                state,
+                L_INFO,
+                "[HUB] Added trusted bot: {}{}\n",
+                inb.mask,
+                if inb.has_pub { "" } else { " (no key yet)" }
+            );
             state.trusted_bots.push(inb);
             true
         }
@@ -800,7 +1057,11 @@ fn sync_bot_line(state: &mut BotState, data: &str, listed: &mut Vec<String>) -> 
 /// (keeping newer local last_seen / last_used); a T| marker makes the b|
 /// lines the whole trusted set.  Saved locally, never echoed back.
 pub fn process_config_data(state: &mut BotState, payload: &str) {
-    logm!(state, L_DEBUG, "[HUB-SYNC] Processing config data from hub\n");
+    logm!(
+        state,
+        L_DEBUG,
+        "[HUB-SYNC] Processing config data from hub\n"
+    );
     let mut has_user_lines = false;
     let mut has_mask_lines = false;
     let mut has_trust_set = false;
@@ -846,10 +1107,17 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
             b'm' => sync_mask_line(state, data),
             b'a' | b'o' => sync_user_line(state, b[0] as char, data),
             b'O' => match config::parse_opt_line(data) {
-                Some((flags, ts)) if opt_accepts(ts, &flags, state.opt_flags_ts, &state.opt_flags) => {
+                Some((flags, ts))
+                    if opt_accepts(ts, &flags, state.opt_flags_ts, &state.opt_flags) =>
+                {
                     state.opt_flags = flags;
                     state.opt_flags_ts = if ts > 0 { ts } else { now() };
-                    logm!(state, L_INFO, "[HUB-SYNC] opt flags updated -> '{}'\n", state.opt_flags);
+                    logm!(
+                        state,
+                        L_INFO,
+                        "[HUB-SYNC] opt flags updated -> '{}'\n",
+                        state.opt_flags
+                    );
                     true
                 }
                 _ => false,
@@ -861,7 +1129,13 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
             b'b' => sync_bot_line(state, data, &mut listed),
             b'T' => false, // end of the complete trusted-bot list: swept below
             other => {
-                logm!(state, L_DEBUG, "[HUB-SYNC] Unrecognized line type '{}': {}\n", other as char, line);
+                logm!(
+                    state,
+                    L_DEBUG,
+                    "[HUB-SYNC] Unrecognized line type '{}': {}\n",
+                    other as char,
+                    line
+                );
                 false
             }
         };
@@ -883,7 +1157,11 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
                 L_INFO,
                 "[HUB] Revoked trusted bot: {} ({}) - no longer registered on the hub\n",
                 tb.mask,
-                if tb.uuid.is_empty() { "no uuid" } else { tb.uuid.as_str() }
+                if tb.uuid.is_empty() {
+                    "no uuid"
+                } else {
+                    tb.uuid.as_str()
+                }
             );
             state.trusted_bots.remove(i);
             updates += 1;
@@ -893,23 +1171,36 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
     // Keep locally newer last_seen / last_used (auths not yet pushed).
     for u in &mut state.user_records {
         if let Some(s) = saved_users.iter().find(|s| s.uuid == u.uuid)
-            && s.last_seen > u.last_seen {
+            && s.last_seen > u.last_seen
+        {
             u.last_seen = s.last_seen;
         }
     }
     for m in &mut state.mask_records {
-        if let Some(s) = saved_masks.iter().find(|s| s.uuid == m.uuid && eq_ic(&s.mask, &m.mask))
-            && s.last_used > m.last_used {
+        if let Some(s) = saved_masks
+            .iter()
+            .find(|s| s.uuid == m.uuid && eq_ic(&s.mask, &m.mask))
+            && s.last_used > m.last_used
+        {
             m.last_used = s.last_used;
         }
     }
 
     if updates > 0 {
-        logm!(state, L_INFO, "[HUB] Applied {} config updates from hub\n", updates);
+        logm!(
+            state,
+            L_INFO,
+            "[HUB] Applied {} config updates from hub\n",
+            updates
+        );
         // Local only: echoing hub records back would loop forever.
         config::write_local_with_state_pass(state);
     } else {
-        logm!(state, L_DEBUG, "[HUB-SYNC] No updates applied (all timestamps older or equal)\n");
+        logm!(
+            state,
+            L_DEBUG,
+            "[HUB-SYNC] No updates applied (all timestamps older or equal)\n"
+        );
     }
 }
 
@@ -923,7 +1214,12 @@ fn handle_response(state: &mut BotState, cmd: u8, payload: &str) {
         CMD_BOT_TREE => process_tree(state, payload),
         CMD_CONFIG_PULL => logm!(state, L_INFO, "[HUB] Hub requested config sync\n"),
         CMD_CONFIG_DATA => {
-            logm!(state, L_INFO, "[HUB] Received config from hub ({} bytes)\n", payload.len());
+            logm!(
+                state,
+                L_INFO,
+                "[HUB] Received config from hub ({} bytes)\n",
+                payload.len()
+            );
             if !payload.is_empty() {
                 process_config_data(state, payload);
             }
@@ -949,13 +1245,30 @@ fn handle_response(state: &mut BotState, cmd: u8, payload: &str) {
             match channel::find(state, chan) {
                 Some(ci) if state.chans[ci].status == ChanStatus::In => {
                     if state.chans[ci].i_am_opped {
-                        logm!(state, L_INFO, "[HUB] Granting ops to {} in {} (hub request)\n", nick, chan);
+                        logm!(
+                            state,
+                            L_INFO,
+                            "[HUB] Granting ops to {} in {} (hub request)\n",
+                            nick,
+                            chan
+                        );
                         ircf!(state, "MODE {} +o {}\r\n", chan, nick);
                     } else {
-                        logm!(state, L_INFO, "[HUB] Cannot grant ops to {} in {} - I'm not opped\n", nick, chan);
+                        logm!(
+                            state,
+                            L_INFO,
+                            "[HUB] Cannot grant ops to {} in {} - I'm not opped\n",
+                            nick,
+                            chan
+                        );
                     }
                 }
-                _ => logm!(state, L_INFO, "[HUB] Cannot grant ops - not in channel {}\n", chan),
+                _ => logm!(
+                    state,
+                    L_INFO,
+                    "[HUB] Cannot grant ops - not in channel {}\n",
+                    chan
+                ),
             }
         }
         CMD_OP_FAILED => {
@@ -968,12 +1281,23 @@ fn handle_response(state: &mut BotState, cmd: u8, payload: &str) {
             }
         }
         CMD_INVITE_REQUEST => {
-            let r = sscanf(payload, &[Fmt::Set(9, P), Fmt::Lit("|"), Fmt::Set(64, b"\n")]);
+            let r = sscanf(
+                payload,
+                &[Fmt::Set(9, P), Fmt::Lit("|"), Fmt::Set(64, b"\n")],
+            );
             if r.len() == 2 {
                 let (nick, chan) = (r[0].s(), r[1].s());
                 if let Some(ci) = channel::find(state, chan)
-                    && state.chans[ci].status == ChanStatus::In && state.chans[ci].i_am_opped {
-                    logm!(state, L_INFO, "[INVITE] Inviting {} into {} (hub request)\n", nick, chan);
+                    && state.chans[ci].status == ChanStatus::In
+                    && state.chans[ci].i_am_opped
+                {
+                    logm!(
+                        state,
+                        L_INFO,
+                        "[INVITE] Inviting {} into {} (hub request)\n",
+                        nick,
+                        chan
+                    );
                     ircf!(state, "INVITE {} {}\r\n", nick, chan);
                 }
             }
@@ -984,8 +1308,17 @@ fn handle_response(state: &mut BotState, cmd: u8, payload: &str) {
             let r = sscanf(
                 payload,
                 &[
-                    Fmt::Set(63, P), Fmt::Lit("|"), Fmt::Set(15, P), Fmt::Lit("|"), Fmt::Set(64, P), Fmt::Lit("|"),
-                    Fmt::Set(63, P), Fmt::Lit("|"), Fmt::Set(9, P), Fmt::Lit("|"), Fmt::Set(255, P),
+                    Fmt::Set(63, P),
+                    Fmt::Lit("|"),
+                    Fmt::Set(15, P),
+                    Fmt::Lit("|"),
+                    Fmt::Set(64, P),
+                    Fmt::Lit("|"),
+                    Fmt::Set(63, P),
+                    Fmt::Lit("|"),
+                    Fmt::Set(9, P),
+                    Fmt::Lit("|"),
+                    Fmt::Set(255, P),
                 ],
             );
             if r.len() < 4 {
@@ -996,8 +1329,15 @@ fn handle_response(state: &mut BotState, cmd: u8, payload: &str) {
             let nick = r.get(4).map_or("", |c| c.s());
             let mask = r.get(5).map_or("", |c| c.s());
             match ChanReq::from_token(kind) {
-                Some(k) => channel::access_service(state, id, k, chan, Some(nick), Some(mask), None),
-                None => logm!(state, L_DEBUG, "[DEBUG] [CHANREQ] Unknown action kind '{}'\n", kind),
+                Some(k) => {
+                    channel::access_service(state, id, k, chan, Some(nick), Some(mask), None)
+                }
+                None => logm!(
+                    state,
+                    L_DEBUG,
+                    "[DEBUG] [CHANREQ] Unknown action kind '{}'\n",
+                    kind
+                ),
             }
         }
         CMD_CHAN_REPLY => {
@@ -1005,7 +1345,15 @@ fn handle_response(state: &mut BotState, cmd: u8, payload: &str) {
             // 4th '|', never re-split (a key may contain one).
             let r = sscanf(
                 payload,
-                &[Fmt::Set(63, P), Fmt::Lit("|"), Fmt::Set(15, P), Fmt::Lit("|"), Fmt::Set(64, P), Fmt::Lit("|"), Fmt::Set(15, P)],
+                &[
+                    Fmt::Set(63, P),
+                    Fmt::Lit("|"),
+                    Fmt::Set(15, P),
+                    Fmt::Lit("|"),
+                    Fmt::Set(64, P),
+                    Fmt::Lit("|"),
+                    Fmt::Set(15, P),
+                ],
             );
             if r.len() == 4 {
                 let (kind, chan, status) = (r[1].s(), r[2].s(), r[3].s());
@@ -1013,12 +1361,24 @@ fn handle_response(state: &mut BotState, cmd: u8, payload: &str) {
                 if ChanReq::from_token(kind) == Some(ChanReq::Key) && status == "ok" {
                     channel::access_accept_key(state, chan, data);
                 } else {
-                    logm!(state, L_DEBUG, "[DEBUG] [CHANREQ] Reply {} for {}: {}\n", kind, chan, status);
+                    logm!(
+                        state,
+                        L_DEBUG,
+                        "[DEBUG] [CHANREQ] Reply {} for {}: {}\n",
+                        kind,
+                        chan,
+                        status
+                    );
                 }
             }
         }
         CMD_BOT_MSG if !payload.is_empty() => {
-            logm!(state, L_DEBUG, "[BOT-COMM] Received relayed bot command via hub ({} bytes)\n", payload.len());
+            logm!(
+                state,
+                L_DEBUG,
+                "[BOT-COMM] Received relayed bot command via hub ({} bytes)\n",
+                payload.len()
+            );
             bot_comms::process_payload(state, payload);
         }
         _ => {}
@@ -1032,7 +1392,11 @@ pub fn connect(state: &mut BotState) {
     }
     let hold = |state: &mut BotState| state.last_hub_connect_attempt = now() + 3600;
     if state.bot_uuid.is_empty() {
-        logm!(state, L_INFO, "[HUB] Cannot connect: UUID not set (it is generated at bot creation — re-run 'ircbot -setup').\n");
+        logm!(
+            state,
+            L_INFO,
+            "[HUB] Cannot connect: UUID not set (it is generated at bot creation — re-run 'ircbot -setup').\n"
+        );
         hold(state);
         return;
     }
@@ -1047,7 +1411,11 @@ pub fn connect(state: &mut BotState) {
         return;
     }
     if state.hub_key.is_empty() {
-        logm!(state, L_INFO, "[HUB] Cannot connect: bot keypair not set (generated at creation — re-run 'ircbot -setup').\n");
+        logm!(
+            state,
+            L_INFO,
+            "[HUB] Cannot connect: bot keypair not set (generated at creation — re-run 'ircbot -setup').\n"
+        );
         hold(state);
         return;
     }
@@ -1063,7 +1431,11 @@ pub fn connect(state: &mut BotState) {
         return;
     }
     if state.hubs[0].addr.is_empty() {
-        logm!(state, L_INFO, "[HUB] Cannot connect: No hubs configured. Use '+hub <host:port> <pubkey>'.\n");
+        logm!(
+            state,
+            L_INFO,
+            "[HUB] Cannot connect: No hubs configured. Use '+hub <host:port> <pubkey>'.\n"
+        );
         hold(state);
         return;
     }
@@ -1082,13 +1454,24 @@ pub fn connect(state: &mut BotState) {
         state.hub_remote_ed_pub_set = true;
     } else {
         state.hub_remote_ed_pub_set = false;
-        logm!(state, L_INFO, "[HUB] Cannot connect to {}: no pinned pubkey. Re-add with '+hub {} <pubkey>'.\n", hub_original, hub_original);
+        logm!(
+            state,
+            L_INFO,
+            "[HUB] Cannot connect to {}: no pinned pubkey. Re-add with '+hub {} <pubkey>'.\n",
+            hub_original,
+            hub_original
+        );
         state.hub_connecting = false;
         state.last_hub_connect_attempt = crate::cstr::now() + 60;
         return;
     }
     let Some(colon) = hub_original.rfind(':') else {
-        logm!(state, L_INFO, "[HUB] Invalid hub address (missing port): {}\n", hub_original);
+        logm!(
+            state,
+            L_INFO,
+            "[HUB] Invalid hub address (missing port): {}\n",
+            hub_original
+        );
         state.hub_connecting = false;
         return;
     };
@@ -1096,34 +1479,63 @@ pub fn connect(state: &mut BotState) {
     let addrs = match net::resolve(host, port) {
         Ok(a) => a,
         Err(e) => {
-            logm!(state, L_INFO, "[HUB] Cannot resolve hub address '{}': {}\n", host, e);
+            logm!(
+                state,
+                L_INFO,
+                "[HUB] Cannot resolve hub address '{}': {}\n",
+                host,
+                e
+            );
             state.hub_connecting = false;
             return;
         }
     };
     let mut stream = None;
     for addr in &addrs {
-        let Ok(sock) = net::new_socket(addr, None) else { continue };
+        let Ok(sock) = net::new_socket(addr, None) else {
+            continue;
+        };
         if let Ok(s) = net::connect_timeout(sock, addr, CONNECT_TIMEOUT_SECS) {
             stream = Some(s);
             break;
         }
     }
     let Some(stream) = stream else {
-        logm!(state, L_INFO, "[HUB] Failed to connect to {}:{}\n", host, port);
+        logm!(
+            state,
+            L_INFO,
+            "[HUB] Failed to connect to {}:{}\n",
+            host,
+            port
+        );
         state.hub_connecting = false;
         return;
     };
     let token = state.new_token(net::SLOT_HUB);
-    let sock = match net::into_mio(stream).and_then(|mut s| state.registry.register(&mut s, token, net::INTEREST).map(|_| s)) {
+    let sock = match net::into_mio(stream).and_then(|mut s| {
+        state
+            .registry
+            .register(&mut s, token, net::INTEREST)
+            .map(|_| s)
+    }) {
         Ok(s) => s,
         Err(e) => {
-            logm!(state, L_INFO, "[HUB] Could not register hub socket: {}\n", e);
+            logm!(
+                state,
+                L_INFO,
+                "[HUB] Could not register hub socket: {}\n",
+                e
+            );
             state.hub_connecting = false;
             return;
         }
     };
-    state.hub = Some(HubConn { sock, token, rbuf: Vec::new(), wbuf: Vec::new() });
+    state.hub = Some(HubConn {
+        sock,
+        token,
+        rbuf: Vec::new(),
+        wbuf: Vec::new(),
+    });
     state.hub_connected = true;
     state.hub_authenticated = false;
     state.hub_auth_state = HubAuthState::None;
@@ -1145,7 +1557,10 @@ pub fn handle_event(state: &mut BotState, token: mio::Token, readable: bool, wri
         return;
     }
     if writable {
-        let res = state.hub.as_mut().map(|h| net::flush(&mut h.sock, &mut h.wbuf));
+        let res = state
+            .hub
+            .as_mut()
+            .map(|h| net::flush(&mut h.sock, &mut h.wbuf));
         if let Some(Err(_)) = res {
             disconnect(state);
             return;
@@ -1156,17 +1571,22 @@ pub fn handle_event(state: &mut BotState, token: mio::Token, readable: bool, wri
     }
     loop {
         let outcome = {
-            let Some(h) = state.hub.as_mut().filter(|h| h.token == token) else { return };
+            let Some(h) = state.hub.as_mut().filter(|h| h.token == token) else {
+                return;
+            };
             net::read_available(&mut h.sock, &mut h.rbuf, MAX_HUB_FRAME + 4)
         };
         // Every complete frame, one at a time (a handler may drop the link).
         loop {
             let packet = {
-                let Some(h) = state.hub.as_mut().filter(|h| h.token == token) else { return };
+                let Some(h) = state.hub.as_mut().filter(|h| h.token == token) else {
+                    return;
+                };
                 if h.rbuf.len() < 4 {
                     None
                 } else {
-                    let len = u32::from_be_bytes([h.rbuf[0], h.rbuf[1], h.rbuf[2], h.rbuf[3]]) as usize;
+                    let len =
+                        u32::from_be_bytes([h.rbuf[0], h.rbuf[1], h.rbuf[2], h.rbuf[3]]) as usize;
                     if len == 0 || len > MAX_HUB_FRAME || len > i32::MAX as usize {
                         Some(Err(()))
                     } else if h.rbuf.len() < 4 + len {
@@ -1247,7 +1667,12 @@ fn process_packet(state: &mut BotState, body: &[u8]) {
 /// v2 challenge: challenge(32) || hub_eph_pub(32) || hub_sig(64).
 fn handle_challenge(state: &mut BotState, body: &[u8]) {
     if body.len() != 128 {
-        logm!(state, L_INFO, "[HUB] Expected 128-byte v2 challenge, got {} bytes\n", body.len());
+        logm!(
+            state,
+            L_INFO,
+            "[HUB] Expected 128-byte v2 challenge, got {} bytes\n",
+            body.len()
+        );
         disconnect(state);
         return;
     }
@@ -1257,7 +1682,11 @@ fn handle_challenge(state: &mut BotState, body: &[u8]) {
     let hub_sig = &body[64..128];
 
     if !state.hub_remote_ed_pub_set {
-        logm!(state, L_INFO, "[HUB] ERROR: hub pubkey not pinned. Re-add with '+hub <host:port> <pubkey>' before connecting.\n");
+        logm!(
+            state,
+            L_INFO,
+            "[HUB] ERROR: hub pubkey not pinned. Re-add with '+hub <host:port> <pubkey>' before connecting.\n"
+        );
         disconnect(state);
         return;
     }
@@ -1268,7 +1697,11 @@ fn handle_challenge(state: &mut BotState, body: &[u8]) {
     transcript.extend_from_slice(challenge);
     transcript.extend_from_slice(&hub_eph_pub);
     if !crypto::ed25519_verify(&state.hub_remote_ed_pub, &transcript, hub_sig) {
-        logm!(state, L_INFO, "[HUB] v2 hub signature INVALID — possible MITM. Disconnecting.\n");
+        logm!(
+            state,
+            L_INFO,
+            "[HUB] v2 hub signature INVALID — possible MITM. Disconnecting.\n"
+        );
         disconnect(state);
         return;
     }
@@ -1300,14 +1733,24 @@ fn handle_challenge(state: &mut BotState, body: &[u8]) {
 /// The hub's ACK: an encrypted single byte 0x01.
 fn handle_ack(state: &mut BotState, body: &[u8]) {
     if body.len() < GCM_IV_LEN + 1 + GCM_TAG_LEN {
-        logm!(state, L_INFO, "[HUB] Bad ACK from hub (len={})\n", body.len());
+        logm!(
+            state,
+            L_INFO,
+            "[HUB] Bad ACK from hub (len={})\n",
+            body.len()
+        );
         disconnect(state);
         return;
     }
     let ack = crypto::gcm_open(state.hub_session_key.get(), &[], body);
     let ok = matches!(&ack, Some(p) if p.len() == 1 && p[0] == 0x01);
     if !ok {
-        logm!(state, L_INFO, "[HUB] v2 ACK decrypt/parse failed (len={})\n", ack.map_or(-1, |p| p.len() as i64));
+        logm!(
+            state,
+            L_INFO,
+            "[HUB] v2 ACK decrypt/parse failed (len={})\n",
+            ack.map_or(-1, |p| p.len() as i64)
+        );
         disconnect(state);
         return;
     }
@@ -1322,7 +1765,11 @@ fn handle_ack(state: &mut BotState, body: &[u8]) {
     send_presence(state, true);
     if state.admin_delta_pending {
         // After the config push, so the hub already knows v|2.
-        logm!(state, L_INFO, "[HUB] Pushing user/mask changes made while the hub was unreachable\n");
+        logm!(
+            state,
+            L_INFO,
+            "[HUB] Pushing user/mask changes made while the hub was unreachable\n"
+        );
         push_admin_delta(state);
     }
 }
@@ -1333,10 +1780,22 @@ mod tests {
 
     #[test]
     fn hub_chan_formats() {
-        assert_eq!(parse_hub_chan("#a|k|64|add|5"), Some(("#a".into(), "k".into(), 64, "add".into(), 5)));
-        assert_eq!(parse_hub_chan("#a||128|del|6"), Some(("#a".into(), String::new(), 128, "del".into(), 6)));
-        assert_eq!(parse_hub_chan("#a|k|add|7"), Some(("#a".into(), "k".into(), 0, "add".into(), 7)));
-        assert_eq!(parse_hub_chan("#a||add|8"), Some(("#a".into(), String::new(), 0, "add".into(), 8)));
+        assert_eq!(
+            parse_hub_chan("#a|k|64|add|5"),
+            Some(("#a".into(), "k".into(), 64, "add".into(), 5))
+        );
+        assert_eq!(
+            parse_hub_chan("#a||128|del|6"),
+            Some(("#a".into(), String::new(), 128, "del".into(), 6))
+        );
+        assert_eq!(
+            parse_hub_chan("#a|k|add|7"),
+            Some(("#a".into(), "k".into(), 0, "add".into(), 7))
+        );
+        assert_eq!(
+            parse_hub_chan("#a||add|8"),
+            Some(("#a".into(), String::new(), 0, "add".into(), 8))
+        );
         assert_eq!(parse_hub_chan("#a"), None);
     }
 }

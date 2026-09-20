@@ -18,10 +18,10 @@ use zeroize::Zeroizing;
 
 use crate::consts::*;
 use crate::crypto::{self, Key32};
-use crate::cstr::{atoi, display_width, eq_ic, now, pad_right, trunc, trunc_string, Tok};
+use crate::cstr::{Tok, atoi, display_width, eq_ic, now, pad_right, trunc, trunc_string};
 use crate::state::{
-    has_control_bytes, is_rfc_nick, is_valid_bot_nick, lww_next_ts, A2rCtx, BotState, ChanStatus, MaskRecord, TrustedBot,
-    UserRecord, S_CONNECTED, S_DIE,
+    A2rCtx, BotState, ChanStatus, MaskRecord, S_CONNECTED, S_DIE, TrustedBot, UserRecord,
+    has_control_bytes, is_rfc_nick, is_valid_bot_nick, lww_next_ts,
 };
 use crate::{auth, bot_comms, channel, config, dcc, hub_client, irc_client, ircf, logm, updater};
 
@@ -45,7 +45,13 @@ fn reply_row_cap(state: &BotState) -> usize {
 
 fn reply_rows_omitted(state: &mut BotState, nick: &str, omitted: usize, what: &str) {
     if omitted > 0 {
-        ircf!(state, "PRIVMSG {} :| (+{} more {} not shown -- ask over 'dcc' for the full list)\r\n", nick, omitted, what);
+        ircf!(
+            state,
+            "PRIVMSG {} :| (+{} more {} not shown -- ask over 'dcc' for the full list)\r\n",
+            nick,
+            omitted,
+            what
+        );
     }
 }
 
@@ -77,7 +83,13 @@ fn fmt_elapsed(since: i64) -> String {
     if since <= 0 || d < 0 {
         d = 0;
     }
-    format!("{}d {}h {}m {}s", d / 86400, (d % 86400) / 3600, (d % 3600) / 60, d % 60)
+    format!(
+        "{}d {}h {}m {}s",
+        d / 86400,
+        (d % 86400) / 3600,
+        (d % 3600) / 60,
+        d % 60
+    )
 }
 
 /// "3d4h", "16h31m", "45s": two units for the bot tree.
@@ -85,13 +97,18 @@ fn tree_fmt_uptime(secs: i64) -> String {
     if secs <= 0 {
         return "-".into();
     }
-    let (d, h, m, s) = (secs / 86400, (secs % 86400) / 3600, (secs % 3600) / 60, secs % 60);
+    let (d, h, m, s) = (
+        secs / 86400,
+        (secs % 86400) / 3600,
+        (secs % 3600) / 60,
+        secs % 60,
+    );
     if d != 0 {
         format!("{d}d{h}h")
     } else if h != 0 {
-    format!("{h}h{m}m")
+        format!("{h}h{m}m")
     } else if m != 0 {
-    format!("{m}m{s}s")
+        format!("{m}m{s}s")
     } else {
         format!("{s}s")
     }
@@ -142,7 +159,11 @@ fn tree_prefix(depth: i32, last_at: &[bool], is_last: bool, has_kids: bool) -> S
     }
     let mut out = String::new();
     for a in 1..depth as usize {
-        out.push_str(if last_at.get(a).copied().unwrap_or(false) { "  " } else { "\u{2502} " });
+        out.push_str(if last_at.get(a).copied().unwrap_or(false) {
+            "  "
+        } else {
+            "\u{2502} "
+        });
     }
     out.push_str(if is_last { "\u{2514}" } else { "\u{251c}" });
     out.push('\u{2500}');
@@ -159,68 +180,113 @@ fn bots_tree_row(state: &BotState, i: usize, last_at: &mut [bool; 10]) -> BotsRo
     }
     let prefix = tree_prefix(r.depth, last_at, is_last, tree_has_children(state, i));
     let label = if r.kind == 'h' {
-        format!("{}{}", if r.name.is_empty() { "(hub)" } else { r.name.as_str() }, if r.online { "" } else { " (unlinked)" })
+        format!(
+            "{}{}",
+            if r.name.is_empty() {
+                "(hub)"
+            } else {
+                r.name.as_str()
+            },
+            if r.online { "" } else { " (unlinked)" }
+        )
     } else if r.name.is_empty() {
-    "(unnamed)".to_string()
-} else {
-    r.name.clone()
-};
-let age = (now() - state.bot_tree_ts).max(0);
-BotsRow {
-    name: format!("{prefix}{}", trunc(&label, TREE_NAME_MAX + 32)),
-        version: if r.version.is_empty() { "-".into() } else { r.version.clone() },
-        uptime: tree_fmt_uptime(if r.kind == 'h' && !r.online { 0 } else { r.uptime + age }),
+        "(unnamed)".to_string()
+    } else {
+        r.name.clone()
+    };
+    let age = (now() - state.bot_tree_ts).max(0);
+    BotsRow {
+        name: format!("{prefix}{}", trunc(&label, TREE_NAME_MAX + 32)),
+        version: if r.version.is_empty() {
+            "-".into()
+        } else {
+            r.version.clone()
+        },
+        uptime: tree_fmt_uptime(if r.kind == 'h' && !r.online {
+            0
+        } else {
+            r.uptime + age
+        }),
         server: if r.kind == 'h' {
             "(hub)".into()
         } else if r.server.is_empty() {
-        "-".into()
-    } else {
-        r.server.clone()
-    },
-}
+            "-".into()
+        } else {
+            r.server.clone()
+        },
+    }
 }
 
 fn bots_self_row(state: &BotState) -> BotsRow {
-BotsRow {
-    name: if state.current_nick.is_empty() { "me".into() } else { state.current_nick.clone() },
-    version: BOT_VERSION.into(),
-    uptime: tree_fmt_uptime(now() - state.bot_start_time),
-    server: if state.status & S_CONNECTED != 0 && !state.actual_server_name.is_empty() {
-        trunc_string(&state.actual_server_name, TREE_SERVER_MAX + 1)
-    } else {
-        "-".into()
-    },
-}
+    BotsRow {
+        name: if state.current_nick.is_empty() {
+            "me".into()
+        } else {
+            state.current_nick.clone()
+        },
+        version: BOT_VERSION.into(),
+        uptime: tree_fmt_uptime(now() - state.bot_start_time),
+        server: if state.status & S_CONNECTED != 0 && !state.actual_server_name.is_empty() {
+            trunc_string(&state.actual_server_name, TREE_SERVER_MAX + 1)
+        } else {
+            "-".into()
+        },
+    }
 }
 
 fn bots_trusted_row(state: &BotState, i: usize) -> BotsRow {
-let bnick = state.trusted_bots[i].nick();
-let prefix = tree_prefix(1, &[], i + 1 == state.trusted_bots.len(), false);
-BotsRow {
-    name: format!("{}{}", prefix, if bnick.is_empty() { "(unnamed)" } else { bnick }),
-    version: "-".into(),
-    uptime: "-".into(),
-    server: "-".into(),
-}
+    let bnick = state.trusted_bots[i].nick();
+    let prefix = tree_prefix(1, &[], i + 1 == state.trusted_bots.len(), false);
+    BotsRow {
+        name: format!(
+            "{}{}",
+            prefix,
+            if bnick.is_empty() { "(unnamed)" } else { bnick }
+        ),
+        version: "-".into(),
+        uptime: "-".into(),
+        server: "-".into(),
+    }
 }
 
 fn bots_widen(c: &BotsRow, cols: &mut (usize, usize, usize)) {
-cols.0 = cols.0.max((display_width(&c.name) + BOTS_COL_GAP).min(BOTS_NAME_COL_MAX));
-cols.1 = cols.1.max(display_width(&c.version) + BOTS_COL_GAP);
-cols.2 = cols.2.max(display_width(&c.uptime) + BOTS_COL_GAP);
+    cols.0 = cols
+        .0
+        .max((display_width(&c.name) + BOTS_COL_GAP).min(BOTS_NAME_COL_MAX));
+    cols.1 = cols.1.max(display_width(&c.version) + BOTS_COL_GAP);
+    cols.2 = cols.2.max(display_width(&c.uptime) + BOTS_COL_GAP);
 }
 
 /// Spaces taking a cell of width w out to col, never fewer than the gap.
 fn bots_pad(col: usize, w: usize, cap: usize) -> String {
-let n = if w + BOTS_COL_GAP <= col { col - w } else { BOTS_COL_GAP };
-" ".repeat(n.min(cap - 1))
+    let n = if w + BOTS_COL_GAP <= col {
+        col - w
+    } else {
+        BOTS_COL_GAP
+    };
+    " ".repeat(n.min(cap - 1))
 }
 
 fn bots_emit(state: &mut BotState, nick: &str, c: &BotsRow, cols: (usize, usize, usize)) {
-let p1 = bots_pad(cols.0, display_width(&c.name), BOTS_NAME_COL_MAX + 1);
-let p2 = bots_pad(cols.1, display_width(&c.version), TREE_VERSION_MAX + 1 + BOTS_COL_GAP + 1);
-let p3 = bots_pad(cols.2, display_width(&c.uptime), 32 + BOTS_COL_GAP + 1);
-ircf!(state, "PRIVMSG {} :| {}{}{}{}{}{}{}\r\n", nick, c.name, p1, c.version, p2, c.uptime, p3, c.server);
+    let p1 = bots_pad(cols.0, display_width(&c.name), BOTS_NAME_COL_MAX + 1);
+    let p2 = bots_pad(
+        cols.1,
+        display_width(&c.version),
+        TREE_VERSION_MAX + 1 + BOTS_COL_GAP + 1,
+    );
+    let p3 = bots_pad(cols.2, display_width(&c.uptime), 32 + BOTS_COL_GAP + 1);
+    ircf!(
+        state,
+        "PRIVMSG {} :| {}{}{}{}{}{}{}\r\n",
+        nick,
+        c.name,
+        p1,
+        c.version,
+        p2,
+        c.uptime,
+        p3,
+        c.server
+    );
 }
 
 // ---- CMD-log redaction -----------------------------------------------------------------
@@ -229,29 +295,69 @@ ircf!(state, "PRIVMSG {} :| {}{}{}{}{}{}{}\r\n", nick, c.name, p1, c.version, p2
 /// secret.  A verb missing from the list is logged without its name or
 /// arguments (a typo can put anything anywhere).
 const LOGGABLE_CMDS: &[(&str, u32)] = &[
-("+admin", 0), ("+oper", 0), ("chkey", 0), ("die", 0), ("jump", 0), ("join", 0), ("part", 0), ("op", 0),
-("invite", 0), ("+bot", 0), ("-bot", 0), ("status", 0), ("givenick", 0), ("chnick", 0), ("saveconf", 0),
-("setlog", 0), ("getlog", 0), ("admins", 0), ("opers", 0), ("match", 0), ("-admin", 0), ("-oper", 0),
-("+usermask", 0), ("-usermask", 0), ("+server", 0), ("-server", 0), ("update", 0), ("+hub", 0), ("-hub", 0),
-("rekey", 0), ("help", 0), ("dcc", 0), ("servers", 0), ("bots", 0),
+    ("+admin", 0),
+    ("+oper", 0),
+    ("chkey", 0),
+    ("die", 0),
+    ("jump", 0),
+    ("join", 0),
+    ("part", 0),
+    ("op", 0),
+    ("invite", 0),
+    ("+bot", 0),
+    ("-bot", 0),
+    ("status", 0),
+    ("givenick", 0),
+    ("chnick", 0),
+    ("saveconf", 0),
+    ("setlog", 0),
+    ("getlog", 0),
+    ("admins", 0),
+    ("opers", 0),
+    ("match", 0),
+    ("-admin", 0),
+    ("-oper", 0),
+    ("+usermask", 0),
+    ("-usermask", 0),
+    ("+server", 0),
+    ("-server", 0),
+    ("update", 0),
+    ("+hub", 0),
+    ("-hub", 0),
+    ("rekey", 0),
+    ("help", 0),
+    ("dcc", 0),
+    ("servers", 0),
+    ("bots", 0),
 ];
 const REDACT_MASK: &str = "********";
 
-fn log_user_command(state: &BotState, tag: &str, who: usize, user_host: &str, command: &str, args: [Option<&str>; 3]) {
-let mut line = String::new();
-let cap = MAX_LOG_LINE_LEN - 1;
-let mut append = |s: &str| {
-    for ch in s.chars() {
-        if line.len() + ch.len_utf8() > cap {
-            break;
-        }
+fn log_user_command(
+    state: &BotState,
+    tag: &str,
+    who: usize,
+    user_host: &str,
+    command: &str,
+    args: [Option<&str>; 3],
+) {
+    let mut line = String::new();
+    let cap = MAX_LOG_LINE_LEN - 1;
+    let mut append = |s: &str| {
+        for ch in s.chars() {
+            if line.len() + ch.len_utf8() > cap {
+                break;
+            }
             line.push(ch);
         }
     };
     append(state.user_records.get(who).map_or("?", |u| u.name.as_str()));
     append(" (");
     append(user_host);
-    append(if state.dcc_reply.is_some() { " via DCC): " } else { "): " });
+    append(if state.dcc_reply.is_some() {
+        " via DCC): "
+    } else {
+        "): "
+    });
     match LOGGABLE_CMDS.iter().find(|(n, _)| eq_ic(command, n)) {
         None => append("unrecognized command (not logged)"),
         Some((name, secret)) => {
@@ -259,7 +365,11 @@ let mut append = |s: &str| {
             for (i, a) in args.iter().enumerate() {
                 let Some(a) = a else { break };
                 append(" ");
-                append(if secret & (1 << i) != 0 { REDACT_MASK } else { a });
+                append(if secret & (1 << i) != 0 {
+                    REDACT_MASK
+                } else {
+                    a
+                });
             }
         }
     }
@@ -275,7 +385,13 @@ fn lc_copy(s: &str, cap: usize) -> Option<String> {
 
 /// label "\0" lc(botnick) "\0" lc(usernick) [ "\0" extra ], None when it
 /// would not fit a buffer of `cap` bytes.
-fn a2_context(cap: usize, label: &str, botnick: &str, usernick: &str, extra: Option<&str>) -> Option<Vec<u8>> {
+fn a2_context(
+    cap: usize,
+    label: &str,
+    botnick: &str,
+    usernick: &str,
+    extra: Option<&str>,
+) -> Option<Vec<u8>> {
     let b = lc_copy(botnick, A2_NICK_MAX)?;
     let u = lc_copy(usernick, A2_NICK_MAX)?;
     let mut out = Vec::new();
@@ -307,13 +423,25 @@ fn a2_handle_auth(state: &mut BotState, nick: &str, user_host: &str, dest: &str,
     }
     // Validate "<ts>:<nonce>" with the envelope parser and a dummy command.
     let probe = format!("{tsn}:x");
-    let Some((ts, nonce, _)) = bot_comms::envelope_parse(&probe).filter(|(_, _, d)| *d == "x") else {
-        logm!(state, L_CMD, "[CMD] ~A2A from {}: bad ts/nonce\n", user_host);
+    let Some((ts, nonce, _)) = bot_comms::envelope_parse(&probe).filter(|(_, _, d)| *d == "x")
+    else {
+        logm!(
+            state,
+            L_CMD,
+            "[CMD] ~A2A from {}: bad ts/nonce\n",
+            user_host
+        );
         return;
     };
     let now = now();
     if (now - ts).abs() > A2_TS_SKEW {
-        logm!(state, L_CMD, "[CMD] ~A2A from {}: timestamp skew {}s\n", user_host, now - ts);
+        logm!(
+            state,
+            L_CMD,
+            "[CMD] ~A2A from {}: timestamp skew {}s\n",
+            user_host,
+            now - ts
+        );
         return;
     }
     let sig = crypto::b64_decode(sig_b64);
@@ -348,7 +476,13 @@ fn a2_handle_auth(state: &mut BotState, nick: &str, user_host: &str, dest: &str,
     if now - state.user_records[who].last_auth_reply < A2_AUTH_REPLY_MIN_INTERVAL
         || now - state.last_auth_reply_any < A2_AUTH_REPLY_GLOBAL_INTERVAL
     {
-        logm!(state, L_CMD, "[CMD] ~A2A from {} ({}): throttled\n", name, user_host);
+        logm!(
+            state,
+            L_CMD,
+            "[CMD] ~A2A from {} ({}): throttled\n",
+            name,
+            user_host
+        );
         return;
     }
     if !state.self_pub_set {
@@ -359,7 +493,13 @@ fn a2_handle_auth(state: &mut BotState, nick: &str, user_host: &str, dest: &str,
     // and bound to this request's ts:nonce.
     let frame = a2_context(256, A2K_LABEL, dest, nick, Some(tsn)).and_then(|aad| {
         let upub = crypto::pubkey_b64_decode(&state.user_records[who].pubkey_b64)?;
-        crypto::seal(None, &crypto::pub_halves(&upub).1, A2K_LABEL, &aad, &state.self_pub)
+        crypto::seal(
+            None,
+            &crypto::pub_halves(&upub).1,
+            A2K_LABEL,
+            &aad,
+            &state.self_pub,
+        )
     });
     let Some(frame) = frame else {
         logm!(state, L_CMD, "[CMD] ~A2A: sealing the lockbox failed\n");
@@ -368,8 +508,19 @@ fn a2_handle_auth(state: &mut BotState, nick: &str, user_host: &str, dest: &str,
     state.user_records[who].last_auth_reply = now;
     state.last_auth_reply_any = now;
     auth::mark_used(state, Some(who), Some(who_mask), now);
-    ircf!(state, "NOTICE {} :~A2K {}\r\n", nick, crypto::b64_encode(&frame));
-    logm!(state, L_CMD, "[CMD] ~A2A: {} ({}) authenticated; key sent\n", name, user_host);
+    ircf!(
+        state,
+        "NOTICE {} :~A2K {}\r\n",
+        nick,
+        crypto::b64_encode(&frame)
+    );
+    logm!(
+        state,
+        L_CMD,
+        "[CMD] ~A2A: {} ({}) authenticated; key sent\n",
+        name,
+        user_host
+    );
 }
 
 /// An opened sealed command: who sent it, the command text, and (for ~A2S)
@@ -392,33 +543,58 @@ fn a2_open_command(
     b64: &str,
     sealed_replies: bool,
 ) -> Option<Opened> {
-    let (tag, label) = if sealed_replies { ("~A2S", A2S_LABEL) } else { ("~A2", A2_LABEL) };
+    let (tag, label) = if sealed_replies {
+        ("~A2S", A2S_LABEL)
+    } else {
+        ("~A2", A2_LABEL)
+    };
     if b64.len() > A2_B64_MAX {
-        logm!(state, L_CMD, "[CMD] {} from {}: oversized\n", tag, user_host);
+        logm!(
+            state,
+            L_CMD,
+            "[CMD] {} from {}: oversized\n",
+            tag,
+            user_host
+        );
         return None;
     }
     let aad = a2_context(160, label, dest, nick, None);
     let frame = crypto::b64_decode(b64);
     let (Some(aad), Some(frame)) = (aad, frame.filter(|f| f.len() >= SEAL_OVERHEAD)) else {
-        logm!(state, L_CMD, "[CMD] {} from {}: malformed\n", tag, user_host);
+        logm!(
+            state,
+            L_CMD,
+            "[CMD] {} from {}: malformed\n",
+            tag,
+            user_host
+        );
         return None;
     };
     if !state.self_pub_set {
-        logm!(state, L_CMD, "[CMD] {} from {}: malformed\n", tag, user_host);
+        logm!(
+            state,
+            L_CMD,
+            "[CMD] {} from {}: malformed\n",
+            tag,
+            user_host
+        );
         return None;
     }
 
     let cands = auth::user_candidates(state, user_host);
     let mut opened = None;
     if !cands.is_empty()
-        && let Some((_ed, x)) = hub_client::bot_key_decode(state) {
+        && let Some((_ed, x)) = hub_client::bot_key_decode(state)
+    {
         let (_, self_x) = crypto::pub_halves(&state.self_pub);
         for &(ui, mi) in &cands {
             let u = &state.user_records[ui];
             if only_uuid.is_some_and(|o| o != u.uuid) {
                 continue;
             }
-            let Some(upub) = crypto::pubkey_b64_decode(&u.pubkey_b64) else { continue };
+            let Some(upub) = crypto::pubkey_b64_decode(&u.pubkey_b64) else {
+                continue;
+            };
             let (_, ux) = crypto::pub_halves(&upub);
             if let Some(r) = crypto::open_rk(
                 &x,
@@ -449,18 +625,37 @@ fn a2_open_command(
     // Reject, don't repair: a CR/LF in an argument would split into a
     // second IRC command.
     if has_control_bytes(&pt) {
-        logm!(state, L_CMD, "[CMD] {} from {}: control character in command; dropped\n", tag, user_host);
+        logm!(
+            state,
+            L_CMD,
+            "[CMD] {} from {}: control character in command; dropped\n",
+            tag,
+            user_host
+        );
         return None;
     }
     let text = Zeroizing::new(String::from_utf8_lossy(&pt).into_owned());
     drop(pt);
     let Some((ts, nonce, cmd)) = bot_comms::envelope_parse(&text) else {
-        logm!(state, L_CMD, "[CMD] {} from {}: bad envelope\n", tag, user_host);
+        logm!(
+            state,
+            L_CMD,
+            "[CMD] {} from {}: bad envelope\n",
+            tag,
+            user_host
+        );
         return None;
     };
     let now = now();
     if (now - ts).abs() > A2_TS_SKEW {
-        logm!(state, L_CMD, "[CMD] {} from {}: timestamp skew {}s\n", tag, user_host, now - ts);
+        logm!(
+            state,
+            L_CMD,
+            "[CMD] {} from {}: timestamp skew {}s\n",
+            tag,
+            user_host,
+            now - ts
+        );
         return None;
     }
     if state.admin_nonces.seen(nonce, now) {
@@ -470,8 +665,19 @@ fn a2_open_command(
     state.admin_nonces.record(nonce, now);
     auth::mark_used(state, Some(who), Some(who_mask), now);
     let u = &state.user_records[who];
-    logm!(state, L_DEBUG, "[CMD_DEBUG] {} verified: User='{}' Type={}\n", tag, u.name, u.typ);
-    Some(Opened { who, cmd: Zeroizing::new(cmd.to_string()), rk })
+    logm!(
+        state,
+        L_DEBUG,
+        "[CMD_DEBUG] {} verified: User='{}' Type={}\n",
+        tag,
+        u.name,
+        u.typ
+    );
+    Some(Opened {
+        who,
+        cmd: Zeroizing::new(cmd.to_string()),
+        rk,
+    })
 }
 
 /// Split, screen and dispatch one opened command line.
@@ -487,14 +693,35 @@ fn run_user_command(state: &mut BotState, nick: &str, user_host: &str, who: usiz
     let is_admin = typ == 'a';
     // Every stored value lands in a '|'-delimited record, where a '|' would
     // shift the fields after it.
-    if std::iter::once(Some(command)).chain(args).flatten().any(|s| s.contains('|')) {
+    if std::iter::once(Some(command))
+        .chain(args)
+        .flatten()
+        .any(|s| s.contains('|'))
+    {
         let name = state.user_records[who].name.clone();
-        logm!(state, L_CMD, "[CMD] '|' in command from {} ({}); dropped\n", name, user_host);
+        logm!(
+            state,
+            L_CMD,
+            "[CMD] '|' in command from {} ({}); dropped\n",
+            name,
+            user_host
+        );
         say(state, nick, "Error: '|' is not allowed in commands.");
         return;
     }
-    log_user_command(state, if is_admin { "CMD_ADMIN" } else { "CMD_OP" }, who, user_host, command, args);
-    let a = Args { a1: args[0], a2: args[1], a3: args[2] };
+    log_user_command(
+        state,
+        if is_admin { "CMD_ADMIN" } else { "CMD_OP" },
+        who,
+        user_host,
+        command,
+        args,
+    );
+    let a = Args {
+        a1: args[0],
+        a2: args[1],
+        a3: args[2],
+    };
     if is_admin {
         admin_command(state, nick, user_host, who, command, a);
     } else {
@@ -504,21 +731,47 @@ fn run_user_command(state: &mut BotState, nick: &str, user_host: &str, who: usiz
 
 /// Run an opened command; for ~A2S its replies to `nick` are sealed under
 /// `rk` while it runs, and the reply state is wiped afterwards either way.
-fn a2_dispatch(state: &mut BotState, nick: &str, user_host: &str, botnick: &str, who: usize, cmd_line: &str, rk: Option<Key32>) {
+fn a2_dispatch(
+    state: &mut BotState,
+    nick: &str,
+    user_host: &str,
+    botnick: &str,
+    who: usize,
+    cmd_line: &str,
+    rk: Option<Key32>,
+) {
     if let Some(rk) = rk {
         let aad = a2_context(A2_NICK_MAX * 2 + 16, A2R_LABEL, botnick, nick, None);
         let Some(aad) = aad.filter(|_| nick.len() < A2_NICK_MAX) else {
-            logm!(state, L_CMD, "[CMD] ~A2S from {}: no reply context; dropped\n", user_host);
+            logm!(
+                state,
+                L_CMD,
+                "[CMD] ~A2S from {}: no reply context; dropped\n",
+                user_host
+            );
             state.a2r = A2rCtx::default();
             return;
         };
-        state.a2r = A2rCtx { active: true, key: rk, aad, nick: nick.to_string(), seq: 0 };
+        state.a2r = A2rCtx {
+            active: true,
+            key: rk,
+            aad,
+            nick: nick.to_string(),
+            seq: 0,
+        };
     }
     run_user_command(state, nick, user_host, who, cmd_line);
     state.a2r = A2rCtx::default();
 }
 
-pub fn handle_private_message(state: &mut BotState, nick: &str, user: &str, host: &str, dest: &str, message: &str) {
+pub fn handle_private_message(
+    state: &mut BotState,
+    nick: &str,
+    user: &str,
+    host: &str,
+    dest: &str,
+    message: &str,
+) {
     if !eq_ic(dest, &state.current_nick) {
         return;
     }
@@ -562,18 +815,32 @@ pub fn handle_private_message(state: &mut BotState, nick: &str, user: &str, host
 pub fn handle_dcc_line(state: &mut BotState, i: usize, line: &str) -> bool {
     let (name, uh, nick, botnick, uuid) = {
         let s = &state.dcc[i];
-        (s.name.clone(), s.user_host.clone(), s.nick.clone(), s.botnick.clone(), s.uuid.clone())
+        (
+            s.name.clone(),
+            s.user_host.clone(),
+            s.nick.clone(),
+            s.botnick.clone(),
+            s.uuid.clone(),
+        )
     };
     let sealed = line.starts_with("~A2S ");
     if !sealed && !line.starts_with("~A2 ") {
-        logm!(state, L_CMD, "[CMD] DCC line from {} ({}) is not a sealed command\n", name, uh);
+        logm!(
+            state,
+            L_CMD,
+            "[CMD] DCC line from {} ({}) is not a sealed command\n",
+            name,
+            uh
+        );
         return false;
     }
     // Same checks as PRIVMSG, with the chat's owner as the only key and the
     // chat's nicks as the context.  A record demoted since ends the chat.
     let b64 = &line[if sealed { 5 } else { 4 }..];
     let opened = a2_open_command(state, &nick, &uh, &botnick, Some(&uuid), b64, sealed);
-    let Some(o) = opened.filter(|o| state.user_records[o.who].typ == 'a') else { return false };
+    let Some(o) = opened.filter(|o| state.user_records[o.who].typ == 'a') else {
+        return false;
+    };
     state.dcc[i].last_active = now();
     state.dcc_reply = Some(i);
     a2_dispatch(state, &nick, &uh, &botnick, o.who, &o.cmd, o.rk);
@@ -595,7 +862,13 @@ fn user_key_fp(u: &UserRecord) -> String {
 
 /// A user public-key argument: canonical 88-char key, held by no other
 /// active user.  `me` is the record being re-keyed.
-fn user_key_arg_ok(state: &mut BotState, nick: &str, key: Option<&str>, me: Option<usize>, cmdname: &str) -> bool {
+fn user_key_arg_ok(
+    state: &mut BotState,
+    nick: &str,
+    key: Option<&str>,
+    me: Option<usize>,
+    cmdname: &str,
+) -> bool {
     let Some(key) = key.filter(|k| crypto::pubkey_b64_decode(k).is_some()) else {
         ircf!(
             state,
@@ -613,7 +886,12 @@ fn user_key_arg_ok(state: &mut BotState, nick: &str, key: Option<&str>, me: Opti
         .find(|(i, o)| Some(*i) != me && o.is_active && o.has_pubkey && o.pubkey_b64 == key)
         .map(|(_, o)| o.name.clone());
     if let Some(owner) = owner {
-        ircf!(state, "PRIVMSG {} :Error: that key already belongs to '{}'. Each user needs their own keypair.\r\n", nick, owner);
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: that key already belongs to '{}'. Each user needs their own keypair.\r\n",
+            nick,
+            owner
+        );
         return false;
     }
     true
@@ -667,7 +945,19 @@ struct Args<'a> {
 
 /// Commands refused locally under opt 'h' (hub-only mutations).  +hub/-hub
 /// are bot-local connection settings and stay allowed.
-const HUB_ONLY_CMDS: &[&str] = &["+admin", "-admin", "+oper", "-oper", "+usermask", "-usermask", "+bot", "-bot", "join", "part", "chkey"];
+const HUB_ONLY_CMDS: &[&str] = &[
+    "+admin",
+    "-admin",
+    "+oper",
+    "-oper",
+    "+usermask",
+    "-usermask",
+    "+bot",
+    "-bot",
+    "join",
+    "part",
+    "chkey",
+];
 
 fn chan_arg(arg: &str, amp_ok: bool) -> String {
     if arg.starts_with('#') || (amp_ok && arg.starts_with('&')) {
@@ -677,9 +967,17 @@ fn chan_arg(arg: &str, amp_ok: bool) -> String {
     }
 }
 
-fn admin_command(state: &mut BotState, nick: &str, user_host: &str, who: usize, command: &str, a: Args<'_>) {
+fn admin_command(
+    state: &mut BotState,
+    nick: &str,
+    user_host: &str,
+    who: usize,
+    command: &str,
+    a: Args<'_>,
+) {
     if state.is_opt_set(OPT_HUB_ONLY_MUTATIONS)
-        && let Some(c) = HUB_ONLY_CMDS.iter().find(|c| eq_ic(command, c)) {
+        && let Some(c) = HUB_ONLY_CMDS.iter().find(|c| eq_ic(command, c))
+    {
         ircf!(
             state,
             "PRIVMSG {} :Error: '{}' is disabled — network is in hub-only-mutation mode (opt 'h'). Use hub_admin.\r\n",
@@ -715,7 +1013,13 @@ fn admin_command(state: &mut BotState, nick: &str, user_host: &str, who: usize, 
                 c.is_managed = false;
                 c.timestamp = lww_next_ts(c.timestamp);
                 let ts = c.timestamp;
-                logm!(state, L_DEBUG, "[PART-OP] Channel {}: soft delete ts={}\n", name, ts);
+                logm!(
+                    state,
+                    L_DEBUG,
+                    "[PART-OP] Channel {}: soft delete ts={}\n",
+                    name,
+                    ts
+                );
                 ircf!(state, "PART {}\r\n", name);
                 config::write_with_state_pass(state);
             }
@@ -731,18 +1035,32 @@ fn admin_command(state: &mut BotState, nick: &str, user_host: &str, who: usize, 
         "-bot" => cmd_del_bot(state, nick, a),
         "status" => cmd_status(state, nick),
         "givenick" => {
-            ircf!(state, "PRIVMSG {} :You have about {} seconds to retrieve.\r\n", nick, NICK_TAKE_TIME);
+            ircf!(
+                state,
+                "PRIVMSG {} :You have about {} seconds to retrieve.\r\n",
+                nick,
+                NICK_TAKE_TIME
+            );
             irc_client::generate_new_nick(state);
             state.nick_release_time = now();
         }
         "chnick" => cmd_chnick(state, nick, a),
         "saveconf" => {
             config::write_with_state_pass(state);
-            ircf!(state, "PRIVMSG {} :Configuration state saved to {}.\r\n", nick, CONFIG_FILE);
+            ircf!(
+                state,
+                "PRIVMSG {} :Configuration state saved to {}.\r\n",
+                nick,
+                CONFIG_FILE
+            );
         }
         "setlog" => {
             let Some(arg1) = a.a1 else {
-                say(state, nick, "Syntax: setlog <loglevel> :: LOGLEVELS: 0=NONE,15=INFO,63=DEBUG");
+                say(
+                    state,
+                    nick,
+                    "Syntax: setlog <loglevel> :: LOGLEVELS: 0=NONE,15=INFO,63=DEBUG",
+                );
                 return;
             };
             if arg1.bytes().all(|c| c.is_ascii_digit()) {
@@ -751,7 +1069,11 @@ fn admin_command(state: &mut BotState, nick: &str, user_host: &str, who: usize, 
                 ircf!(state, "PRIVMSG {} :Log level set to {}.\r\n", nick, lvl);
                 config::write_with_state_pass(state);
             } else {
-                say(state, nick, "Invalid log level. Please provide a valid integer.");
+                say(
+                    state,
+                    nick,
+                    "Invalid log level. Please provide a valid integer.",
+                );
             }
         }
         "getlog" => cmd_getlog(state, nick, a),
@@ -774,7 +1096,12 @@ fn admin_command(state: &mut BotState, nick: &str, user_host: &str, who: usize, 
                 irc_client::server_block_clear(state, slot);
                 state.server_list.push(arg1.to_string());
                 config::write_with_state_pass(state);
-                ircf!(state, "PRIVMSG {} :Added server '{}' and saved config.\r\n", nick, arg1);
+                ircf!(
+                    state,
+                    "PRIVMSG {} :Added server '{}' and saved config.\r\n",
+                    nick,
+                    arg1
+                );
             } else {
                 say(state, nick, "Error: Server list is full.");
             }
@@ -789,10 +1116,20 @@ fn admin_command(state: &mut BotState, nick: &str, user_host: &str, who: usize, 
                     irc_client::server_block_remove(state, i);
                     state.server_list.remove(i);
                     config::write_with_state_pass(state);
-                    ircf!(state, "PRIVMSG {} :Removed server '{}' and saved config.\r\n", nick, arg1);
+                    ircf!(
+                        state,
+                        "PRIVMSG {} :Removed server '{}' and saved config.\r\n",
+                        nick,
+                        arg1
+                    );
                 }
                 None => {
-                    ircf!(state, "PRIVMSG {} :Error: Server '{}' not found.\r\n", nick, arg1);
+                    ircf!(
+                        state,
+                        "PRIVMSG {} :Error: Server '{}' not found.\r\n",
+                        nick,
+                        arg1
+                    );
                 }
             }
         }
@@ -808,15 +1145,27 @@ fn admin_command(state: &mut BotState, nick: &str, user_host: &str, who: usize, 
                 say(state, nick, "Syntax: chkey <name> <pubkey>");
                 return;
             };
-            let Some(ui) = state.user_records.iter().position(|u| u.is_active && eq_ic(&u.name, arg1)) else {
-                ircf!(state, "PRIVMSG {} :Error: user '{}' not found.\r\n", nick, arg1);
+            let Some(ui) = state
+                .user_records
+                .iter()
+                .position(|u| u.is_active && eq_ic(&u.name, arg1))
+            else {
+                ircf!(
+                    state,
+                    "PRIVMSG {} :Error: user '{}' not found.\r\n",
+                    nick,
+                    arg1
+                );
                 return;
             };
             if !user_key_arg_ok(state, nick, Some(arg2), Some(ui), "chkey") {
                 return;
             }
             set_user_key(state, ui, arg2);
-            let (name, fp) = (state.user_records[ui].name.clone(), user_key_fp(&state.user_records[ui]));
+            let (name, fp) = (
+                state.user_records[ui].name.clone(),
+                user_key_fp(&state.user_records[ui]),
+            );
             ircf!(
                 state,
                 "PRIVMSG {} :Key for {} changed (key {}). They must use the new private key from now on.\r\n",
@@ -845,15 +1194,30 @@ fn cmd_jump(state: &mut BotState, nick: &str, a: Args<'_>) {
         }
     };
     let arg_host = host_of(arg1);
-    let Some(idx) = state.server_list.iter().position(|s| eq_ic(&host_of(s), &arg_host)) else {
-        ircf!(state, "PRIVMSG {} :Error: Server '{}' not in list.\r\n", nick, arg1);
+    let Some(idx) = state
+        .server_list
+        .iter()
+        .position(|s| eq_ic(&host_of(s), &arg_host))
+    else {
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: Server '{}' not in list.\r\n",
+            nick,
+            arg1
+        );
         return;
     };
     // An explicit jump overrides any ban/throttle hold on the target.
     let held = irc_client::server_block_desc(state, idx);
     if !held.is_empty() {
         let srv = state.server_list[idx].clone();
-        logm!(state, L_INFO, "[BAN] {}: hold ({}) cleared by jump.\n", srv, held);
+        logm!(
+            state,
+            L_INFO,
+            "[BAN] {}: hold ({}) cleared by jump.\n",
+            srv,
+            held
+        );
     }
     irc_client::server_block_clear(state, idx);
     state.current_server_index = idx;
@@ -869,7 +1233,12 @@ fn cmd_join(state: &mut BotState, nick: &str, a: Args<'_>) {
     let name = chan_arg(arg1, false);
     let found = channel::find(state, &name);
     if found.is_some_and(|ci| state.chans[ci].is_managed) {
-        ircf!(state, "PRIVMSG {} :Error: Channel {} is already in my list.\r\n", nick, name);
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: Channel {} is already in my list.\r\n",
+            nick,
+            name
+        );
         return;
     }
     // Past any stamp this channel had (a part in this same second).
@@ -883,11 +1252,22 @@ fn cmd_join(state: &mut BotState, nick: &str, a: Args<'_>) {
         c.is_managed = true;
         c.timestamp = lww_next_ts(prev_ts);
         let ts = c.timestamp;
-        logm!(state, L_DEBUG, "[JOIN] Channel {}: re-enabled ts={}\n", name, ts);
+        logm!(
+            state,
+            L_DEBUG,
+            "[JOIN] Channel {}: re-enabled ts={}\n",
+            name,
+            ts
+        );
     }
     config::write_with_state_pass(state);
     hub_client::push_config(state);
-    ircf!(state, "PRIVMSG {} :JOIN {} and saving config file.\r\n", nick, arg1);
+    ircf!(
+        state,
+        "PRIVMSG {} :JOIN {} and saving config file.\r\n",
+        nick,
+        arg1
+    );
 }
 
 fn cmd_invite(state: &mut BotState, nick: &str, a: Args<'_>) {
@@ -906,7 +1286,12 @@ fn cmd_invite(state: &mut BotState, nick: &str, a: Args<'_>) {
     }
     // Escalate: hub, else a sealed ~B2 to each trusted bot.
     if !hub_client::send_invite_request(state, nick, &ch) {
-        let nicks: Vec<String> = state.trusted_bots.iter().map(|t| t.nick().to_string()).filter(|n| !n.is_empty()).collect();
+        let nicks: Vec<String> = state
+            .trusted_bots
+            .iter()
+            .map(|t| t.nick().to_string())
+            .filter(|n| !n.is_empty())
+            .collect();
         for tb in nicks {
             bot_comms::send_command(state, &tb, &format!("INVITE {ch} {nick}"));
         }
@@ -924,26 +1309,48 @@ fn cmd_add_bot(state: &mut BotState, nick: &str, a: Args<'_>) {
     }
     // +bot <nick!user@host> <uuid> <pubkey>, all from the other bot's status.
     let (Some(mask), Some(uuid), Some(key)) = (a.a1, a.a2, a.a3) else {
-        say(state, nick, "Syntax: +bot <nick!user@host> <uuid> <pubkey> - copy the UUID and Pubkey lines from that bot's 'status'.");
+        say(
+            state,
+            nick,
+            "Syntax: +bot <nick!user@host> <uuid> <pubkey> - copy the UUID and Pubkey lines from that bot's 'status'.",
+        );
         return;
     };
     if mask.len() >= MAX_MASK_LEN || !mask.contains('!') || !mask.contains('@') {
-        ircf!(state, "PRIVMSG {} :Error: mask must be nick!user@host (max {} chars).\r\n", nick, MAX_MASK_LEN - 1);
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: mask must be nick!user@host (max {} chars).\r\n",
+            nick,
+            MAX_MASK_LEN - 1
+        );
         return;
     }
     if !crate::cstr::has_uuid_dashes(uuid) {
-        ircf!(state, "PRIVMSG {} :Error: '{}' is not a bot UUID.\r\n", nick, uuid);
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: '{}' is not a bot UUID.\r\n",
+            nick,
+            uuid
+        );
         return;
     }
     let Some(pub_key) = crypto::pubkey_b64_decode(key) else {
-        say(state, nick, "Error: pubkey must be the bot's 88-char public key (Pubkey line of its 'status').");
+        say(
+            state,
+            nick,
+            "Error: pubkey must be the bot's 88-char public key (Pubkey line of its 'status').",
+        );
         return;
     };
     if uuid == state.bot_uuid {
         say(state, nick, "Error: that is this bot.");
         return;
     }
-    if state.trusted_bots.iter().any(|t| eq_ic(&t.mask, mask) || t.uuid == uuid) {
+    if state
+        .trusted_bots
+        .iter()
+        .any(|t| eq_ic(&t.mask, mask) || t.uuid == uuid)
+    {
         ircf!(
             state,
             "PRIVMSG {} :Error: Trusted bot '{}' already exists (same mask or UUID). Remove it with -bot first.\r\n",
@@ -956,9 +1363,21 @@ fn cmd_add_bot(state: &mut BotState, nick: &str, a: Args<'_>) {
         say(state, nick, "Error: trusted bot list is full.");
         return;
     }
-    state.trusted_bots.push(TrustedBot { mask: mask.to_string(), uuid: uuid.to_string(), pub_key, has_pub: true, ts: now() });
+    state.trusted_bots.push(TrustedBot {
+        mask: mask.to_string(),
+        uuid: uuid.to_string(),
+        pub_key,
+        has_pub: true,
+        ts: now(),
+    });
     config::write_with_state_pass(state);
-    ircf!(state, "PRIVMSG {} :Added trusted bot: {} (key {})\r\n", nick, mask, crypto::key_fingerprint(&pub_key));
+    ircf!(
+        state,
+        "PRIVMSG {} :Added trusted bot: {} (key {})\r\n",
+        nick,
+        mask,
+        crypto::key_fingerprint(&pub_key)
+    );
 }
 
 fn cmd_del_bot(state: &mut BotState, nick: &str, a: Args<'_>) {
@@ -981,7 +1400,12 @@ fn cmd_del_bot(state: &mut BotState, nick: &str, a: Args<'_>) {
             ircf!(state, "PRIVMSG {} :Removed trusted bot: {}\r\n", nick, mask);
         }
         None => {
-            ircf!(state, "PRIVMSG {} :Error: no trusted bot with mask '{}' (see 'status').\r\n", nick, mask);
+            ircf!(
+                state,
+                "PRIVMSG {} :Error: no trusted bot with mask '{}' (see 'status').\r\n",
+                nick,
+                mask
+            );
         }
     }
 }
@@ -1008,13 +1432,28 @@ fn emit_bot_names(state: &mut BotState, nick: &str) {
     const PFX1: &str = "| Bots   : ";
     const PFX2: &str = "|          ";
     const CW: usize = 66;
-    let names: Vec<String> = state.trusted_bots.iter().take(TRUST_MAX).map(|t| t.nick().to_string()).collect();
+    let names: Vec<String> = state
+        .trusted_bots
+        .iter()
+        .take(TRUST_MAX)
+        .map(|t| t.nick().to_string())
+        .collect();
     let mut line = String::new();
     let mut first = true;
     for n in names {
-        let need = if line.is_empty() { n.len() } else { n.len() + 2 };
+        let need = if line.is_empty() {
+            n.len()
+        } else {
+            n.len() + 2
+        };
         if !line.is_empty() && line.len() + need > CW {
-            ircf!(state, "PRIVMSG {} :{}{}\r\n", nick, if first { PFX1 } else { PFX2 }, line);
+            ircf!(
+                state,
+                "PRIVMSG {} :{}{}\r\n",
+                nick,
+                if first { PFX1 } else { PFX2 },
+                line
+            );
             first = false;
             line.clear();
         }
@@ -1024,44 +1463,79 @@ fn emit_bot_names(state: &mut BotState, nick: &str) {
         line.push_str(&n);
     }
     if !line.is_empty() {
-        ircf!(state, "PRIVMSG {} :{}{}\r\n", nick, if first { PFX1 } else { PFX2 }, line);
+        ircf!(
+            state,
+            "PRIVMSG {} :{}{}\r\n",
+            nick,
+            if first { PFX1 } else { PFX2 },
+            line
+        );
     }
     if state.trusted_bots.len() > TRUST_MAX {
-        ircf!(state, "PRIVMSG {} :|          ...and {} more\r\n", nick, state.trusted_bots.len() - TRUST_MAX);
+        ircf!(
+            state,
+            "PRIVMSG {} :|          ...and {} more\r\n",
+            nick,
+            state.trusted_bots.len() - TRUST_MAX
+        );
     }
 }
 
 fn cmd_status(state: &mut BotState, nick: &str) {
-    let uptime = if state.bot_start_time > 0 { fmt_elapsed(state.bot_start_time) } else { "N/A".into() };
+    let uptime = if state.bot_start_time > 0 {
+        fmt_elapsed(state.bot_start_time)
+    } else {
+        "N/A".into()
+    };
     // Network: the name the server reported, with the configured port.
-    let prev = state.current_server_index.checked_sub(1).and_then(|i| state.server_list.get(i)).cloned();
+    let prev = state
+        .current_server_index
+        .checked_sub(1)
+        .and_then(|i| state.server_list.get(i))
+        .cloned();
     let srv = if !state.actual_server_name.is_empty() {
-        let port = prev.as_deref().and_then(|s| s.rfind(':').map(|c| atoi(&s[c + 1..]))).unwrap_or(0);
+        let port = prev
+            .as_deref()
+            .and_then(|s| s.rfind(':').map(|c| atoi(&s[c + 1..])))
+            .unwrap_or(0);
         if port > 0 {
             format!("{}:{}", state.actual_server_name, port)
         } else {
             state.actual_server_name.clone()
         }
     } else if let Some(p) = prev {
-    p
-} else {
-    "N/A".into()
-};
-let srv = trunc_string(&srv, 300);
-let conn = if state.status & S_CONNECTED != 0 {
-    if state.connection_time > 0 {
-        format!("CONNECTED {}", fmt_elapsed(state.connection_time))
+        p
     } else {
+        "N/A".into()
+    };
+    let srv = trunc_string(&srv, 300);
+    let conn = if state.status & S_CONNECTED != 0 {
+        if state.connection_time > 0 {
+            format!("CONNECTED {}", fmt_elapsed(state.connection_time))
+        } else {
             "CONNECTED".into()
         }
     } else {
         "DISCONNECTED".into()
     };
-    let admins = state.user_records.iter().filter(|u| u.is_active && u.typ == 'a').count();
-    let opers = state.user_records.iter().filter(|u| u.is_active && u.typ == 'o').count();
+    let admins = state
+        .user_records
+        .iter()
+        .filter(|u| u.is_active && u.typ == 'a')
+        .count();
+    let opers = state
+        .user_records
+        .iter()
+        .filter(|u| u.is_active && u.typ == 'o')
+        .count();
     let tls = state.irc.as_ref().is_some_and(|c| c.is_tls());
 
-    ircf!(state, "PRIVMSG {} :| ircbot {} status\r\n", nick, BOT_VERSION);
+    ircf!(
+        state,
+        "PRIVMSG {} :| ircbot {} status\r\n",
+        nick,
+        BOT_VERSION
+    );
     ircf!(state, "PRIVMSG {} :{}\r\n", nick, RULE);
     ircf!(
         state,
@@ -1069,25 +1543,49 @@ let conn = if state.status & S_CONNECTED != 0 {
         nick,
         state.current_nick,
         state.target_nick,
-        if state.bot_uuid.is_empty() { "none" } else { state.bot_uuid.as_str() }
+        if state.bot_uuid.is_empty() {
+            "none"
+        } else {
+            state.bot_uuid.as_str()
+        }
     );
     if state.self_pub_set {
-        let (pb, fp) = (crypto::b64_encode(&state.self_pub), crypto::key_fingerprint(&state.self_pub));
-        ircf!(state, "PRIVMSG {} :| Pubkey   : {} (fp {})\r\n", nick, pb, fp);
+        let (pb, fp) = (
+            crypto::b64_encode(&state.self_pub),
+            crypto::key_fingerprint(&state.self_pub),
+        );
+        ircf!(
+            state,
+            "PRIVMSG {} :| Pubkey   : {} (fp {})\r\n",
+            nick,
+            pb,
+            fp
+        );
     } else {
         say(state, nick, "| Pubkey   : NONE (re-run -setup)");
     }
     ircf!(state, "PRIVMSG {} :| Uptime   : {}\r\n", nick, uptime);
-    ircf!(state, "PRIVMSG {} :| Network  : {} ({}, TLS: {})\r\n", nick, srv, conn, if tls { "YES" } else { "NO" });
+    ircf!(
+        state,
+        "PRIVMSG {} :| Network  : {} ({}, TLS: {})\r\n",
+        nick,
+        srv,
+        conn,
+        if tls { "YES" } else { "NO" }
+    );
     reply_pace(state, 80);
 
     if state.server_list.len() > 1 {
-        say(state, nick, "+-[ Servers ]---------------------------------------------------------------");
+        say(
+            state,
+            nick,
+            "+-[ Servers ]---------------------------------------------------------------",
+        );
         let entries: Vec<String> = (0..state.server_list.len())
             .map(|i| {
                 let is_cur = state.current_server_index > 0
-        && i == state.current_server_index - 1
-        && state.status & S_CONNECTED != 0;
+                    && i == state.current_server_index - 1
+                    && state.status & S_CONNECTED != 0;
                 let held = irc_client::server_block_desc(state, i);
                 let e = format!(
                     "{}{}{}{}{}",
@@ -1101,16 +1599,28 @@ let conn = if state.status & S_CONNECTED != 0 {
             })
             .collect();
         let line = join_bounded(&entries, 600);
-        ircf!(state, "PRIVMSG {} :| {}\r\n", nick, String::from_utf8_lossy(&line));
+        ircf!(
+            state,
+            "PRIVMSG {} :| {}\r\n",
+            nick,
+            String::from_utf8_lossy(&line)
+        );
         reply_pace(state, 80);
     }
 
-    say(state, nick, "+-[ Channels ]---------------------------------------------------------------");
+    say(
+        state,
+        nick,
+        "+-[ Channels ]---------------------------------------------------------------",
+    );
     let mut ins = Vec::new();
     let mut outs = Vec::new();
     for c in state.chans.iter().filter(|c| c.is_managed) {
         if c.status == ChanStatus::In {
-            ins.push(trunc_string(&format!("{}{}", if c.i_am_opped { "@" } else { "" }, c.name), 128));
+            ins.push(trunc_string(
+                &format!("{}{}", if c.i_am_opped { "@" } else { "" }, c.name),
+                128,
+            ));
         } else {
             outs.push(c.name.clone());
         }
@@ -1137,29 +1647,65 @@ let conn = if state.status & S_CONNECTED != 0 {
                 }
             }
             let seg = String::from_utf8_lossy(&in_buf[p..p + n]).into_owned();
-            ircf!(state, "PRIVMSG {} :{}{}\r\n", nick, if first { "| (IN)  " } else { "|        " }, seg);
+            ircf!(
+                state,
+                "PRIVMSG {} :{}{}\r\n",
+                nick,
+                if first { "| (IN)  " } else { "|        " },
+                seg
+            );
             first = false;
             p += n;
         }
     }
     if !out_buf.is_empty() {
-        ircf!(state, "PRIVMSG {} :| (OUT) {}\r\n", nick, String::from_utf8_lossy(&out_buf));
+        ircf!(
+            state,
+            "PRIVMSG {} :| (OUT) {}\r\n",
+            nick,
+            String::from_utf8_lossy(&out_buf)
+        );
     }
     reply_pace(state, 80);
 
-    say(state, nick, "+-[ Access Control ]---------------------------------------------------------");
-    ircf!(state, "PRIVMSG {} :| Admins : {:<4}  Ops: {}\r\n", nick, admins, opers);
+    say(
+        state,
+        nick,
+        "+-[ Access Control ]---------------------------------------------------------",
+    );
+    ircf!(
+        state,
+        "PRIVMSG {} :| Admins : {:<4}  Ops: {}\r\n",
+        nick,
+        admins,
+        opers
+    );
     reply_pace(state, 80);
 
     if !state.hubs.is_empty() {
-        say(state, nick, "+-[ Hub Config ]-------------------------------------------------------------");
+        say(
+            state,
+            nick,
+            "+-[ Hub Config ]-------------------------------------------------------------",
+        );
         if state.hub_connected && !state.current_hub.is_empty() {
             let hub = state.current_hub.clone();
             if state.hub_connect_time > 0 && state.hub_authenticated {
                 let up = fmt_elapsed(state.hub_connect_time);
-                ircf!(state, "PRIVMSG {} :| Hub    : {} (CONNECTED {})\r\n", nick, hub, up);
+                ircf!(
+                    state,
+                    "PRIVMSG {} :| Hub    : {} (CONNECTED {})\r\n",
+                    nick,
+                    hub,
+                    up
+                );
             } else {
-                ircf!(state, "PRIVMSG {} :| Hub    : {} (CONNECTED)\r\n", nick, hub);
+                ircf!(
+                    state,
+                    "PRIVMSG {} :| Hub    : {} (CONNECTED)\r\n",
+                    nick,
+                    hub
+                );
             }
         } else {
             say(state, nick, "| Hub    : DISCONNECTED");
@@ -1181,38 +1727,66 @@ let conn = if state.status & S_CONNECTED != 0 {
         }
         say(state, nick, FOOT);
     } else if !state.trusted_bots.is_empty() {
-    say(state, nick, "+-[ Bots ]-------------------------------------------------------------------");
-    emit_bot_names(state, nick);
-    say(state, nick, FOOT);
-} else {
-    say(state, nick, FOOT);
-}
+        say(
+            state,
+            nick,
+            "+-[ Bots ]-------------------------------------------------------------------",
+        );
+        emit_bot_names(state, nick);
+        say(state, nick, FOOT);
+    } else {
+        say(state, nick, FOOT);
+    }
 }
 
 fn cmd_chnick(state: &mut BotState, nick: &str, a: Args<'_>) {
-let (Some(old), Some(new)) = (a.a1, a.a2) else {
-    say(state, nick, "Syntax: chnick <oldnick> <newnick>");
-    return;
-};
-if !is_valid_bot_nick(new) {
-if new.contains('|') {
-    say(state, nick, "Error: New nick cannot contain '|'.");
-} else {
-        ircf!(state, "PRIVMSG {} :Error: New nick too long (max {} chars).\r\n", nick, MAX_NICK - 1);
+    let (Some(old), Some(new)) = (a.a1, a.a2) else {
+        say(state, nick, "Syntax: chnick <oldnick> <newnick>");
+        return;
+    };
+    if !is_valid_bot_nick(new) {
+        if new.contains('|') {
+            say(state, nick, "Error: New nick cannot contain '|'.");
+        } else {
+            ircf!(
+                state,
+                "PRIVMSG {} :Error: New nick too long (max {} chars).\r\n",
+                nick,
+                MAX_NICK - 1
+            );
+        }
+        return;
     }
-    return;
-}
     // Names are unique across bots, admins and opers.
-    if state.user_records.iter().any(|u| u.is_active && eq_ic(&u.name, new)) {
-        ircf!(state, "PRIVMSG {} :Error: Name '{}' already in use.\r\n", nick, new);
+    if state
+        .user_records
+        .iter()
+        .any(|u| u.is_active && eq_ic(&u.name, new))
+    {
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: Name '{}' already in use.\r\n",
+            nick,
+            new
+        );
         return;
     }
     if eq_ic(&state.target_nick, new) {
-        ircf!(state, "PRIVMSG {} :Error: Name '{}' already in use by this bot.\r\n", nick, new);
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: Name '{}' already in use by this bot.\r\n",
+            nick,
+            new
+        );
         return;
     }
     if state.trusted_bots.iter().any(|t| eq_ic(t.nick(), new)) {
-        ircf!(state, "PRIVMSG {} :Error: Name '{}' already in use by a bot.\r\n", nick, new);
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: Name '{}' already in use by a bot.\r\n",
+            nick,
+            new
+        );
         return;
     }
     // A bot's new name is its IRC nick, so it must be one the ircd takes.
@@ -1235,17 +1809,32 @@ if new.contains('|') {
         config::write_with_state_pass(state);
         let ts = state.current_nick_ts;
         hub_client::push_delta(state, "n", new, ts);
-        ircf!(state, "PRIVMSG {} :This bot's nick changed to '{}' and saved.\r\n", nick, new);
+        ircf!(
+            state,
+            "PRIVMSG {} :This bot's nick changed to '{}' and saved.\r\n",
+            nick,
+            new
+        );
         return;
     }
     // An admin or oper.
-    if let Some(ui) = state.user_records.iter().position(|u| u.is_active && eq_ic(&u.name, old)) {
+    if let Some(ui) = state
+        .user_records
+        .iter()
+        .position(|u| u.is_active && eq_ic(&u.name, old))
+    {
         let u = &mut state.user_records[ui];
         u.name = new.to_string();
         u.timestamp = lww_next_ts(u.timestamp);
         config::write_with_state_pass(state);
         hub_client::push_admin_delta(state);
-        ircf!(state, "PRIVMSG {} :User '{}' renamed to '{}'.\r\n", nick, old, new);
+        ircf!(
+            state,
+            "PRIVMSG {} :User '{}' renamed to '{}'.\r\n",
+            nick,
+            old,
+            new
+        );
         return;
     }
     // A trusted bot.
@@ -1270,10 +1859,21 @@ if new.contains('|') {
             tb.ts = now();
         }
         config::write_with_state_pass(state);
-        ircf!(state, "PRIVMSG {} :Bot '{}' renamed to '{}' and notified.\r\n", nick, old, new);
+        ircf!(
+            state,
+            "PRIVMSG {} :Bot '{}' renamed to '{}' and notified.\r\n",
+            nick,
+            old,
+            new
+        );
         return;
     }
-    ircf!(state, "PRIVMSG {} :Error: No bot/admin/oper named '{}' found.\r\n", nick, old);
+    ircf!(
+        state,
+        "PRIVMSG {} :Error: No bot/admin/oper named '{}' found.\r\n",
+        nick,
+        old
+    );
 }
 
 fn cmd_getlog(state: &mut BotState, nick: &str, a: Args<'_>) {
@@ -1289,7 +1889,12 @@ fn cmd_getlog(state: &mut BotState, nick: &str, a: Args<'_>) {
     };
     let names = ["msg", "ctcp", "info", "cmd", "raw", "debug"];
     let Some(bi) = names.iter().position(|n| eq_ic(level, n)) else {
-        ircf!(state, "PRIVMSG {} :Error: Unknown log level '{}'.\r\n", nick, level);
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: Unknown log level '{}'.\r\n",
+            nick,
+            level
+        );
         return;
     };
     let mut show = DEFAULT_LOG_LINES;
@@ -1299,7 +1904,12 @@ fn cmd_getlog(state: &mut BotState, nick: &str, a: Args<'_>) {
             show = DEFAULT_LOG_LINES;
         }
         if show > MAX_LOG_LINES {
-            ircf!(state, "PRIVMSG {} :Warning: Line count capped at {}.\r\n", nick, MAX_LOG_LINES);
+            ircf!(
+                state,
+                "PRIVMSG {} :Warning: Line count capped at {}.\r\n",
+                nick,
+                MAX_LOG_LINES
+            );
             show = MAX_LOG_LINES;
         }
     }
@@ -1318,13 +1928,29 @@ fn cmd_getlog(state: &mut BotState, nick: &str, a: Args<'_>) {
         ircf!(state, "PRIVMSG {} :{}\r\n", nick, line);
         reply_pace(state, 250);
     }
-    ircf!(state, "PRIVMSG {} :--- End of Log ({}) --- \r\n", nick, level);
+    ircf!(
+        state,
+        "PRIVMSG {} :--- End of Log ({}) --- \r\n",
+        nick,
+        level
+    );
 }
 
 fn cmd_list_users(state: &mut BotState, nick: &str, typ: char) {
     let what = if typ == 'a' { "admins" } else { "opers" };
-    let name_w = state.user_records.iter().filter(|u| u.typ == typ).map(|u| u.name.len()).fold(8, usize::max);
-    ircf!(state, "PRIVMSG {} :| ircbot {} {}\r\n", nick, BOT_VERSION, what);
+    let name_w = state
+        .user_records
+        .iter()
+        .filter(|u| u.typ == typ)
+        .map(|u| u.name.len())
+        .fold(8, usize::max);
+    ircf!(
+        state,
+        "PRIVMSG {} :| ircbot {} {}\r\n",
+        nick,
+        BOT_VERSION,
+        what
+    );
     say(state, nick, RULE);
     let cap = reply_row_cap(state);
     let (mut shown, mut omitted) = (0usize, 0usize);
@@ -1364,7 +1990,13 @@ fn cmd_match(state: &mut BotState, nick: &str, a: Args<'_>) {
         return;
     };
     let all = arg1 == "*";
-    ircf!(state, "PRIVMSG {} :| ircbot {} match{}\r\n", nick, BOT_VERSION, if all { " *" } else { "" });
+    ircf!(
+        state,
+        "PRIVMSG {} :| ircbot {} match{}\r\n",
+        nick,
+        BOT_VERSION,
+        if all { " *" } else { "" }
+    );
     say(state, nick, RULE);
     let cap = reply_row_cap(state);
     let (mut shown, mut omitted) = (0usize, 0usize);
@@ -1375,7 +2007,12 @@ fn cmd_match(state: &mut BotState, nick: &str, a: Args<'_>) {
         .cloned()
         .collect();
     for u in users {
-        let masks: Vec<MaskRecord> = state.mask_records.iter().filter(|m| m.is_active && m.uuid == u.uuid).cloned().collect();
+        let masks: Vec<MaskRecord> = state
+            .mask_records
+            .iter()
+            .filter(|m| m.is_active && m.uuid == u.uuid)
+            .cloned()
+            .collect();
         if shown >= cap {
             omitted += 1 + masks.len();
             continue;
@@ -1396,15 +2033,33 @@ fn cmd_match(state: &mut BotState, nick: &str, a: Args<'_>) {
                 omitted += 1;
                 continue;
             }
-            ircf!(state, "PRIVMSG {} :|   {}  (last used: {})\r\n", nick, m.mask, last_seen_str(m.last_used));
+            ircf!(
+                state,
+                "PRIVMSG {} :|   {}  (last used: {})\r\n",
+                nick,
+                m.mask,
+                last_seen_str(m.last_used)
+            );
             reply_pace(state, 100);
             shown += 1;
         }
     }
     // No user by that name: maybe a trusted bot.
-    if shown == 0 && !all
-        && let Some(tb) = state.trusted_bots.iter().find(|t| eq_ic(t.nick(), arg1)).cloned() {
-        ircf!(state, "PRIVMSG {} :| [b] {}  (last seen: {})\r\n", nick, pad_right(tb.nick(), 20), last_seen_str(tb.ts));
+    if shown == 0
+        && !all
+        && let Some(tb) = state
+            .trusted_bots
+            .iter()
+            .find(|t| eq_ic(t.nick(), arg1))
+            .cloned()
+    {
+        ircf!(
+            state,
+            "PRIVMSG {} :| [b] {}  (last seen: {})\r\n",
+            nick,
+            pad_right(tb.nick(), 20),
+            last_seen_str(tb.ts)
+        );
         reply_pace(state, 100);
         if !tb.mask.is_empty() {
             ircf!(state, "PRIVMSG {} :|   mask: {}\r\n", nick, tb.mask);
@@ -1413,11 +2068,20 @@ fn cmd_match(state: &mut BotState, nick: &str, a: Args<'_>) {
             ircf!(state, "PRIVMSG {} :|   uuid: {}\r\n", nick, tb.uuid);
         }
         if tb.has_pub {
-            ircf!(state, "PRIVMSG {} :|   key : {}\r\n", nick, crypto::key_fingerprint(&tb.pub_key));
+            ircf!(
+                state,
+                "PRIVMSG {} :|   key : {}\r\n",
+                nick,
+                crypto::key_fingerprint(&tb.pub_key)
+            );
         } else {
             say(state, nick, "|   key : (none on file)");
         }
-        let hub = if state.hub_connected && !state.current_hub.is_empty() { state.current_hub.clone() } else { "none".into() };
+        let hub = if state.hub_connected && !state.current_hub.is_empty() {
+            state.current_hub.clone()
+        } else {
+            "none".into()
+        };
         ircf!(state, "PRIVMSG {} :|   hub : {}\r\n", nick, hub);
         shown += 1;
         reply_pace(state, 100);
@@ -1448,11 +2112,25 @@ fn cmd_add_user(state: &mut BotState, nick: &str, add_admin: bool, a: Args<'_>) 
         return;
     }
     if !mask.contains('!') || !mask.contains('@') || mask.len() >= MAX_MASK_LEN {
-        ircf!(state, "PRIVMSG {} :Error: mask must be nick!user@host (max {} chars)\r\n", nick, MAX_MASK_LEN - 1);
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: mask must be nick!user@host (max {} chars)\r\n",
+            nick,
+            MAX_MASK_LEN - 1
+        );
         return;
     }
-    if state.user_records.iter().any(|u| u.is_active && eq_ic(&u.name, name)) {
-        ircf!(state, "PRIVMSG {} :Error: name '{}' already exists.\r\n", nick, name);
+    if state
+        .user_records
+        .iter()
+        .any(|u| u.is_active && eq_ic(&u.name, name))
+    {
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: name '{}' already exists.\r\n",
+            nick,
+            name
+        );
         return;
     }
     if !user_key_arg_ok(state, nick, Some(key), None, what) {
@@ -1483,7 +2161,13 @@ fn cmd_add_user(state: &mut BotState, nick: &str, add_admin: bool, a: Args<'_>) 
     };
     let fp = user_key_fp(&u);
     state.user_records.push(u);
-    state.mask_records.push(MaskRecord { uuid, mask: mask.to_string(), is_active: true, last_used: 0, timestamp: now });
+    state.mask_records.push(MaskRecord {
+        uuid,
+        mask: mask.to_string(),
+        is_active: true,
+        last_used: 0,
+        timestamp: now,
+    });
     config::write_with_state_pass(state);
     hub_client::push_admin_delta(state);
     ircf!(
@@ -1503,8 +2187,18 @@ fn cmd_del_user(state: &mut BotState, nick: &str, typ: char, a: Args<'_>) {
         ircf!(state, "PRIVMSG {} :Syntax: -{} <name>\r\n", nick, what);
         return;
     };
-    let Some(ui) = state.user_records.iter().position(|u| u.is_active && u.typ == typ && eq_ic(&u.name, name)) else {
-        ircf!(state, "PRIVMSG {} :Error: {} '{}' not found.\r\n", nick, what, name);
+    let Some(ui) = state
+        .user_records
+        .iter()
+        .position(|u| u.is_active && u.typ == typ && eq_ic(&u.name, name))
+    else {
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: {} '{}' not found.\r\n",
+            nick,
+            what,
+            name
+        );
         return;
     };
     let u = &mut state.user_records[ui];
@@ -1535,8 +2229,17 @@ fn cmd_add_usermask(state: &mut BotState, nick: &str, a: Args<'_>) {
         say(state, nick, "Error: mask must contain ! and @");
         return;
     }
-    let Some(ui) = state.user_records.iter().position(|u| u.is_active && eq_ic(&u.name, name)) else {
-        ircf!(state, "PRIVMSG {} :Error: user '{}' not found.\r\n", nick, name);
+    let Some(ui) = state
+        .user_records
+        .iter()
+        .position(|u| u.is_active && eq_ic(&u.name, name))
+    else {
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: user '{}' not found.\r\n",
+            nick,
+            name
+        );
         return;
     };
     let uuid = state.user_records[ui].uuid.clone();
@@ -1571,7 +2274,13 @@ fn cmd_add_usermask(state: &mut BotState, nick: &str, a: Args<'_>) {
     }
     config::write_with_state_pass(state);
     hub_client::push_admin_delta(state);
-    ircf!(state, "PRIVMSG {} :Mask {} added to {}\r\n", nick, mask, name);
+    ircf!(
+        state,
+        "PRIVMSG {} :Mask {} added to {}\r\n",
+        nick,
+        mask,
+        name
+    );
 }
 
 fn cmd_del_usermask(state: &mut BotState, nick: &str, a: Args<'_>) {
@@ -1579,13 +2288,32 @@ fn cmd_del_usermask(state: &mut BotState, nick: &str, a: Args<'_>) {
         say(state, nick, "Syntax: -usermask <name> <mask>");
         return;
     };
-    let Some(ui) = state.user_records.iter().position(|u| u.is_active && eq_ic(&u.name, name)) else {
-        ircf!(state, "PRIVMSG {} :Error: user '{}' not found.\r\n", nick, name);
+    let Some(ui) = state
+        .user_records
+        .iter()
+        .position(|u| u.is_active && eq_ic(&u.name, name))
+    else {
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: user '{}' not found.\r\n",
+            nick,
+            name
+        );
         return;
     };
     let uuid = state.user_records[ui].uuid.clone();
-    let Some(mi) = state.mask_records.iter().position(|m| m.is_active && m.uuid == uuid && eq_ic(&m.mask, mask)) else {
-        ircf!(state, "PRIVMSG {} :Error: mask '{}' not found for {}.\r\n", nick, mask, name);
+    let Some(mi) = state
+        .mask_records
+        .iter()
+        .position(|m| m.is_active && m.uuid == uuid && eq_ic(&m.mask, mask))
+    else {
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: mask '{}' not found for {}.\r\n",
+            nick,
+            mask,
+            name
+        );
         return;
     };
     let m = &mut state.mask_records[mi];
@@ -1593,7 +2321,13 @@ fn cmd_del_usermask(state: &mut BotState, nick: &str, a: Args<'_>) {
     m.timestamp = lww_next_ts(m.timestamp);
     config::write_with_state_pass(state);
     hub_client::push_admin_delta(state);
-    ircf!(state, "PRIVMSG {} :Mask {} removed from {}\r\n", nick, mask, name);
+    ircf!(
+        state,
+        "PRIVMSG {} :Mask {} removed from {}\r\n",
+        nick,
+        mask,
+        name
+    );
 }
 
 /// bots -- the mesh as this bot sees it: the hub-pushed tree (cached, so
@@ -1604,7 +2338,12 @@ fn cmd_bots(state: &mut BotState, nick: &str, a: Args<'_>) {
         return;
     }
     let have_tree = state.bot_tree_ts != 0 && !state.bot_tree.is_empty();
-    ircf!(state, "PRIVMSG {} :| ircbot {} bots  [ version,  uptime,  irc server ]\r\n", nick, BOT_VERSION);
+    ircf!(
+        state,
+        "PRIVMSG {} :| ircbot {} bots  [ version,  uptime,  irc server ]\r\n",
+        nick,
+        BOT_VERSION
+    );
     say(state, nick, RULE);
 
     // Two passes over the same rows: size the columns, then print.  The hub
@@ -1664,11 +2403,19 @@ fn cmd_bots(state: &mut BotState, nick: &str, a: Args<'_>) {
         let mut offline = String::new();
         let (mut listed, mut omitted) = (0, 0);
         for r in state.bot_tree.iter().filter(|r| r.kind == 'd') {
-            let ts = if r.uptime <= 0 { "never".to_string() } else { gm_time(r.uptime, "%Y-%m-%d %H:%M UTC") };
+            let ts = if r.uptime <= 0 {
+                "never".to_string()
+            } else {
+                gm_time(r.uptime, "%Y-%m-%d %H:%M UTC")
+            };
             let w = format!(
                 "{}{} ({})",
                 if offline.is_empty() { "" } else { ", " },
-                if r.name.is_empty() { "(unnamed)" } else { r.name.as_str() },
+                if r.name.is_empty() {
+                    "(unnamed)"
+                } else {
+                    r.name.as_str()
+                },
                 ts
             );
             if offline.len() + w.len() >= 419 {
@@ -1680,29 +2427,44 @@ fn cmd_bots(state: &mut BotState, nick: &str, a: Args<'_>) {
         }
         if listed > 0 || omitted > 0 {
             if omitted > 0 {
-                ircf!(state, "PRIVMSG {} :| Disconnected: {} (+{} more)\r\n", nick, offline, omitted);
+                ircf!(
+                    state,
+                    "PRIVMSG {} :| Disconnected: {} (+{} more)\r\n",
+                    nick,
+                    offline,
+                    omitted
+                );
             } else {
                 ircf!(state, "PRIVMSG {} :| Disconnected: {}\r\n", nick, offline);
             }
         }
         let age = now() - state.bot_tree_ts;
         if age > BOT_TREE_STALE_AFTER {
-            ircf!(state, "PRIVMSG {} :| (hub last refreshed this {} ago)\r\n", nick, tree_fmt_uptime(age));
+            ircf!(
+                state,
+                "PRIVMSG {} :| (hub last refreshed this {} ago)\r\n",
+                nick,
+                tree_fmt_uptime(age)
+            );
         }
     } else if !state.hubs.is_empty() {
-    say(state, nick, "| (no hub tree yet -- showing trusted bots only)");
-}
-say(state, nick, FOOT);
+        say(
+            state,
+            nick,
+            "| (no hub tree yet -- showing trusted bots only)",
+        );
+    }
+    say(state, nick, FOOT);
 }
 
 /// Every configured server and its port.  The live link is irc_server_idx
 /// (current_server_index is the rotation cursor, already past it).
 fn cmd_servers(state: &mut BotState, nick: &str) {
-let split = |s: &str| -> (String, String) {
-    match s.rfind(':') {
-        Some(c) if c + 1 < s.len() => (trunc_string(&s[..c], 256), s[c + 1..].to_string()),
-        _ => (trunc_string(s, 256), "default".to_string()),
-    }
+    let split = |s: &str| -> (String, String) {
+        match s.rfind(':') {
+            Some(c) if c + 1 < s.len() => (trunc_string(&s[..c], 256), s[c + 1..].to_string()),
+            _ => (trunc_string(s, 256), "default".to_string()),
+        }
     };
     let host_w = state
         .server_list
@@ -1712,11 +2474,20 @@ let split = |s: &str| -> (String, String) {
     let up = state.status & S_CONNECTED != 0;
     let connected_idx = if up { state.irc_server_idx } else { None };
     let next_idx = if connected_idx.is_none() {
-        Some(if state.current_server_index < state.server_list.len() { state.current_server_index } else { 0 })
+        Some(if state.current_server_index < state.server_list.len() {
+            state.current_server_index
+        } else {
+            0
+        })
     } else {
         None
     };
-    ircf!(state, "PRIVMSG {} :| ircbot {} servers\r\n", nick, BOT_VERSION);
+    ircf!(
+        state,
+        "PRIVMSG {} :| ircbot {} servers\r\n",
+        nick,
+        BOT_VERSION
+    );
     say(state, nick, RULE);
     let mut shown = 0;
     for i in 0..state.server_list.len().min(BOT_STATUS_MAX_LINES) {
@@ -1729,44 +2500,66 @@ let split = |s: &str| -> (String, String) {
             " "
         };
         let held = irc_client::server_block_desc(state, i);
-        let note = if held.is_empty() { String::new() } else { format!("  [{held}]") };
-        ircf!(state, "PRIVMSG {} :| {} {}  port {}{}\r\n", nick, marker, pad_right(&host, host_w), pad_right(&port, 7), note);
+        let note = if held.is_empty() {
+            String::new()
+        } else {
+            format!("  [{held}]")
+        };
+        ircf!(
+            state,
+            "PRIVMSG {} :| {} {}  port {}{}\r\n",
+            nick,
+            marker,
+            pad_right(&host, host_w),
+            pad_right(&port, 7),
+            note
+        );
         shown += 1;
         reply_pace(state, 100);
     }
     if shown == 0 {
         say(state, nick, "| (no servers configured)");
     } else if connected_idx.is_some() {
-    say(state, nick, "| '*' connected, [..] on hold");
-} else {
-    say(state, nick, "| not connected; '>' tried next, [..] on hold");
-}
-say(state, nick, FOOT);
+        say(state, nick, "| '*' connected, [..] on hold");
+    } else {
+        say(state, nick, "| not connected; '>' tried next, [..] on hold");
+    }
+    say(state, nick, FOOT);
 }
 
 /// +hub <host:port> <pubkey-b64>: the hub's pinned Ed25519 key, 44-char raw
 /// or 88-char combined (first 32 bytes).  Pinning is required.
 fn cmd_add_hub(state: &mut BotState, nick: &str, a: Args<'_>) {
-let (Some(addr), Some(key)) = (a.a1, a.a2) else {
-    say(state, nick, "Syntax: +hub <host:port> <pubkey-b64>");
-    return;
-};
-match addr.rfind(':') {
-    Some(c) if c > 0 && atoi(&addr[c + 1..]) > 0 => {}
+    let (Some(addr), Some(key)) = (a.a1, a.a2) else {
+        say(state, nick, "Syntax: +hub <host:port> <pubkey-b64>");
+        return;
+    };
+    match addr.rfind(':') {
+        Some(c) if c > 0 && atoi(&addr[c + 1..]) > 0 => {}
         _ => {
-            say(state, nick, "Error: address must be HOST:PORT (e.g. hub.example.com:7000).");
+            say(
+                state,
+                nick,
+                "Error: address must be HOST:PORT (e.g. hub.example.com:7000).",
+            );
             return;
         }
     }
     if state.hubs.iter().any(|h| h.addr == addr) {
-        ircf!(state, "PRIVMSG {} :Error: Hub '{}' already exists. Remove it with -hub first to change its key.\r\n", nick, addr);
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: Hub '{}' already exists. Remove it with -hub first to change its key.\r\n",
+            nick,
+            addr
+        );
         return;
     }
     if state.hubs.len() >= MAX_SERVERS {
         say(state, nick, "Error: Hub list is full.");
         return;
     }
-    let Some(dec) = crypto::b64_decode(key).filter(|d| d.len() == 32 || d.len() == HUB_KEY_RAW_LEN) else {
+    let Some(dec) = crypto::b64_decode(key).filter(|d| d.len() == 32 || d.len() == HUB_KEY_RAW_LEN)
+    else {
         say(
             state,
             nick,
@@ -1776,9 +2569,18 @@ match addr.rfind(':') {
     };
     let mut ed_pub = [0u8; 32];
     ed_pub.copy_from_slice(&dec[..32]);
-    state.hubs.push(crate::state::HubEntry { addr: trunc_string(addr, 256), ed_pub, ed_pub_set: true });
+    state.hubs.push(crate::state::HubEntry {
+        addr: trunc_string(addr, 256),
+        ed_pub,
+        ed_pub_set: true,
+    });
     config::write_with_state_pass(state);
-    ircf!(state, "PRIVMSG {} :Added Hub: {} (pubkey pinned)\r\n", nick, addr);
+    ircf!(
+        state,
+        "PRIVMSG {} :Added Hub: {} (pubkey pinned)\r\n",
+        nick,
+        addr
+    );
     // Not connected to any hub yet: try the new one now.
     if state.hub.is_none() {
         state.last_hub_connect_attempt = 0;
@@ -1792,12 +2594,22 @@ fn cmd_del_hub(state: &mut BotState, nick: &str, a: Args<'_>) {
         return;
     };
     let Some(i) = state.hubs.iter().position(|h| h.addr == addr) else {
-        ircf!(state, "PRIVMSG {} :Error: Hub '{}' not found.\r\n", nick, addr);
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: Hub '{}' not found.\r\n",
+            nick,
+            addr
+        );
         return;
     };
     let is_current = state.hub_connected && state.current_hub == addr;
     if is_current {
-        ircf!(state, "PRIVMSG {} :Disconnecting from current hub: {}\r\n", nick, addr);
+        ircf!(
+            state,
+            "PRIVMSG {} :Disconnecting from current hub: {}\r\n",
+            nick,
+            addr
+        );
         hub_client::disconnect(state);
     }
     state.hubs.remove(i);
@@ -1808,135 +2620,226 @@ fn cmd_del_hub(state: &mut BotState, nick: &str, a: Args<'_>) {
         state.last_hub_connect_attempt = 0;
         hub_client::connect(state);
     } else if is_current {
-    say(state, nick, "No other hubs available to connect to.");
-}
+        say(state, nick, "No other hubs available to connect to.");
+    }
 }
 
 /// Rotate this bot's identity keypair.  The new PUBLIC key is pushed under
 /// the current (old-key) session first; only if that succeeds is the new
 /// private key committed, then the bot reconnects so the hub re-verifies it.
 fn cmd_rekey(state: &mut BotState, nick: &str) {
-if state.hubs.is_empty() {
-    say(state, nick, "Error: no hub configured; nothing to rekey.");
-    return;
-}
-if !state.hub_authenticated || state.hub.is_none() {
-    say(
-        state,
-        nick,
-        "Error: not authenticated to a hub. Rekey needs an active session so the new key is pushed under the old one. Try again once connected.",
+    if state.hubs.is_empty() {
+        say(state, nick, "Error: no hub configured; nothing to rekey.");
+        return;
+    }
+    if !state.hub_authenticated || state.hub.is_none() {
+        say(
+            state,
+            nick,
+            "Error: not authenticated to a hub. Rekey needs an active session so the new key is pushed under the old one. Try again once connected.",
+        );
+        return;
+    }
+    let Some((new_priv, new_pub)) = crypto::generate_combined_keypair() else {
+        say(state, nick, "Error: keypair generation failed.");
+        return;
+    };
+    let new_priv_b64 = Zeroizing::new(crypto::b64_encode(new_priv.as_ref()));
+    let new_pub_b64 = crypto::b64_encode(&new_pub);
+    if !hub_client::push_delta(state, "pub", &new_pub_b64, now()) {
+        say(
+            state,
+            nick,
+            "Error: failed to push new pubkey to hub; key left UNCHANGED.",
+        );
+        return;
+    }
+    state.hub_key_raw.set(&new_priv);
+    *state.hub_key = new_priv_b64.to_string();
+    drop(new_priv_b64);
+    hub_client::self_pub_refresh(state);
+    config::write_with_state_pass(state);
+    let (fp, me) = (
+        crypto::key_fingerprint(&new_pub),
+        state.current_nick.clone(),
     );
-    return;
-}
-let Some((new_priv, new_pub)) = crypto::generate_combined_keypair() else {
-    say(state, nick, "Error: keypair generation failed.");
-    return;
-};
-let new_priv_b64 = Zeroizing::new(crypto::b64_encode(new_priv.as_ref()));
-let new_pub_b64 = crypto::b64_encode(&new_pub);
-if !hub_client::push_delta(state, "pub", &new_pub_b64, now()) {
-    say(state, nick, "Error: failed to push new pubkey to hub; key left UNCHANGED.");
-    return;
-}
-state.hub_key_raw.set(&new_priv);
-*state.hub_key = new_priv_b64.to_string();
-drop(new_priv_b64);
-hub_client::self_pub_refresh(state);
-config::write_with_state_pass(state);
-let (fp, me) = (crypto::key_fingerprint(&new_pub), state.current_nick.clone());
-ircf!(
-    state,
-    "PRIVMSG {} :\u{2713} Rekeyed (new key {}). New pubkey pushed to hub; reconnecting with new key. Clients must re-auth (/botforget {}).\r\n",
-    nick,
-    fp,
-    me
-);
-logm!(state, L_INFO, "[HUB] Rekey: generated new identity, pushed new pub to hub, reconnecting.\n");
-hub_client::disconnect(state);
-state.last_hub_connect_attempt = 0;
-hub_client::connect(state);
+    ircf!(
+        state,
+        "PRIVMSG {} :\u{2713} Rekeyed (new key {}). New pubkey pushed to hub; reconnecting with new key. Clients must re-auth (/botforget {}).\r\n",
+        nick,
+        fp,
+        me
+    );
+    logm!(
+        state,
+        L_INFO,
+        "[HUB] Rekey: generated new identity, pushed new pub to hub, reconnecting.\n"
+    );
+    hub_client::disconnect(state);
+    state.last_hub_connect_attempt = 0;
+    hub_client::connect(state);
 }
 
 fn help_header(state: &mut BotState, nick: &str) {
-ircf!(state, "PRIVMSG {} : | {} {} help\r\n", nick, BOT_NAME, BOT_VERSION);
-ircf!(state, "PRIVMSG {} : {}\r\n", nick, RULE);
-say(state, nick, " | ");
+    ircf!(
+        state,
+        "PRIVMSG {} : | {} {} help\r\n",
+        nick,
+        BOT_NAME,
+        BOT_VERSION
+    );
+    ircf!(state, "PRIVMSG {} : {}\r\n", nick, RULE);
+    say(state, nick, " | ");
 }
 
 fn help_footer(state: &mut BotState, nick: &str) {
-say(state, nick, " |");
-ircf!(state, "PRIVMSG {} : {}\r\n", nick, FOOT);
+    say(state, nick, " |");
+    ircf!(state, "PRIVMSG {} : {}\r\n", nick, FOOT);
 }
 
 fn admin_help(state: &mut BotState, nick: &str, topic: Option<&str>) {
-let Some(t) = topic else {
-    help_header(state, nick);
-    if state.is_opt_set(OPT_HUB_ONLY_MUTATIONS) {
-        say(state, nick, " |   die, jump, op, invite, status, givenick, chnick");
-        say(state, nick, " |   +server, -server, servers, bots, admins, opers, match, dcc");
-        say(state, nick, " |   +hub, -hub, rekey, saveconf, setlog, getlog, update, help");
-        say(state, nick, " |   (hub-only-mutation mode: users, masks, keys, channels via hub_admin)");
-    } else {
-            say(state, nick, " |   die, jump, op, invite, join, part, status, givenick, chnick");
-            say(state, nick, " |   +server, -server, servers, bots, admins, opers, match, dcc");
-            say(state, nick, " |   +admin, -admin, +oper, -oper, +usermask, -usermask, chkey");
+    let Some(t) = topic else {
+        help_header(state, nick);
+        if state.is_opt_set(OPT_HUB_ONLY_MUTATIONS) {
+            say(
+                state,
+                nick,
+                " |   die, jump, op, invite, status, givenick, chnick",
+            );
+            say(
+                state,
+                nick,
+                " |   +server, -server, servers, bots, admins, opers, match, dcc",
+            );
+            say(
+                state,
+                nick,
+                " |   +hub, -hub, rekey, saveconf, setlog, getlog, update, help",
+            );
+            say(
+                state,
+                nick,
+                " |   (hub-only-mutation mode: users, masks, keys, channels via hub_admin)",
+            );
+        } else {
+            say(
+                state,
+                nick,
+                " |   die, jump, op, invite, join, part, status, givenick, chnick",
+            );
+            say(
+                state,
+                nick,
+                " |   +server, -server, servers, bots, admins, opers, match, dcc",
+            );
+            say(
+                state,
+                nick,
+                " |   +admin, -admin, +oper, -oper, +usermask, -usermask, chkey",
+            );
             say(state, nick, " |   +bot, -bot, +hub, -hub, rekey");
             say(state, nick, " |   saveconf, setlog, getlog, update, help");
         }
-        say(state, nick, " |   'help auth' explains how clients sign in with their key");
+        say(
+            state,
+            nick,
+            " |   'help auth' explains how clients sign in with their key",
+        );
         help_footer(state, nick);
         return;
     };
     let lower = t.to_ascii_lowercase();
     let text: &str = match lower.as_str() {
         "die" => "Syntax: die - Kills the bot process.",
-        "jump" => "Syntax: jump [server] - Jump to the next IRC server, or to a specific server by hostname (port-independent match). Servers that banned or throttled the bot are skipped; naming one clears its hold and retries it now.",
+        "jump" => {
+            "Syntax: jump [server] - Jump to the next IRC server, or to a specific server by hostname (port-independent match). Servers that banned or throttled the bot are skipped; naming one clears its hold and retries it now."
+        }
         "op" => "Syntax: op <#channel> - Get operator status on a channel.",
         "status" => "Syntax: status - Show bot status.",
-        "givenick" => "Syntax: givenick - Temporarily changes the bot nick to an alternate. Will try to regain primary nick after 20 seconds until it accomplishes the task.",
-        "chnick" => "Syntax: chnick <oldnick> <newnick> - Renames a bot, admin, or oper. Nicks must be unique across all types. For bots, propagates the change via hub mesh.",
-        "+server" => "Syntax: +server <irc.network.net:6667> - Add another irc server to the bot's server list. Port not required.",
-        "-server" => "Syntax: -server <irc.network.net:6667> - Removes a server from the bot's server list. Specify server as it is listed in 'status' command.",
-        "servers" => "Syntax: servers - List every configured IRC server and its port. '*' marks the one we are on, '>' the one selected, and [..] a ban or throttle hold.",
+        "givenick" => {
+            "Syntax: givenick - Temporarily changes the bot nick to an alternate. Will try to regain primary nick after 20 seconds until it accomplishes the task."
+        }
+        "chnick" => {
+            "Syntax: chnick <oldnick> <newnick> - Renames a bot, admin, or oper. Nicks must be unique across all types. For bots, propagates the change via hub mesh."
+        }
+        "+server" => {
+            "Syntax: +server <irc.network.net:6667> - Add another irc server to the bot's server list. Port not required."
+        }
+        "-server" => {
+            "Syntax: -server <irc.network.net:6667> - Removes a server from the bot's server list. Specify server as it is listed in 'status' command."
+        }
+        "servers" => {
+            "Syntax: servers - List every configured IRC server and its port. '*' marks the one we are on, '>' the one selected, and [..] a ban or throttle hold."
+        }
         "bots" => {
-            say(state, nick, "Syntax: bots - Draw the bot tree: this bot's hub at the root, peer hubs beneath it, each hub's bots under it.");
+            say(
+                state,
+                nick,
+                "Syntax: bots - Draw the bot tree: this bot's hub at the root, peer hubs beneath it, each hub's bots under it.",
+            );
             "  Every row shows version, uptime and IRC server (hubs show '(hub)'). Bots that are known but offline are listed last with their last-seen time. With no hub, all trusted bots list on one branch."
         }
         "admins" => "Syntax: admins - List all admins.",
         "opers" => "Syntax: opers - List all opers.",
         "+admin" => {
-            say(state, nick, "Syntax: +admin <name> <pubkey> <nick!user@host> - Add a named admin with a first usermask. Name must be unique across admins and opers.");
+            say(
+                state,
+                nick,
+                "Syntax: +admin <name> <pubkey> <nick!user@host> - Add a named admin with a first usermask. Name must be unique across admins and opers.",
+            );
             help_keypair(state, nick);
             return;
         }
         "-admin" => "Syntax: -admin <name> - Remove admin and all their masks.",
         "+oper" => {
-            say(state, nick, "Syntax: +oper <name> <pubkey> <nick!user@host> - Add a named oper with a first usermask. Opers may use op, chkey (own key) and help.");
+            say(
+                state,
+                nick,
+                "Syntax: +oper <name> <pubkey> <nick!user@host> - Add a named oper with a first usermask. Opers may use op, chkey (own key) and help.",
+            );
             help_keypair(state, nick);
             return;
         }
         "-oper" => "Syntax: -oper <name> - Remove oper and all their masks.",
         "+usermask" => "Syntax: +usermask <name> <mask> - Add a usermask to admin or oper.",
-        "-usermask" => "Syntax: -usermask <name> <mask> - Remove a specific usermask from admin or oper.",
+        "-usermask" => {
+            "Syntax: -usermask <name> <mask> - Remove a specific usermask from admin or oper."
+        }
         "chkey" => {
-            say(state, nick, "Syntax: chkey <name> <pubkey> - Replace the public key of a named admin or oper (UUID and usermasks are kept). Opers may only change their own key.");
+            say(
+                state,
+                nick,
+                "Syntax: chkey <name> <pubkey> - Replace the public key of a named admin or oper (UUID and usermasks are kept). Opers may only change their own key.",
+            );
             help_keypair(state, nick);
             return;
         }
-        "invite" => "Syntax: invite <#channel> - Invite yourself to a channel (asks the hub or a trusted bot if this bot is not opped there).",
+        "invite" => {
+            "Syntax: invite <#channel> - Invite yourself to a channel (asks the hub or a trusted bot if this bot is not opped there)."
+        }
         "auth" => {
             help_auth(state, nick);
             return;
         }
         "dcc" => {
-            say(state, nick, "Syntax: dcc - Open a DCC chat with this bot for long replies. The bot never accepts connections: it sends a passive offer and connects out to the port your client opens, so open your client's DCC port range in your firewall and set its DCC address to your public IP.");
+            say(
+                state,
+                nick,
+                "Syntax: dcc - Open a DCC chat with this bot for long replies. The bot never accepts connections: it sends a passive offer and connects out to the port your client opens, so open your client's DCC port range in your firewall and set its DCC address to your public IP.",
+            );
             "Commands in the chat are still sealed: while it is open, the client script seals what you type there (and /botcmd <bot> <command>) and the replies come back there; anything unsealed closes it. A command sent by PRIVMSG is still answered by PRIVMSG. Admins only."
         }
         "match" => "Syntax: match <name|*> - Show all records for a user, or * for all users.",
-        "+bot" => "Syntax: +bot <nick!user@host> <uuid> <pubkey> - Standalone bots only (hub-managed bots get peers from the hub): trust another bot for encrypted bot-to-bot commands. Copy the UUID and Pubkey from that bot's 'status' (or its -setup output). The mask should be the one the network shows for it.",
-        "-bot" => "Syntax: -bot <nick*!*user@hostmask.com> - Removes a bot from the known bot list as shown in the 'status' command.",
+        "+bot" => {
+            "Syntax: +bot <nick!user@host> <uuid> <pubkey> - Standalone bots only (hub-managed bots get peers from the hub): trust another bot for encrypted bot-to-bot commands. Copy the UUID and Pubkey from that bot's 'status' (or its -setup output). The mask should be the one the network shows for it."
+        }
+        "-bot" => {
+            "Syntax: -bot <nick*!*user@hostmask.com> - Removes a bot from the known bot list as shown in the 'status' command."
+        }
         "saveconf" => "Syntax: saveconf - Immediately save config file.",
-        "setlog" => "Syntax: setlog <loglevel> - Set loglevel for output to a log file. 0=NONE,15=INFO,63=DEBUG.",
+        "setlog" => {
+            "Syntax: setlog <loglevel> - Set loglevel for output to a log file. 0=NONE,15=INFO,63=DEBUG."
+        }
         "getlog" => {
             ircf!(
                 state,
@@ -1947,14 +2850,25 @@ let Some(t) = topic else {
             );
             return;
         }
-        "update" => "Syntax: update without argument shows available versions. Run with update <ver> to download/compile/and update bot binary.",
+        "update" => {
+            "Syntax: update without argument shows available versions. Run with update <ver> to download/compile/and update bot binary."
+        }
         "join" => "Syntax: join <#channel> - Joins a channel.",
         "part" => "Syntax: part <#channel> - Parts a channel.",
-        "+hub" => "Syntax: +hub <host:port> <pubkey-b64> - Add a hub and pin its Ed25519 pubkey (44 or 88 char base64 from the hub's hub_public.b64).",
+        "+hub" => {
+            "Syntax: +hub <host:port> <pubkey-b64> - Add a hub and pin its Ed25519 pubkey (44 or 88 char base64 from the hub's hub_public.b64)."
+        }
         "-hub" => "Syntax: -hub <host:port> - Remove a configured hub.",
-        "rekey" => "Syntax: rekey - Generate a new Curve25519 identity keypair locally, push the new public key to the hub, and reconnect. UUID is unchanged. Requires an active hub session. Clients holding the old key must re-auth (/botforget <bot>).",
+        "rekey" => {
+            "Syntax: rekey - Generate a new Curve25519 identity keypair locally, push the new public key to the hub, and reconnect. UUID is unchanged. Requires an active hub session. Clients holding the old key must re-auth (/botforget <bot>)."
+        }
         _ => {
-            ircf!(state, "PRIVMSG {} :No help available for command '{}'.\r\n", nick, t);
+            ircf!(
+                state,
+                "PRIVMSG {} :No help available for command '{}'.\r\n",
+                nick,
+                t
+            );
             return;
         }
     };
@@ -1967,12 +2881,16 @@ fn oper_command(state: &mut BotState, nick: &str, who: usize, command: &str, a: 
             ircf!(state, "MODE {} +o {}\r\n", ch, nick);
         }
     } else if eq_ic(command, "chkey") {
-    // Own key only, and refused under opt 'h' like every local mutation
-    // of a hub-authoritative record.
-    if state.is_opt_set(OPT_HUB_ONLY_MUTATIONS) {
-        say(state, nick, "Error: 'chkey' is disabled — network is in hub-only-mutation mode (opt 'h'). Ask a hub admin.");
-        return;
-    }
+        // Own key only, and refused under opt 'h' like every local mutation
+        // of a hub-authoritative record.
+        if state.is_opt_set(OPT_HUB_ONLY_MUTATIONS) {
+            say(
+                state,
+                nick,
+                "Error: 'chkey' is disabled — network is in hub-only-mutation mode (opt 'h'). Ask a hub admin.",
+            );
+            return;
+        }
         let (Some(name), Some(key)) = (a.a1, a.a2) else {
             say(state, nick, "Syntax: chkey <yourname> <pubkey>");
             return;
@@ -1986,25 +2904,47 @@ fn oper_command(state: &mut BotState, nick: &str, who: usize, command: &str, a: 
         }
         set_user_key(state, who, key);
         let fp = user_key_fp(&state.user_records[who]);
-        ircf!(state, "PRIVMSG {} :Your key has been changed (key {}). Use the new private key from now on.\r\n", nick, fp);
+        ircf!(
+            state,
+            "PRIVMSG {} :Your key has been changed (key {}). Use the new private key from now on.\r\n",
+            nick,
+            fp
+        );
     } else if eq_ic(command, "help") {
-    match a.a1 {
-        None => {
-            help_header(state, nick);
-            say(state, nick, " |   op, chkey, help");
-            help_footer(state, nick);
+        match a.a1 {
+            None => {
+                help_header(state, nick);
+                say(state, nick, " |   op, chkey, help");
+                help_footer(state, nick);
+            }
+            Some(t) if eq_ic(t, "op") => say(
+                state,
+                nick,
+                "Syntax: op <#channel> - Get operator status on a channel.",
+            ),
+            Some(t) if eq_ic(t, "chkey") => {
+                say(
+                    state,
+                    nick,
+                    "Syntax: chkey <yourname> <pubkey> - Replace your own public key.",
+                );
+                help_keypair(state, nick);
+            }
+            Some(t) if eq_ic(t, "auth") => help_auth(state, nick),
+            Some(t) if eq_ic(t, "help") => say(
+                state,
+                nick,
+                "Syntax: help [command] - Show available commands.",
+            ),
+            Some(t) => {
+                ircf!(
+                    state,
+                    "PRIVMSG {} :No help available for command '{}'.\r\n",
+                    nick,
+                    t
+                );
+            }
         }
-        Some(t) if eq_ic(t, "op") => say(state, nick, "Syntax: op <#channel> - Get operator status on a channel."),
-        Some(t) if eq_ic(t, "chkey") => {
-            say(state, nick, "Syntax: chkey <yourname> <pubkey> - Replace your own public key.");
-            help_keypair(state, nick);
-        }
-        Some(t) if eq_ic(t, "auth") => help_auth(state, nick),
-        Some(t) if eq_ic(t, "help") => say(state, nick, "Syntax: help [command] - Show available commands."),
-        Some(t) => {
-            ircf!(state, "PRIVMSG {} :No help available for command '{}'.\r\n", nick, t);
-        }
-    }
     }
 }
 
@@ -2024,8 +2964,14 @@ mod tests {
     #[test]
     fn tree_prefixes() {
         assert_eq!(tree_prefix(0, &[], true, false), "");
-        assert_eq!(tree_prefix(1, &[], true, false), "\u{2514}\u{2500}\u{2500} ");
-        assert_eq!(tree_prefix(2, &[false, false], false, true), "\u{2502} \u{251c}\u{2500}\u{252c} ");
+        assert_eq!(
+            tree_prefix(1, &[], true, false),
+            "\u{2514}\u{2500}\u{2500} "
+        );
+        assert_eq!(
+            tree_prefix(2, &[false, false], false, true),
+            "\u{2502} \u{251c}\u{2500}\u{252c} "
+        );
         assert_eq!(tree_fmt_uptime(59), "59s");
         assert_eq!(tree_fmt_uptime(90061), "1d1h");
     }

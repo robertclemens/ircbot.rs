@@ -25,8 +25,8 @@ mod updater;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use mio::{Events, Poll};
@@ -34,7 +34,9 @@ use zeroize::Zeroizing;
 
 use consts::*;
 use cstr::{now, trunc_string};
-use state::{is_rfc_nick, is_valid_bot_nick, BotState, ChanStatus, HubEntry, MaskRecord, UserRecord, S_DIE};
+use state::{
+    BotState, ChanStatus, HubEntry, MaskRecord, S_DIE, UserRecord, is_rfc_nick, is_valid_bot_nick,
+};
 
 /// Keep secrets out of anything that lands on disk: no core dump (which
 /// would carry the identity key and config password), no same-uid ptrace
@@ -66,7 +68,7 @@ fn get_input(prompt: &str, len: usize) -> Zeroizing<String> {
 /// Read a password with terminal echo off (plain read when stdin is not a
 /// terminal, e.g. `echo pass | ./ircbot`).
 fn get_password(prompt: &str, len: usize) -> Zeroizing<String> {
-    use nix::sys::termios::{tcgetattr, tcsetattr, LocalFlags, SetArg};
+    use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
     print!("{prompt}: ");
     let _ = io::stdout().flush();
     let stdin = io::stdin();
@@ -111,7 +113,14 @@ fn passfile_context() -> Zeroizing<String> {
     let machine = nix::sys::utsname::uname()
         .map(|u| u.machine().to_string_lossy().into_owned())
         .unwrap_or_default();
-    Zeroizing::new(format!("{}:{}:{}:{}:{}", ino, dev, uid.as_raw(), gid.as_raw(), cstr::trunc(&machine, 65)))
+    Zeroizing::new(format!(
+        "{}:{}:{}:{}:{}",
+        ino,
+        dev,
+        uid.as_raw(),
+        gid.as_raw(),
+        cstr::trunc(&machine, 65)
+    ))
 }
 
 fn passfile_create(path: &str, password: &str) -> bool {
@@ -127,7 +136,13 @@ fn passfile_create(path: &str, password: &str) -> bool {
         eprintln!("Encryption failed.");
         return false;
     };
-    let mut f = match OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path) {
+    let mut f = match OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+    {
         Ok(f) => f,
         Err(e) => {
             eprintln!("open: {e}");
@@ -164,7 +179,9 @@ fn passfile_load(path: &str) -> Option<Zeroizing<String>> {
     let ctx = passfile_context();
     let key = crypto::derive_config_key(ctx.as_bytes(), &buf[..SALT_SIZE]);
     match crypto::gcm_open(key.as_ref(), &[], &buf[SALT_SIZE..]) {
-        Some(p) if !p.is_empty() && p.len() < MAX_PASS => Some(Zeroizing::new(String::from_utf8_lossy(&p).into_owned())),
+        Some(p) if !p.is_empty() && p.len() < MAX_PASS => {
+            Some(Zeroizing::new(String::from_utf8_lossy(&p).into_owned()))
+        }
         _ => {
             eprintln!("[WARN] {path}: decryption failed (wrong machine or tampered file).");
             None
@@ -177,14 +194,21 @@ fn passfile_load(path: &str) -> Option<Zeroizing<String>> {
 /// A user's public key for the wizard: pasted, or a path to .public.b64.
 fn wizard_read_pubkey(who: &str) -> String {
     loop {
-        let input = get_input("Public key (paste the 88 chars, or a path to the .public.b64)", 4096);
+        let input = get_input(
+            "Public key (paste the 88 chars, or a path to the .public.b64)",
+            4096,
+        );
         if input.is_empty() {
-            println!("ERROR: a public key is required. Make one with 'utils/keygen {who}' and give its .public.b64.");
+            println!(
+                "ERROR: a public key is required. Make one with 'utils/keygen {who}' and give its .public.b64."
+            );
             continue;
         }
         // A keygen private file has the same shape: refuse it by name.
         if input.contains(".private.") {
-            println!("ERROR: that is a PRIVATE key file — it stays with the admin. Use the matching .public.b64.");
+            println!(
+                "ERROR: that is a PRIVATE key file — it stays with the admin. Use the matching .public.b64."
+            );
             continue;
         }
         let (key, raw) = match crypto::pubkey_b64_decode(&input) {
@@ -194,7 +218,12 @@ fn wizard_read_pubkey(who: &str) -> String {
                 let line = file
                     .as_deref()
                     .and_then(|s| s.lines().next())
-                    .map(|l| l.split([' ', '\t', '\r', '\n']).next().unwrap_or("").to_string())
+                    .map(|l| {
+                        l.split([' ', '\t', '\r', '\n'])
+                            .next()
+                            .unwrap_or("")
+                            .to_string()
+                    })
                     .unwrap_or_default();
                 match crypto::pubkey_b64_decode(&line) {
                     Some(raw) if !line.is_empty() => (line, raw),
@@ -208,7 +237,11 @@ fn wizard_read_pubkey(who: &str) -> String {
                 }
             }
         };
-        println!("  Key fingerprint for {}: {}", who, crypto::key_fingerprint(&raw));
+        println!(
+            "  Key fingerprint for {}: {}",
+            who,
+            crypto::key_fingerprint(&raw)
+        );
         let yn = get_input("Use this key? (Y/n)", 16);
         if !yn.starts_with(['n', 'N']) {
             return key;
@@ -269,14 +302,23 @@ fn run_config_wizard() -> io::Result<()> {
             if state.target_nick.contains('|') {
                 println!("ERROR: Nick cannot contain '|' (reserved as protocol delimiter).");
             } else if !is_valid_bot_nick(&state.target_nick) {
-            println!("ERROR: Invalid nick length (1-{} characters).", MAX_NICK - 1);
+                println!(
+                    "ERROR: Invalid nick length (1-{} characters).",
+                    MAX_NICK - 1
+                );
             } else {
-                println!("ERROR: Not a valid IRC nick: start with a letter or one of []\\`_^{{}}, then letters, digits, those or '-'.");
+                println!(
+                    "ERROR: Not a valid IRC nick: start with a letter or one of []\\`_^{{}}, then letters, digits, those or '-'."
+                );
             }
         }
         state.user = get_input("Enter bot username (ident)", 64).to_string();
         state.gecos = get_input("Enter bot real name (gecos)", 128).to_string();
-        state.vhost = get_input("Enter VHOST IP (optional, press Enter for default [no vhost])", 128).to_string();
+        state.vhost = get_input(
+            "Enter VHOST IP (optional, press Enter for default [no vhost])",
+            128,
+        )
+        .to_string();
 
         println!("\n--- Setup IRC Server ---");
         let server = loop {
@@ -307,7 +349,9 @@ fn run_config_wizard() -> io::Result<()> {
                 println!("\n--- Hub #{} Address ---", state.hubs.len() + 1);
                 let addr = loop {
                     let a = get_input("Enter hub address (e.g., 127.0.0.1:6000)", 256);
-                    let ok = a.rfind(':').is_some_and(|c| c > 0 && c + 1 < a.len() && (1..65536).contains(&cstr::atoi(&a[c + 1..])));
+                    let ok = a.rfind(':').is_some_and(|c| {
+                        c > 0 && c + 1 < a.len() && (1..65536).contains(&cstr::atoi(&a[c + 1..]))
+                    });
                     if ok {
                         break a.to_string();
                     }
@@ -317,7 +361,9 @@ fn run_config_wizard() -> io::Result<()> {
                     println!("🚨 ERROR: '{addr}' already added; skipping.");
                 } else {
                     println!("\n--- Hub #{} Public Key ---", state.hubs.len() + 1);
-                    println!("Paste the base64 from the hub's hub_public.b64 file (44 or 88 chars).");
+                    println!(
+                        "Paste the base64 from the hub's hub_public.b64 file (44 or 88 chars)."
+                    );
                     let ed_pub = loop {
                         let k = get_input("Hub public key", 256);
                         let k = k.trim_end_matches([' ', '\r', '\n', '\t']);
@@ -333,7 +379,11 @@ fn run_config_wizard() -> io::Result<()> {
                             ),
                         }
                     };
-                    state.hubs.push(HubEntry { addr: addr.clone(), ed_pub, ed_pub_set: true });
+                    state.hubs.push(HubEntry {
+                        addr: addr.clone(),
+                        ed_pub,
+                        ed_pub_set: true,
+                    });
                     println!("\n✓ Hub added: {addr}");
                 }
                 if state.hubs.len() >= MAX_SERVERS {
@@ -345,7 +395,9 @@ fn run_config_wizard() -> io::Result<()> {
                 }
             }
             if state.hubs.is_empty() {
-                println!("\n🚨 ERROR: A hub-managed bot needs at least one hub. Restarting setup.\n");
+                println!(
+                    "\n🚨 ERROR: A hub-managed bot needs at least one hub. Restarting setup.\n"
+                );
                 continue;
             }
             println!(
@@ -378,7 +430,15 @@ fn run_config_wizard() -> io::Result<()> {
             println!("Press Enter with no mask when done (at least one required).\n");
             let mut masks: Vec<String> = Vec::new();
             while masks.len() < 20 {
-                print!("Usermask {}{}: ", masks.len() + 1, if masks.is_empty() { " (required)" } else { " (or Enter to finish)" });
+                print!(
+                    "Usermask {}{}: ",
+                    masks.len() + 1,
+                    if masks.is_empty() {
+                        " (required)"
+                    } else {
+                        " (or Enter to finish)"
+                    }
+                );
                 let _ = io::stdout().flush();
                 let mut line = String::new();
                 if io::stdin().lock().read_line(&mut line).unwrap_or(0) == 0 {
@@ -400,7 +460,11 @@ fn run_config_wizard() -> io::Result<()> {
             }
             println!("\n--- Setup Initial Channel ---");
             loop {
-                chan = get_input("Enter channel to join (e.g., #bots) [Optional, Enter to skip]", MAX_CHAN).to_string();
+                chan = get_input(
+                    "Enter channel to join (e.g., #bots) [Optional, Enter to skip]",
+                    MAX_CHAN,
+                )
+                .to_string();
                 if chan.is_empty() || (chan.starts_with('#') && chan.len() > 1) {
                     break;
                 }
@@ -415,15 +479,31 @@ fn run_config_wizard() -> io::Result<()> {
         println!("Bot Nick: {}", state.target_nick);
         println!("IRC Server: {server}");
         if hub_managed {
-            println!("Mode: HUB-MANAGED ({} hub{})", state.hubs.len(), if state.hubs.len() == 1 { "" } else { "s" });
+            println!(
+                "Mode: HUB-MANAGED ({} hub{})",
+                state.hubs.len(),
+                if state.hubs.len() == 1 { "" } else { "s" }
+            );
             println!("Admins/channels: managed on the hub");
         } else if let Some((name, key, masks)) = &admin {
-        println!("Mode: STANDALONE");
-        println!("Admin: {} ({} usermask{})", name, masks.len(), if masks.len() == 1 { "" } else { "s" });
+            println!("Mode: STANDALONE");
+            println!(
+                "Admin: {} ({} usermask{})",
+                name,
+                masks.len(),
+                if masks.len() == 1 { "" } else { "s" }
+            );
             if let Some(raw) = crypto::pubkey_b64_decode(key) {
                 println!("Admin key: {}", crypto::key_fingerprint(&raw));
             }
-            println!("Channel: {}", if chan.is_empty() { "(none)" } else { chan.as_str() });
+            println!(
+                "Channel: {}",
+                if chan.is_empty() {
+                    "(none)"
+                } else {
+                    chan.as_str()
+                }
+            );
         }
         if get_input("Does this look correct? (Y/n)", 16).starts_with(['n', 'N']) {
             println!("\nRestarting configuration wizard...\n");
@@ -434,8 +514,7 @@ fn run_config_wizard() -> io::Result<()> {
 
     // Standalone only: the hub is authoritative for a|/m| records and would
     // replace them on the first sync.
-    if !hub_managed
-        && let Some((name, key, masks)) = admin {
+    if !hub_managed && let Some((name, key, masks)) = admin {
         let uuid = crypto::gen_uuid_v4().unwrap_or_default();
         let t = now();
         state.user_records.push(UserRecord {
@@ -449,12 +528,19 @@ fn run_config_wizard() -> io::Result<()> {
             ..UserRecord::default()
         });
         for m in masks.into_iter().take(MAX_USER_MASKS) {
-            state.mask_records.push(MaskRecord { uuid: uuid.clone(), mask: m, is_active: true, last_used: 0, timestamp: t });
+            state.mask_records.push(MaskRecord {
+                uuid: uuid.clone(),
+                mask: m,
+                is_active: true,
+                last_used: 0,
+                timestamp: t,
+            });
         }
     }
     state.server_list.push(server);
     if !chan.is_empty()
-        && let Some(ci) = channel::add(&mut state, &chan) {
+        && let Some(ci) = channel::add(&mut state, &chan)
+    {
         let c = &mut state.chans[ci];
         c.is_managed = true;
         c.timestamp = now();
@@ -484,7 +570,14 @@ fn daemonize() {
 
 /// The pid file, flock'd: the lock is what marks this bot as running.
 fn lock_pid_file() -> Option<fs::File> {
-    let mut f = OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(PID_FILE).ok()?;
+    let mut f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(PID_FILE)
+        .ok()?;
     if f.try_lock().is_err() {
         let mut existing = String::new();
         let _ = f.read_to_string(&mut existing);
@@ -564,7 +657,9 @@ fn main() {
     println!("{BOT_NAME} {BOT_VERSION}");
     daemonize();
 
-    let Some(pid_file) = lock_pid_file() else { std::process::exit(1) };
+    let Some(pid_file) = lock_pid_file() else {
+        std::process::exit(1)
+    };
     let code = run(password, pid_file);
     std::process::exit(code);
 }

@@ -16,9 +16,9 @@
 
 use aes_gcm::aead::{AeadInOut, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce, Tag};
-use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig, STANDARD};
 use base64::engine::DecodePaddingMode;
-use base64::{alphabet, Engine};
+use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig, STANDARD};
+use base64::{Engine, alphabet};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
@@ -87,11 +87,18 @@ fn cipher(key: &[u8]) -> Option<Aes256Gcm> {
 }
 
 /// AES-256-GCM with a caller-supplied IV; returns (ciphertext, tag).
-pub fn gcm_encrypt_detached(key: &[u8], iv: &[u8; GCM_IV_LEN], aad: &[u8], pt: &[u8]) -> Option<(Vec<u8>, [u8; GCM_TAG_LEN])> {
+pub fn gcm_encrypt_detached(
+    key: &[u8],
+    iv: &[u8; GCM_IV_LEN],
+    aad: &[u8],
+    pt: &[u8],
+) -> Option<(Vec<u8>, [u8; GCM_TAG_LEN])> {
     let c = cipher(key)?;
     let mut buf = pt.to_vec();
     let nonce = Nonce::try_from(&iv[..]).ok()?;
-    let tag = c.encrypt_inout_detached(&nonce, aad, buf.as_mut_slice().into()).ok()?;
+    let tag = c
+        .encrypt_inout_detached(&nonce, aad, buf.as_mut_slice().into())
+        .ok()?;
     let mut t = [0u8; GCM_TAG_LEN];
     t.copy_from_slice(&tag);
     Some((buf, t))
@@ -113,7 +120,8 @@ pub fn gcm_decrypt_detached(
     let mut buf = Zeroizing::new(ct.to_vec());
     let nonce = Nonce::try_from(iv).ok()?;
     let tag = Tag::try_from(tag).ok()?;
-    c.decrypt_inout_detached(&nonce, aad, buf.as_mut_slice().into(), &tag).ok()?;
+    c.decrypt_inout_detached(&nonce, aad, buf.as_mut_slice().into(), &tag)
+        .ok()?;
     Some(buf)
 }
 
@@ -144,7 +152,9 @@ pub fn gcm_open(key: &[u8], aad: &[u8], frame: &[u8]) -> Option<Zeroizing<Vec<u8
 
 /// HKDF-SHA256 extract-and-expand into `out`.
 pub fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8], out: &mut [u8]) -> bool {
-    Hkdf::<Sha256>::new(Some(salt), ikm).expand(info, out).is_ok()
+    Hkdf::<Sha256>::new(Some(salt), ikm)
+        .expand(info, out)
+        .is_ok()
 }
 
 /// X25519(priv, peer_pub); None on an all-zero (low-order point) result,
@@ -183,7 +193,8 @@ pub fn ed25519_verify(pub_key: &[u8; 32], msg: &[u8], sig: &[u8]) -> bool {
 }
 
 /// Fresh combined keypair: priv = ed_seed || x_priv, pub = ed_pub || x_pub.
-pub fn generate_combined_keypair() -> Option<(Zeroizing<[u8; HUB_KEY_RAW_LEN]>, [u8; HUB_KEY_RAW_LEN])> {
+pub fn generate_combined_keypair()
+-> Option<(Zeroizing<[u8; HUB_KEY_RAW_LEN]>, [u8; HUB_KEY_RAW_LEN])> {
     let mut priv_key = Zeroizing::new([0u8; HUB_KEY_RAW_LEN]);
     if !random_bytes(priv_key.as_mut()) {
         return None;
@@ -251,7 +262,11 @@ pub fn pubkey_b64_decode(b64: &str) -> Option<[u8; HUB_KEY_RAW_LEN]> {
     }
     for (i, &c) in b.iter().enumerate() {
         let alpha = c.is_ascii_alphanumeric() || c == b'+' || c == b'/';
-        let ok = if i >= COMBINED_KEY_B64 - 2 { c == b'=' } else { alpha };
+        let ok = if i >= COMBINED_KEY_B64 - 2 {
+            c == b'='
+        } else {
+            alpha
+        };
         if !ok {
             return None;
         }
@@ -294,7 +309,13 @@ pub fn sha256_file_hex(path: &str) -> Option<String> {
 }
 
 /// key = HKDF-SHA256(ikm, salt = eph_pub, info = label || [s_x_pub] || r_x_pub)
-fn seal_kdf(ikm: &[u8], eph_pub: &[u8; 32], label: &str, s_x_pub: Option<&[u8; 32]>, r_x_pub: &[u8; 32]) -> Option<Key32> {
+fn seal_kdf(
+    ikm: &[u8],
+    eph_pub: &[u8; 32],
+    label: &str,
+    s_x_pub: Option<&[u8; 32]>,
+    r_x_pub: &[u8; 32],
+) -> Option<Key32> {
     if label.len() > 64 {
         return None;
     }
@@ -445,8 +466,24 @@ mod tests {
         let (_, r_x) = split_priv(&rpriv);
         let (_, s_x_pub) = pub_halves(&spub);
         let (_, r_x_pub) = pub_halves(&rpub);
-        let f = seal(Some((&s_x, &s_x_pub)), &r_x_pub, A2S_LABEL, b"ctx", b"1:0123456789abcdef:status").unwrap();
-        let (pt, rk) = open_rk(&r_x, &r_x_pub, Some(&s_x_pub), A2S_LABEL, b"ctx", &f, Some(A2R_LABEL)).unwrap();
+        let f = seal(
+            Some((&s_x, &s_x_pub)),
+            &r_x_pub,
+            A2S_LABEL,
+            b"ctx",
+            b"1:0123456789abcdef:status",
+        )
+        .unwrap();
+        let (pt, rk) = open_rk(
+            &r_x,
+            &r_x_pub,
+            Some(&s_x_pub),
+            A2S_LABEL,
+            b"ctx",
+            &f,
+            Some(A2R_LABEL),
+        )
+        .unwrap();
         assert_eq!(pt.as_slice(), b"1:0123456789abcdef:status");
         assert!(rk.is_some());
         // Wrong sender key, wrong label, wrong AAD all fail.
@@ -483,15 +520,13 @@ mod tests {
     #[test]
     fn ed25519_rfc8032_vector1() {
         // RFC 8032 section 7.1, TEST 1 (empty message).
-        let seed: [u8; 32] = hex32("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+        let seed: [u8; 32] =
+            hex32("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
         let pk = hex32("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
         assert_eq!(ed25519_public(&seed), pk);
         let sig = ed25519_sign(&seed, b"");
         assert!(ed25519_verify(&pk, b"", &sig));
-        assert_eq!(
-            sig[..8],
-            [0xe5, 0x56, 0x43, 0x00, 0xc3, 0x60, 0xac, 0x72]
-        );
+        assert_eq!(sig[..8], [0xe5, 0x56, 0x43, 0x00, 0xc3, 0x60, 0xac, 0x72]);
     }
 
     fn hex32(s: &str) -> [u8; 32] {

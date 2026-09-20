@@ -51,12 +51,18 @@ pub fn user_candidates(state: &BotState, user_host: &str) -> Vec<(usize, usize)>
             .user_records
             .iter()
             .position(|u| u.is_active && u.has_pubkey && u.uuid == mr.uuid)
-            && !out.iter().any(|&(u, _)| u == ui) {
+            && !out.iter().any(|&(u, _)| u == ui)
+        {
             out.push((ui, mi));
         }
     }
     if out.is_empty() {
-        logm!(state, L_DEBUG, "[AUTH] no keyed user mask matched {}\n", user_host);
+        logm!(
+            state,
+            L_DEBUG,
+            "[AUTH] no keyed user mask matched {}\n",
+            user_host
+        );
     }
     out
 }
@@ -105,7 +111,10 @@ pub fn trusted_bot_by_nick(state: &BotState, nick: &str) -> Option<usize> {
     if nick.is_empty() {
         return None;
     }
-    state.trusted_bots.iter().position(|tb| tb.nick().eq_ignore_ascii_case(nick))
+    state
+        .trusted_bots
+        .iter()
+        .position(|tb| tb.nick().eq_ignore_ascii_case(nick))
 }
 
 pub fn is_trusted_bot(state: &BotState, user_host: &str) -> bool {

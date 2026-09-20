@@ -11,7 +11,7 @@
 use crate::auth::wildcard_match;
 use crate::consts::*;
 use crate::cstr::{eq_ic, now, trunc_string};
-use crate::state::{BotState, Chan, ChanReq, ChanStatus, UnbanJob, S_AUTHED};
+use crate::state::{BotState, Chan, ChanReq, ChanStatus, S_AUTHED, UnbanJob};
 use crate::{bot_comms, config, hub_client, ircf, logm};
 
 /// channel_add(): None if the channel is already listed.
@@ -89,13 +89,31 @@ pub fn check_joins(state: &mut BotState) {
         let name = c.name.clone();
         let mut should_refresh = false;
         if c.roster.is_empty() && now - c.last_who_request > 30 {
-            logm!(state, L_DEBUG, "[DEBUG] No roster for {}. Requesting WHO.\n", name);
+            logm!(
+                state,
+                L_DEBUG,
+                "[DEBUG] No roster for {}. Requesting WHO.\n",
+                name
+            );
             should_refresh = true;
         } else if now - c.last_who_request > ROSTER_REFRESH_INTERVAL {
-            logm!(state, L_DEBUG, "[DEBUG] Periodic roster refresh for {} (not opped).\n", name);
+            logm!(
+                state,
+                L_DEBUG,
+                "[DEBUG] Periodic roster refresh for {} (not opped).\n",
+                name
+            );
             should_refresh = true;
-        } else if c.op_request_pending && now - c.last_op_request_time > 60 && c.op_request_retry_count < 5 {
-            logm!(state, L_DEBUG, "[DEBUG] Op request timeout in {}. Refreshing to retry.\n", name);
+        } else if c.op_request_pending
+            && now - c.last_op_request_time > 60
+            && c.op_request_retry_count < 5
+        {
+            logm!(
+                state,
+                L_DEBUG,
+                "[DEBUG] Op request timeout in {}. Refreshing to retry.\n",
+                name
+            );
             should_refresh = true;
             state.chans[i].op_request_pending = false;
         }
@@ -139,7 +157,14 @@ fn access_fallback(state: &mut BotState, kind: ChanReq, channel: &str) -> bool {
             ChanReq::Key => format!("KEY {channel}"),
         };
         bot_comms::send_command(state, &tb_nick, &cmd);
-        logm!(state, L_INFO, "[CHANREQ] {} for {} via {} (no hub)\n", kind.token(), channel, tb_nick);
+        logm!(
+            state,
+            L_INFO,
+            "[CHANREQ] {} for {} via {} (no hub)\n",
+            kind.token(),
+            channel,
+            tb_nick
+        );
         return true;
     }
     false
@@ -150,7 +175,9 @@ fn access_fallback(state: &mut BotState, kind: ChanReq, channel: &str) -> bool {
 /// globally; true when a request actually left the bot.
 pub fn access_request(state: &mut BotState, ci: usize, kind: ChanReq) -> bool {
     let k = kind as usize;
-    let Some(c) = state.chans.get(ci) else { return false };
+    let Some(c) = state.chans.get(ci) else {
+        return false;
+    };
     if !c.is_managed || c.join_disabled || state.status & S_AUTHED == 0 {
         return false;
     }
@@ -188,7 +215,10 @@ pub fn access_request(state: &mut BotState, ci: usize, kind: ChanReq) -> bool {
 }
 
 fn unban_job_find(state: &BotState, channel: &str) -> Option<usize> {
-    state.unban_jobs.iter().position(|j| j.active && eq_ic(&j.channel, channel))
+    state
+        .unban_jobs
+        .iter()
+        .position(|j| j.active && eq_ic(&j.channel, channel))
 }
 
 /// Close out ban-list walks whose 368 never arrived.
@@ -199,7 +229,12 @@ pub fn unban_expire(state: &mut BotState) {
         if j.active && now - j.started > UNBAN_JOB_TTL {
             let ch = j.channel.clone();
             state.unban_jobs[i].active = false;
-            logm!(state, L_DEBUG, "[DEBUG] [UNBAN] Ban list for {} never closed; job dropped\n", ch);
+            logm!(
+                state,
+                L_DEBUG,
+                "[DEBUG] [UNBAN] Ban list for {} never closed; job dropped\n",
+                ch
+            );
         }
     }
 }
@@ -223,14 +258,22 @@ fn unban_job_start(state: &mut BotState, channel: &str, hostmask: &str) -> bool 
         active: true,
     };
     ircf!(state, "MODE {} +b\r\n", channel);
-    logm!(state, L_INFO, "[UNBAN] Walking ban list of {} for {}\n", channel, hostmask);
+    logm!(
+        state,
+        L_INFO,
+        "[UNBAN] Walking ban list of {} for {}\n",
+        channel,
+        hostmask
+    );
     true
 }
 
 /// One 367 entry.  Only masks that match the requester come off, and never
 /// more than UNBAN_MAX_REMOVALS of them.
 pub fn unban_note_ban(state: &mut BotState, channel: &str, ban_mask: &str) {
-    let Some(ji) = unban_job_find(state, channel) else { return };
+    let Some(ji) = unban_job_find(state, channel) else {
+        return;
+    };
     if ban_mask.is_empty() {
         return;
     }
@@ -247,14 +290,29 @@ pub fn unban_note_ban(state: &mut BotState, channel: &str, ban_mask: &str) {
     if let Some(j) = state.unban_jobs.get_mut(ji) {
         j.removed += 1;
     }
-    logm!(state, L_INFO, "[UNBAN] Removed {} from {} (matched {})\n", ban_mask, channel, hostmask);
+    logm!(
+        state,
+        L_INFO,
+        "[UNBAN] Removed {} from {} (matched {})\n",
+        ban_mask,
+        channel,
+        hostmask
+    );
 }
 
 pub fn unban_finish(state: &mut BotState, channel: &str) {
-    let Some(ji) = unban_job_find(state, channel) else { return };
+    let Some(ji) = unban_job_find(state, channel) else {
+        return;
+    };
     if state.unban_jobs[ji].removed == 0 {
         let hm = state.unban_jobs[ji].hostmask.clone();
-        logm!(state, L_INFO, "[UNBAN] No ban in {} matched {}\n", channel, hm);
+        logm!(
+            state,
+            L_INFO,
+            "[UNBAN] No ban in {} matched {}\n",
+            channel,
+            hm
+        );
     }
     state.unban_jobs[ji].active = false;
 }
@@ -277,27 +335,53 @@ pub fn access_service(
     let ci = match find(state, channel) {
         Some(ci) if state.chans[ci].status == ChanStatus::In => ci,
         _ => {
-            logm!(state, L_DEBUG, "[DEBUG] [CHANREQ] {} for {} ignored: not in channel\n", kind.token(), channel);
+            logm!(
+                state,
+                L_DEBUG,
+                "[DEBUG] [CHANREQ] {} for {} ignored: not in channel\n",
+                kind.token(),
+                channel
+            );
             return;
         }
     };
     let opped = state.chans[ci].i_am_opped;
     match kind {
         ChanReq::Unban => {
-            let Some(hm) = hostmask.filter(|h| !h.is_empty()) else { return };
+            let Some(hm) = hostmask.filter(|h| !h.is_empty()) else {
+                return;
+            };
             if !opped {
-                logm!(state, L_DEBUG, "[DEBUG] [UNBAN] Not opped in {}; cannot help\n", channel);
+                logm!(
+                    state,
+                    L_DEBUG,
+                    "[DEBUG] [UNBAN] Not opped in {}; cannot help\n",
+                    channel
+                );
                 return;
             }
             unban_job_start(state, channel, hm);
         }
         ChanReq::Invite => {
-            let Some(n) = nick.filter(|n| !n.is_empty()) else { return };
+            let Some(n) = nick.filter(|n| !n.is_empty()) else {
+                return;
+            };
             if !opped {
-                logm!(state, L_DEBUG, "[DEBUG] [INVITE] Not opped in {}; cannot help\n", channel);
+                logm!(
+                    state,
+                    L_DEBUG,
+                    "[DEBUG] [INVITE] Not opped in {}; cannot help\n",
+                    channel
+                );
                 return;
             }
-            logm!(state, L_INFO, "[INVITE] Inviting {} into {} (mesh request)\n", n, channel);
+            logm!(
+                state,
+                L_INFO,
+                "[INVITE] Inviting {} into {} (mesh request)\n",
+                n,
+                channel
+            );
             ircf!(state, "INVITE {} {}\r\n", n, channel);
         }
         ChanReq::Key => {
@@ -305,15 +389,31 @@ pub fn access_service(
             // the current key.
             let key = state.chans[ci].key.clone();
             if key.is_empty() {
-                logm!(state, L_DEBUG, "[DEBUG] [CHANREQ] No key held for {}; staying quiet\n", channel);
+                logm!(
+                    state,
+                    L_DEBUG,
+                    "[DEBUG] [CHANREQ] No key held for {}; staying quiet\n",
+                    channel
+                );
                 return;
             }
             if let Some(to) = reply_to.filter(|r| !r.is_empty()) {
                 bot_comms::send_command(state, to, &format!("KEYIS {channel} {key}"));
-                logm!(state, L_INFO, "[CHANREQ] Sent key for {} to {} (~B2)\n", channel, to);
+                logm!(
+                    state,
+                    L_INFO,
+                    "[CHANREQ] Sent key for {} to {} (~B2)\n",
+                    channel,
+                    to
+                );
             } else if !request_id.is_empty() {
                 hub_client::send_chan_reply(state, request_id, kind.token(), channel, "ok", &key);
-                logm!(state, L_INFO, "[CHANREQ] Sent key for {} via hub\n", channel);
+                logm!(
+                    state,
+                    L_INFO,
+                    "[CHANREQ] Sent key for {} via hub\n",
+                    channel
+                );
             }
         }
     }
@@ -327,17 +427,29 @@ pub fn access_accept_key(state: &mut BotState, channel: &str, key: &str) {
         return;
     }
     if key.len() >= MAX_KEY {
-        logm!(state, L_INFO, "[CHANREQ] Oversized key for {} ignored\n", channel);
+        logm!(
+            state,
+            L_INFO,
+            "[CHANREQ] Oversized key for {} ignored\n",
+            channel
+        );
         return;
     }
-    let Some(ci) = find(state, channel) else { return };
+    let Some(ci) = find(state, channel) else {
+        return;
+    };
     let c = &state.chans[ci];
     if !c.is_managed || c.status == ChanStatus::In {
         return;
     }
     let asked = c.last_access_request[ChanReq::Key as usize];
     if asked == 0 || now() - asked > CHAN_REPLY_ACCEPT_WINDOW {
-        logm!(state, L_INFO, "[CHANREQ] Unsolicited key for {} ignored\n", channel);
+        logm!(
+            state,
+            L_INFO,
+            "[CHANREQ] Unsolicited key for {} ignored\n",
+            channel
+        );
         return;
     }
     if c.key == key {
@@ -346,7 +458,12 @@ pub fn access_accept_key(state: &mut BotState, channel: &str, key: &str) {
     let c = &mut state.chans[ci];
     c.key = key.to_string();
     c.timestamp = crate::state::lww_next_ts(c.timestamp);
-    logm!(state, L_INFO, "[CHANREQ] Learned key for {}; retrying join\n", channel);
+    logm!(
+        state,
+        L_INFO,
+        "[CHANREQ] Learned key for {}; retrying join\n",
+        channel
+    );
     hub_client::push_channel(state, ci);
     config::write_with_state_pass(state);
     // Go straight back in rather than waiting out JOIN_RETRY_TIME.

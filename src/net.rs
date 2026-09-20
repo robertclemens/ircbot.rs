@@ -37,7 +37,11 @@ pub fn resolve(host: &str, port: &str) -> io::Result<Vec<SocketAddr>> {
 /// A TCP socket for `addr` (close-on-exec, as socket2 creates them),
 /// bound to `bind` first when given.
 pub fn new_socket(addr: &SocketAddr, bind: Option<IpAddr>) -> io::Result<Socket> {
-    let sock = Socket::new(Domain::for_address(*addr), Type::STREAM, Some(Protocol::TCP))?;
+    let sock = Socket::new(
+        Domain::for_address(*addr),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
     if let Some(ip) = bind {
         sock.bind(&SockAddr::from(SocketAddr::new(ip, 0)))?;
     }
@@ -91,7 +95,11 @@ pub enum ReadOutcome {
 
 /// Read what is available (edge-triggered: until WouldBlock), stopping once
 /// `into` holds `cap` bytes.
-pub fn read_available<R: Read>(sock: &mut R, into: &mut Vec<u8>, cap: usize) -> io::Result<ReadOutcome> {
+pub fn read_available<R: Read>(
+    sock: &mut R,
+    into: &mut Vec<u8>,
+    cap: usize,
+) -> io::Result<ReadOutcome> {
     let mut chunk = [0u8; 8192];
     loop {
         if into.len() >= cap {

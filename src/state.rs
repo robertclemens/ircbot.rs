@@ -96,7 +96,13 @@ pub struct TrustedBot {
 
 impl Default for TrustedBot {
     fn default() -> Self {
-        TrustedBot { mask: String::new(), uuid: String::new(), pub_key: [0; HUB_KEY_RAW_LEN], has_pub: false, ts: 0 }
+        TrustedBot {
+            mask: String::new(),
+            uuid: String::new(),
+            pub_key: [0; HUB_KEY_RAW_LEN],
+            has_pub: false,
+            ts: 0,
+        }
     }
 }
 
@@ -208,11 +214,16 @@ pub struct NonceCache {
 
 impl NonceCache {
     pub fn new(size: usize) -> Self {
-        NonceCache { entries: vec![NonceEntry::default(); size], idx: 0 }
+        NonceCache {
+            entries: vec![NonceEntry::default(); size],
+            idx: 0,
+        }
     }
 
     pub fn seen(&self, nonce: u64, now: i64) -> bool {
-        self.entries.iter().any(|e| e.nonce == nonce && now - e.ts <= NONCE_TTL_SECONDS)
+        self.entries
+            .iter()
+            .any(|e| e.nonce == nonce && now - e.ts <= NONCE_TTL_SECONDS)
     }
 
     pub fn record(&mut self, nonce: u64, now: i64) {
@@ -384,7 +395,9 @@ impl BotState {
             trusted_bots: Vec::new(),
             last_auth_reply_any: 0,
             admin_delta_pending: false,
-            dcc: (0..DCC_MAX_SESSIONS).map(|_| DccSession::default()).collect(),
+            dcc: (0..DCC_MAX_SESSIONS)
+                .map(|_| DccSession::default())
+                .collect(),
             dcc_reply: None,
             a2r: A2rCtx::default(),
             recent_nonces: NonceCache::new(NONCE_CACHE_SIZE),
@@ -452,11 +465,7 @@ impl BotState {
 /// past its previous stamp (hubs and bots accept only a strictly newer one).
 pub fn lww_next_ts(prev: i64) -> i64 {
     let t = now();
-    if t > prev {
-        t
-    } else {
-        prev + 1
-    }
+    if t > prev { t } else { prev + 1 }
 }
 
 /// LWW acceptance for an add/del record: newer wins; on a tie a delete beats

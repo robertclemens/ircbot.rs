@@ -13,7 +13,9 @@ use zeroize::Zeroizing;
 
 use crate::consts::*;
 use crate::crypto;
-use crate::cstr::{atoll, has_uuid_dashes, is_uuid, now, split_fields, strtoll, trunc, trunc_string, Scan};
+use crate::cstr::{
+    Scan, atoll, has_uuid_dashes, is_uuid, now, split_fields, strtoll, trunc, trunc_string,
+};
 use crate::state::{BotState, ChanStatus, HubEntry, MaskRecord, TrustedBot, UserLine, UserRecord};
 use crate::{channel, hub_client, logm};
 
@@ -66,7 +68,11 @@ pub fn format_user_line(u: &UserRecord) -> String {
         u.typ,
         u.uuid,
         u.name,
-        if u.has_pubkey { u.pubkey_b64.as_str() } else { "" },
+        if u.has_pubkey {
+            u.pubkey_b64.as_str()
+        } else {
+            ""
+        },
         if u.is_active { "add" } else { "del" },
         u.last_seen,
         u.timestamp
@@ -83,7 +89,10 @@ pub fn parse_bot_line(data: &str) -> Option<TrustedBot> {
     if f[0].is_empty() || f[0].len() >= MAX_MASK_LEN {
         return None;
     }
-    let mut out = TrustedBot { mask: f[0].to_string(), ..TrustedBot::default() };
+    let mut out = TrustedBot {
+        mask: f[0].to_string(),
+        ..TrustedBot::default()
+    };
     if f.len() == 1 {
         return Some(out);
     }
@@ -99,7 +108,8 @@ pub fn parse_bot_line(data: &str) -> Option<TrustedBot> {
         return Some(out);
     }
     if !f[2].is_empty()
-        && let Some(k) = field_pubkey(f[2]).and_then(|b| crypto::pubkey_b64_decode(&b)) {
+        && let Some(k) = field_pubkey(f[2]).and_then(|b| crypto::pubkey_b64_decode(&b))
+    {
         out.pub_key = k;
         out.has_pub = true;
     }
@@ -109,7 +119,11 @@ pub fn parse_bot_line(data: &str) -> Option<TrustedBot> {
 
 /// One trusted bot as a full "b|...\n" line (new format).
 pub fn format_bot_line(tb: &TrustedBot) -> String {
-    let pb = if tb.has_pub { crypto::b64_encode(&tb.pub_key) } else { String::new() };
+    let pb = if tb.has_pub {
+        crypto::b64_encode(&tb.pub_key)
+    } else {
+        String::new()
+    };
     format!("b|{}|{}|{}|{}\n", tb.mask, tb.uuid, pb, tb.ts)
 }
 
@@ -127,7 +141,10 @@ pub fn format_mask_line(m: &MaskRecord) -> String {
 
 /// Keep only [a-zA-Z0-9] of an opt-flag string, at most MAX_OPT_FLAGS.
 pub fn clean_opt_flags(s: &str) -> String {
-    s.chars().filter(|c| c.is_ascii_alphanumeric()).take(MAX_OPT_FLAGS).collect()
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(MAX_OPT_FLAGS)
+        .collect()
 }
 
 /// Parse "O|<flags>|<ts>" data (also the hub's form).  "O||<ts>" is a
@@ -139,7 +156,11 @@ pub fn parse_opt_line(data: &str) -> Option<(String, i64)> {
     }
     let mut sc = Scan::new(data);
     let flags = sc.set_not(MAX_OPT_FLAGS, b"|")?;
-    let ts = if sc.lit(b'|') { sc.int().unwrap_or(0) } else { 0 };
+    let ts = if sc.lit(b'|') {
+        sc.int().unwrap_or(0)
+    } else {
+        0
+    };
     Some((clean_opt_flags(flags), ts))
 }
 
@@ -158,15 +179,18 @@ fn parse_cfg_chan(data: &str) -> Option<(String, String, String, i64)> {
             chan = c.to_string();
             parsed = 1;
             if sc.lit(b'|')
-                && let Some(k) = sc.set_not(30, b"|") {
+                && let Some(k) = sc.set_not(30, b"|")
+            {
                 key = k.to_string();
                 parsed = 2;
                 if sc.lit(b'|')
-                    && let Some(o) = sc.set_not(15, b"|") {
+                    && let Some(o) = sc.set_not(15, b"|")
+                {
                     op = o.to_string();
                     parsed = 3;
                     if sc.lit(b'|')
-                        && let Some(t) = sc.int() {
+                        && let Some(t) = sc.int()
+                    {
                         ts = t;
                         parsed = 4;
                     }
@@ -182,12 +206,15 @@ fn parse_cfg_chan(data: &str) -> Option<(String, String, String, i64)> {
         if let Some(c) = sc.set_not(64, b"|") {
             chan = c.to_string();
             parsed = 1;
-            if sc.lit(b'|') && sc.lit(b'|')
-                && let Some(o) = sc.set_not(15, b"|") {
+            if sc.lit(b'|')
+                && sc.lit(b'|')
+                && let Some(o) = sc.set_not(15, b"|")
+            {
                 op = o.to_string();
                 parsed = 2;
                 if sc.lit(b'|')
-                    && let Some(t) = sc.int() {
+                    && let Some(t) = sc.int()
+                {
                     ts = t;
                     parsed = 3;
                 }
@@ -199,11 +226,19 @@ fn parse_cfg_chan(data: &str) -> Option<(String, String, String, i64)> {
 
 /// Read and decrypt the config file; returns the plaintext and whether the
 /// legacy (pre-PBKDF2) key had to be used.
-fn decrypt_file(state: &BotState, password: &str, filename: &str) -> Option<(Zeroizing<Vec<u8>>, bool)> {
+fn decrypt_file(
+    state: &BotState,
+    password: &str,
+    filename: &str,
+) -> Option<(Zeroizing<Vec<u8>>, bool)> {
     let mut f = fs::File::open(filename).ok()?;
     let mut data = Vec::new();
     if f.read_to_end(&mut data).is_err() {
-        logm!(state, L_INFO, "[CFG] Error: Could not read the full contents of the config file.\n");
+        logm!(
+            state,
+            L_INFO,
+            "[CFG] Error: Could not read the full contents of the config file.\n"
+        );
         return None;
     }
     if data.len() < SALT_SIZE {
@@ -219,7 +254,11 @@ fn decrypt_file(state: &BotState, password: &str, filename: &str) -> Option<(Zer
     let tag = &data[SALT_SIZE + GCM_IV_LEN..SALT_SIZE + GCM_IV_LEN + GCM_TAG_LEN];
     let ct = &data[SALT_SIZE + GCM_IV_LEN + GCM_TAG_LEN..];
     if ct.is_empty() || ct.len() > MAX_CONFIG_SIZE {
-        logm!(state, L_INFO, "[CFG] Error: Config file is empty or too large (Max 1MB).\n");
+        logm!(
+            state,
+            L_INFO,
+            "[CFG] Error: Config file is empty or too large (Max 1MB).\n"
+        );
         return None;
     }
     let key = crypto::derive_config_key(password.as_bytes(), salt);
@@ -231,7 +270,11 @@ fn decrypt_file(state: &BotState, password: &str, filename: &str) -> Option<(Zer
     if let Some(pt) = crypto::gcm_decrypt_detached(legacy.as_ref(), iv, &[], ct, tag) {
         return Some((pt, true));
     }
-    logm!(state, L_INFO, "[CFG] Decryption failed (wrong password?).\n");
+    logm!(
+        state,
+        L_INFO,
+        "[CFG] Decryption failed (wrong password?).\n"
+    );
     None
 }
 
@@ -241,7 +284,13 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
     if let Ok(md) = fs::metadata(filename) {
         let mode = md.permissions().mode();
         if mode & 0o177 != 0 {
-            logm!(state, L_INFO, "[CFG] WARN: {} has insecure permissions {:04o} — should be 0600\n", filename, mode & 0o777);
+            logm!(
+                state,
+                L_INFO,
+                "[CFG] WARN: {} has insecure permissions {:04o} — should be 0600\n",
+                filename,
+                mode & 0o777
+            );
         }
     }
     let Some((plaintext, migrated_from_legacy)) = decrypt_file(state, password, filename) else {
@@ -271,7 +320,8 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
             }
             b'c' => {
                 if let Some((chan, key, op, ts)) = parse_cfg_chan(data)
-                    && let Some(ci) = channel::add(state, &chan) {
+                    && let Some(ci) = channel::add(state, &chan)
+                {
                     let c = &mut state.chans[ci];
                     if !key.is_empty() {
                         c.key = trunc_string(&key, MAX_KEY);
@@ -291,7 +341,12 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
                 let f = split_fields(data, 5);
                 if is_uuid(f[0]) {
                     let Some(ul) = parse_user_line(data) else {
-                        logm!(state, L_INFO, "[CFG] Malformed {}| record ignored.\n", typ as char);
+                        logm!(
+                            state,
+                            L_INFO,
+                            "[CFG] Malformed {}| record ignored.\n",
+                            typ as char
+                        );
                         continue;
                     };
                     if ul.legacy {
@@ -312,7 +367,10 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
                     // Pre-UUID shapes, tagged for migration; their password is
                     // never copied:  a|<password>|<ts>
                     //                o|<mask>|<password>|<add/del>|<ts>
-                    let mut u = UserRecord { typ: typ as char, ..UserRecord::default() };
+                    let mut u = UserRecord {
+                        typ: typ as char,
+                        ..UserRecord::default()
+                    };
                     if typ == b'a' {
                         u.uuid = "MIGRATE".into();
                         let ts = f.get(1).map_or(0, |x| atoll(x));
@@ -338,7 +396,11 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
                 if state.trusted_bots.len() < MAX_TRUSTED_BOTS {
                     match parse_bot_line(data) {
                         Some(tb) => state.trusted_bots.push(tb),
-                        None => logm!(state, L_INFO, "[CFG] Malformed or oversized b| line ignored.\n"),
+                        None => logm!(
+                            state,
+                            L_INFO,
+                            "[CFG] Malformed or oversized b| line ignored.\n"
+                        ),
                     }
                 }
             }
@@ -395,13 +457,20 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
         }
     }
 
-    let needs_migration = state.user_records.iter().any(|u| u.uuid.starts_with("MIGRATE"))
+    let needs_migration = state
+        .user_records
+        .iter()
+        .any(|u| u.uuid.starts_with("MIGRATE"))
         || state.mask_records.iter().any(|m| m.uuid == "MIGRATE");
     if needs_migration {
         migrate_legacy_records(state);
     }
     if migrated_from_legacy {
-        logm!(state, L_INFO, "[CFG] Config re-encrypted with PBKDF2 (legacy migration).\n");
+        logm!(
+            state,
+            L_INFO,
+            "[CFG] Config re-encrypted with PBKDF2 (legacy migration).\n"
+        );
     }
 
     // Identity key: a standalone config from before bots had keys gets one
@@ -417,8 +486,10 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
             None => logm!(state, L_INFO, "[CFG] Could not generate an identity key.\n"),
         }
     }
-    if state.bot_uuid.is_empty() && state.hubs.is_empty()
-        && let Some(u) = crypto::gen_uuid_v4() {
+    if state.bot_uuid.is_empty()
+        && state.hubs.is_empty()
+        && let Some(u) = crypto::gen_uuid_v4()
+    {
         state.bot_uuid = u;
         identity_minted = true;
     }
@@ -429,9 +500,9 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
             "[CFG] No usable identity key (k|): admin commands and bot-to-bot messages cannot be decrypted. Re-run -setup.\n"
         );
     } else if identity_minted {
-let fp = crypto::key_fingerprint(&state.self_pub);
-eprintln!(
-    "[CFG] Generated this bot's identity key. Public key: {} (fp {})",
+        let fp = crypto::key_fingerprint(&state.self_pub);
+        eprintln!(
+            "[CFG] Generated this bot's identity key. Public key: {} (fp {})",
             crypto::b64_encode(&state.self_pub),
             fp
         );
@@ -451,19 +522,37 @@ eprintln!(
         }
     }
     if legacy_user_lines > 0 {
-        logm!(state, L_INFO, "[CFG] Migrated {} password-era user record(s); passwords dropped.\n", legacy_user_lines);
+        logm!(
+            state,
+            L_INFO,
+            "[CFG] Migrated {} password-era user record(s); passwords dropped.\n",
+            legacy_user_lines
+        );
     }
     if dropped_botpass {
-        logm!(state, L_INFO, "[CFG] Dropped the retired bot password (p|); bots use public keys now.\n");
+        logm!(
+            state,
+            L_INFO,
+            "[CFG] Dropped the retired bot password (p|); bots use public keys now.\n"
+        );
     }
 
     // Rewrite once if anything above changed the on-disk shape.
-    if needs_migration || migrated_from_legacy || legacy_user_lines > 0 || dropped_botpass || identity_minted {
+    if needs_migration
+        || migrated_from_legacy
+        || legacy_user_lines > 0
+        || dropped_botpass
+        || identity_minted
+    {
         write(state, password);
     }
 
     if state.target_nick.is_empty() || state.server_list.is_empty() || state.user.is_empty() {
-        logm!(state, L_INFO, "[CFG] Config file is missing required fields (Nick, Server, or Ident).\n");
+        logm!(
+            state,
+            L_INFO,
+            "[CFG] Config file is missing required fields (Nick, Server, or Ident).\n"
+        );
         return false;
     }
     true
@@ -475,7 +564,11 @@ fn load_mask_line(state: &mut BotState, data: &str) {
     if state.mask_records.len() >= MAX_USER_MASKS {
         return;
     }
-    let first = data.find('|').map(|p| &data[..p]).filter(|f| f.len() < 40).unwrap_or("");
+    let first = data
+        .find('|')
+        .map(|p| &data[..p])
+        .filter(|f| f.len() < 40)
+        .unwrap_or("");
     if has_uuid_dashes(first) {
         let f: Vec<&str> = data.splitn(5, '|').collect();
         if f.len() == 5 {
@@ -489,12 +582,20 @@ fn load_mask_line(state: &mut BotState, data: &str) {
         }
     } else {
         let mut sc = Scan::new(data);
-        let Some(mask) = sc.set_not(255, b"|") else { return };
+        let Some(mask) = sc.set_not(255, b"|") else {
+            return;
+        };
         if !sc.lit(b'|') {
             return;
         }
-        let Some(op) = sc.set_not(15, b"|") else { return };
-        let ts = if sc.lit(b'|') { sc.int().unwrap_or(0) } else { 0 };
+        let Some(op) = sc.set_not(15, b"|") else {
+            return;
+        };
+        let ts = if sc.lit(b'|') {
+            sc.int().unwrap_or(0)
+        } else {
+            0
+        };
         state.mask_records.push(MaskRecord {
             uuid: "MIGRATE".into(),
             mask: mask.to_string(),
@@ -542,7 +643,11 @@ fn migrate_legacy_records(state: &mut BotState) {
     let mut new_users: Vec<UserRecord> = Vec::new();
     let mut new_masks: Vec<MaskRecord> = Vec::new();
 
-    if let Some(u) = state.user_records.iter().find(|u| u.uuid == "MIGRATE" && u.typ == 'a') {
+    if let Some(u) = state
+        .user_records
+        .iter()
+        .find(|u| u.uuid == "MIGRATE" && u.typ == 'a')
+    {
         new_users.push(UserRecord {
             uuid: admin_uuid.clone(),
             name: "admin".into(),
@@ -600,7 +705,11 @@ fn migrate_legacy_records(state: &mut BotState) {
             });
         }
     }
-    for u in state.user_records.iter().filter(|u| !u.uuid.starts_with("MIGRATE")) {
+    for u in state
+        .user_records
+        .iter()
+        .filter(|u| !u.uuid.starts_with("MIGRATE"))
+    {
         if new_users.len() >= MAX_USER_RECORDS {
             break;
         }
@@ -626,7 +735,13 @@ fn serialize(state: &BotState) -> Option<Zeroizing<String>> {
         push(&format!("s|{s}\n"));
     }
     for c in &state.chans {
-        push(&format!("c|{}|{}|{}|{}\n", c.name, c.key, if c.is_managed { "add" } else { "del" }, c.timestamp));
+        push(&format!(
+            "c|{}|{}|{}|{}\n",
+            c.name,
+            c.key,
+            if c.is_managed { "add" } else { "del" },
+            c.timestamp
+        ));
     }
     for u in &state.user_records {
         let l = format_user_line(u);
@@ -701,13 +816,21 @@ fn write_file(state: &BotState, password: &str) {
         return;
     }
     let key = crypto::derive_config_key(password.as_bytes(), &salt);
-    let Some((ct, tag)) = crypto::gcm_encrypt_detached(key.as_ref(), &iv, &[], plaintext.as_bytes()) else {
+    let Some((ct, tag)) =
+        crypto::gcm_encrypt_detached(key.as_ref(), &iv, &[], plaintext.as_bytes())
+    else {
         return;
     };
     drop(plaintext);
 
     let temp_file = format!("{CONFIG_FILE}.tmp");
-    let mut f = match OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&temp_file) {
+    let mut f = match OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temp_file)
+    {
         Ok(f) => f,
         Err(e) => {
             eprintln!("[CFG] Failed to open {temp_file} for writing: {e}");
@@ -782,13 +905,22 @@ mod tests {
         let (_, p) = crypto::generate_combined_keypair().unwrap();
         let tb = parse_bot_line(&format!("n!u@h|uuid|{}|7", crypto::b64_encode(&p))).unwrap();
         assert!(tb.has_pub && tb.ts == 7);
-        assert_eq!(format_bot_line(&tb), format!("b|n!u@h|uuid|{}|7\n", crypto::b64_encode(&p)));
+        assert_eq!(
+            format_bot_line(&tb),
+            format!("b|n!u@h|uuid|{}|7\n", crypto::b64_encode(&p))
+        );
     }
 
     #[test]
     fn chan_and_opt_lines() {
-        assert_eq!(parse_cfg_chan("#a|k|add|5"), Some(("#a".into(), "k".into(), "add".into(), 5)));
-        assert_eq!(parse_cfg_chan("#a||del|7"), Some(("#a".into(), String::new(), "del".into(), 7)));
+        assert_eq!(
+            parse_cfg_chan("#a|k|add|5"),
+            Some(("#a".into(), "k".into(), "add".into(), 5))
+        );
+        assert_eq!(
+            parse_cfg_chan("#a||del|7"),
+            Some(("#a".into(), String::new(), "del".into(), 7))
+        );
         assert_eq!(parse_opt_line("|12"), Some((String::new(), 12)));
         assert_eq!(parse_opt_line("h-x|3"), Some(("hx".into(), 3)));
     }

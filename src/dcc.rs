@@ -17,7 +17,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use zeroize::Zeroize;
 
 use crate::consts::*;
-use crate::cstr::{eq_ic, now, trunc_string, Tok};
+use crate::cstr::{Tok, eq_ic, now, trunc_string};
 use crate::net;
 use crate::state::BotState;
 use crate::{commands, crypto, ircf, logm};
@@ -92,7 +92,8 @@ fn queue(s: &mut DccSession, text: &[u8]) {
 
 fn flush(s: &mut DccSession) {
     if let Some(sock) = s.sock.as_mut()
-        && net::flush(sock, &mut s.outbuf).is_err() {
+        && net::flush(sock, &mut s.outbuf).is_err()
+    {
         s.failed = true;
     }
 }
@@ -117,8 +118,19 @@ fn close(state: &mut BotState, i: usize, reason: Option<&str>) {
 
 /// The one reply channel a chat that never opened has: PRIVMSG on IRC.
 fn give_up(state: &mut BotState, i: usize, why: &str) {
-    let (name, uh, nick) = (state.dcc[i].name.clone(), state.dcc[i].user_host.clone(), state.dcc[i].nick.clone());
-    logm!(state, L_INFO, "[DCC] Chat for {} ({}) abandoned: {}\n", name, uh, why);
+    let (name, uh, nick) = (
+        state.dcc[i].name.clone(),
+        state.dcc[i].user_host.clone(),
+        state.dcc[i].nick.clone(),
+    );
+    logm!(
+        state,
+        L_INFO,
+        "[DCC] Chat for {} ({}) abandoned: {}\n",
+        name,
+        uh,
+        why
+    );
     ircf!(state, "PRIVMSG {} :DCC chat not opened: {}\r\n", nick, why);
     free(state, i);
 }
@@ -136,12 +148,21 @@ pub fn close_all(state: &mut BotState, reason: &str) {
 /// `dcc` from an admin (user record `who`): make a passive offer.
 pub fn offer(state: &mut BotState, nick: &str, user_host: &str, who: usize) {
     if nick.len() >= A2_NICK_MAX || user_host.len() >= MAX_MASK_LEN {
-        ircf!(state, "PRIVMSG {} :Error: your nick or mask is too long for a DCC chat.\r\n", nick);
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: your nick or mask is too long for a DCC chat.\r\n",
+            nick
+        );
         return;
     }
     // Our address, only because clients reject a zero one: the receiver of
     // a passive offer never connects to it.
-    let ip = match state.irc.as_ref().and_then(|c| c.sock.local_addr().ok()).map(|a| a.ip()) {
+    let ip = match state
+        .irc
+        .as_ref()
+        .and_then(|c| c.sock.local_addr().ok())
+        .map(|a| a.ip())
+    {
         Some(IpAddr::V4(v4)) => u32::from(v4).to_string(),
         Some(IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
             Some(v4) => u32::from(v4).to_string(),
@@ -150,7 +171,11 @@ pub fn offer(state: &mut BotState, nick: &str, user_host: &str, who: usize) {
         None => String::new(),
     };
     if ip.is_empty() {
-        ircf!(state, "PRIVMSG {} :Error: cannot offer a DCC chat right now (no IRC connection).\r\n", nick);
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: cannot offer a DCC chat right now (no IRC connection).\r\n",
+            nick
+        );
         return;
     }
     let mut rnd = [0u8; 4];
@@ -163,7 +188,10 @@ pub fn offer(state: &mut BotState, nick: &str, user_host: &str, who: usize) {
     if token == 0 {
         token = 1;
     }
-    let (who_uuid, who_name) = (state.user_records[who].uuid.clone(), state.user_records[who].name.clone());
+    let (who_uuid, who_name) = (
+        state.user_records[who].uuid.clone(),
+        state.user_records[who].name.clone(),
+    );
 
     // One chat per user: a new request replaces any earlier one.
     for i in 0..state.dcc.len() {
@@ -196,7 +224,13 @@ pub fn offer(state: &mut BotState, nick: &str, user_host: &str, who: usize) {
     s.uuid = who_uuid;
     s.name = who_name.clone();
 
-    ircf!(state, "PRIVMSG {} :\x01DCC CHAT chat {} 0 {}\x01\r\n", nick, ip, token);
+    ircf!(
+        state,
+        "PRIVMSG {} :\x01DCC CHAT chat {} 0 {}\x01\r\n",
+        nick,
+        ip,
+        token
+    );
     ircf!(
         state,
         "PRIVMSG {} :DCC chat offered; accept it within {} s (irssi: /dcc chat {}). I connect out to your client, so open its DCC port range in your firewall and set its DCC address to your public IP. A client without passive DCC can /dcc chat {} instead while this offer is open.\r\n",
@@ -205,7 +239,13 @@ pub fn offer(state: &mut BotState, nick: &str, user_host: &str, who: usize) {
         botnick,
         botnick
     );
-    logm!(state, L_INFO, "[DCC] Offered a chat to {} ({})\n", who_name, user_host);
+    logm!(
+        state,
+        L_INFO,
+        "[DCC] Offered a chat to {} ({})\n",
+        who_name,
+        user_host
+    );
 }
 
 /// The address field of an offer: classic decimal IPv4, or a literal IPv6
@@ -221,11 +261,11 @@ fn parse_addr(a: &str, port: u16) -> Option<SocketAddr> {
         let v: u64 = a.parse().ok()?;
         IpAddr::V4(Ipv4Addr::from(u32::try_from(v).ok()?))
     } else if a.contains(':') {
-    let v6: Ipv6Addr = a.parse().ok()?;
-    match v6.to_ipv4_mapped() {
-        Some(v4) => IpAddr::V4(v4),
-        None => IpAddr::V6(v6),
-    }
+        let v6: Ipv6Addr = a.parse().ok()?;
+        match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        }
     } else {
         IpAddr::V4(a.parse::<Ipv4Addr>().ok()?)
     };
@@ -242,7 +282,10 @@ fn addr_allowed(sa: &SocketAddr) -> bool {
         }
         IpAddr::V6(v6) => {
             let seg = v6.segments();
-            !(v6.is_unspecified() || (seg[0] & 0xffc0) == 0xfe80 || v6.is_multicast() || v6.to_ipv4_mapped().is_some())
+            !(v6.is_unspecified()
+                || (seg[0] & 0xffc0) == 0xfe80
+                || v6.is_multicast()
+                || v6.to_ipv4_mapped().is_some())
         }
     }
 }
@@ -260,7 +303,13 @@ fn start_connect(state: &mut BotState, sa: &SocketAddr) -> io::Result<mio::net::
     let sock = match net::new_socket(sa, bind) {
         Ok(s) => s,
         Err(e) if bind.is_some() => {
-            logm!(state, L_INFO, "[DCC] Could not bind VHOST {}: {}\n", state.vhost, e);
+            logm!(
+                state,
+                L_INFO,
+                "[DCC] Could not bind VHOST {}: {}\n",
+                state.vhost,
+                e
+            );
             net::new_socket(sa, None)?
         }
         Err(e) => return Err(e),
@@ -268,10 +317,14 @@ fn start_connect(state: &mut BotState, sa: &SocketAddr) -> io::Result<mio::net::
     sock.set_nonblocking(true)?;
     match sock.connect(&(*sa).into()) {
         Ok(()) => {}
-        Err(e) if e.raw_os_error() == Some(nix::libc::EINPROGRESS) || e.kind() == io::ErrorKind::WouldBlock => {}
+        Err(e)
+            if e.raw_os_error() == Some(nix::libc::EINPROGRESS)
+                || e.kind() == io::ErrorKind::WouldBlock => {}
         Err(e) => return Err(e),
     }
-    Ok(mio::net::TcpStream::from_std(std::net::TcpStream::from(sock)))
+    Ok(mio::net::TcpStream::from_std(std::net::TcpStream::from(
+        sock,
+    )))
 }
 
 /// "DCC ..." CTCP to us: completes this bot's own pending offer when it is
@@ -290,22 +343,43 @@ pub fn handle_ctcp(state: &mut BotState, user_host: &str, ctcp: &str) {
             f.push(x);
         }
     }
-    shape_ok = shape_ok && f.len() >= 5 && eq_ic(f[0], "DCC") && eq_ic(f[1], "CHAT") && eq_ic(f[2], "chat");
+    shape_ok = shape_ok
+        && f.len() >= 5
+        && eq_ic(f[0], "DCC")
+        && eq_ic(f[1], "CHAT")
+        && eq_ic(f[2], "chat");
     let si = state
         .dcc
         .iter()
         .position(|s| s.phase == DccPhase::Offered && eq_ic(&s.user_host, user_host));
     let Some(i) = si.filter(|_| shape_ok) else {
-        logm!(state, L_CTCP, "[DCC] Ignored DCC request from {}: the bot only connects out, after its own offer\n", user_host);
+        logm!(
+            state,
+            L_CTCP,
+            "[DCC] Ignored DCC request from {}: the bot only connects out, after its own offer\n",
+            user_host
+        );
         return;
     };
-    if f.len() == 6 && (!all_digits(f[5], 10) || f[5].parse::<u64>().ok() != Some(u64::from(state.dcc[i].dcc_token))) {
-        logm!(state, L_CTCP, "[DCC] Reply from {} carries another offer's token; ignored\n", user_host);
+    if f.len() == 6
+        && (!all_digits(f[5], 10)
+            || f[5].parse::<u64>().ok() != Some(u64::from(state.dcc[i].dcc_token)))
+    {
+        logm!(
+            state,
+            L_CTCP,
+            "[DCC] Reply from {} carries another offer's token; ignored\n",
+            user_host
+        );
         return;
     }
     // From here the reply belongs to this offer: a bad value ends it.
     let port_digits = all_digits(f[4], 5);
-    let port: u64 = if port_digits { f[4].parse().unwrap_or(0) } else { 0 };
+    let port: u64 = if port_digits {
+        f[4].parse().unwrap_or(0)
+    } else {
+        0
+    };
     if port_digits && port == 0 {
         give_up(
             state,
@@ -324,7 +398,11 @@ pub fn handle_ctcp(state: &mut BotState, user_host: &str, ctcp: &str) {
         return;
     }
     let Some(sa) = parse_addr(f[3], port as u16).filter(addr_allowed) else {
-        give_up(state, i, "your client sent an address I will not connect to; set its DCC address to your public IP.");
+        give_up(
+            state,
+            i,
+            "your client sent an address I will not connect to; set its DCC address to your public IP.",
+        );
         return;
     };
     state.dcc[i].peer = format!("{} port {}", sa.ip(), port);
@@ -342,7 +420,14 @@ pub fn handle_ctcp(state: &mut BotState, user_host: &str, ctcp: &str) {
             s.phase = DccPhase::Connecting;
             s.phase_since = now();
             let (peer, name) = (s.peer.clone(), s.name.clone());
-            logm!(state, L_INFO, "[DCC] Connecting to {} for {} ({})\n", peer, name, user_host);
+            logm!(
+                state,
+                L_INFO,
+                "[DCC] Connecting to {} for {} ({})\n",
+                peer,
+                name,
+                user_host
+            );
         }
         Err(e) => {
             let why = format!("connecting to {} failed: {}.", state.dcc[i].peer, e);
@@ -353,7 +438,9 @@ pub fn handle_ctcp(state: &mut BotState, user_host: &str, ctcp: &str) {
 
 /// A connecting socket turned writable: open, or report why not.
 fn on_connect(state: &mut BotState, i: usize) {
-    let Some(sock) = state.dcc[i].sock.as_ref() else { return };
+    let Some(sock) = state.dcc[i].sock.as_ref() else {
+        return;
+    };
     let err = match sock.take_error() {
         Ok(Some(e)) => Some(e),
         Err(e) => Some(e),
@@ -384,7 +471,14 @@ fn on_connect(state: &mut BotState, i: usize) {
         DCC_IDLE_TIMEOUT / 60
     );
     let (name, uh, peer) = (s.name.clone(), s.user_host.clone(), s.peer.clone());
-    logm!(state, L_INFO, "[DCC] Chat open with {} ({}) at {}\n", name, uh, peer);
+    logm!(
+        state,
+        L_INFO,
+        "[DCC] Chat open with {} ({}) at {}\n",
+        name,
+        uh,
+        peer
+    );
     queue(&mut state.dcc[i], line.as_bytes());
 }
 
@@ -430,7 +524,11 @@ fn read(state: &mut BotState, i: usize, token: mio::Token) {
                 let ok = commands::handle_dcc_line(state, i, &text);
                 if !ok {
                     if state.dcc[i].token == Some(token) {
-                        close(state, i, Some("That was not a valid sealed command from your key; closing."));
+                        close(
+                            state,
+                            i,
+                            Some("That was not a valid sealed command from your key; closing."),
+                        );
                     }
                     return;
                 }
@@ -443,7 +541,15 @@ fn read(state: &mut BotState, i: usize, token: mio::Token) {
             // LF) or an over-long line is not one.
             let bad = (c < 0x20 && c != b'\r') || c == 0x7f || s.inbuf.last() == Some(&b'\r');
             if bad || s.inbuf.len() > A2_LINE_MAX {
-                close(state, i, Some(if bad { "Unexpected control byte; closing." } else { "Line too long; closing." }));
+                close(
+                    state,
+                    i,
+                    Some(if bad {
+                        "Unexpected control byte; closing."
+                    } else {
+                        "Line too long; closing."
+                    }),
+                );
                 return;
             }
             s.inbuf.push(c);
@@ -452,7 +558,13 @@ fn read(state: &mut BotState, i: usize, token: mio::Token) {
 }
 
 /// A poll event for DCC slot `i`.
-pub fn handle_event(state: &mut BotState, i: usize, token: mio::Token, readable: bool, writable: bool) {
+pub fn handle_event(
+    state: &mut BotState,
+    i: usize,
+    token: mio::Token,
+    readable: bool,
+    writable: bool,
+) {
     let Some(s) = state.dcc.get(i) else { return };
     if s.token != Some(token) || s.sock.is_none() {
         return;
@@ -474,7 +586,10 @@ pub fn handle_event(state: &mut BotState, i: usize, token: mio::Token, readable:
             if !state.dcc[i].failed && readable {
                 read(state, i, token);
             }
-            if state.dcc[i].token == Some(token) && state.dcc[i].phase == DccPhase::Open && state.dcc[i].failed {
+            if state.dcc[i].token == Some(token)
+                && state.dcc[i].phase == DccPhase::Open
+                && state.dcc[i].failed
+            {
                 close(state, i, None);
             }
         }
@@ -489,9 +604,12 @@ pub fn check_timeouts(state: &mut BotState) {
         if s.phase == DccPhase::Open && s.failed {
             close(state, i, None);
         } else if s.phase == DccPhase::Offered && now - s.phase_since > DCC_OFFER_TIMEOUT {
-        give_up(state, i, "your client did not answer the offer in time.");
-    } else if s.phase == DccPhase::Connecting && now - s.phase_since > DCC_CONNECT_TIMEOUT {
-    let why = format!("connecting to {} timed out. Check that your firewall lets that port in.", s.peer);
+            give_up(state, i, "your client did not answer the offer in time.");
+        } else if s.phase == DccPhase::Connecting && now - s.phase_since > DCC_CONNECT_TIMEOUT {
+            let why = format!(
+                "connecting to {} timed out. Check that your firewall lets that port in.",
+                s.peer
+            );
             give_up(state, i, &why);
         } else if s.phase == DccPhase::Open && now - s.last_active > DCC_IDLE_TIMEOUT {
             close(state, i, Some("Idle limit reached; closing."));
@@ -503,7 +621,9 @@ pub fn check_timeouts(state: &mut BotState) {
 /// <that nick> :<text>") go down the chat.  Lines to anyone else still go
 /// to IRC.
 pub fn divert_reply(state: &mut BotState, line: &str) -> bool {
-    let Some(i) = state.dcc_reply else { return false };
+    let Some(i) = state.dcc_reply else {
+        return false;
+    };
     let nick = state.dcc[i].nick.clone();
     let lb = line.as_bytes();
     let head = 8 + nick.len() + 2;
@@ -516,7 +636,13 @@ pub fn divert_reply(state: &mut BotState, line: &str) -> bool {
     }
     let text = &lb[head..lb.len() - 2];
     let uh = state.dcc[i].user_host.clone();
-    logm!(state, L_RAW, "[DCC_SEND] ({}) {}\n", uh, String::from_utf8_lossy(text));
+    logm!(
+        state,
+        L_RAW,
+        "[DCC_SEND] ({}) {}\n",
+        uh,
+        String::from_utf8_lossy(text)
+    );
     queue(&mut state.dcc[i], text);
     true
 }

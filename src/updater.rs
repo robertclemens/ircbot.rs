@@ -10,7 +10,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use crate::consts::*;
-use crate::cstr::{eq_ic, Tok};
+use crate::cstr::{Tok, eq_ic};
 use crate::state::BotState;
 use crate::{config, crypto, dcc, irc_client, ircf, logm};
 
@@ -39,8 +39,18 @@ pub fn strverscmp(s1: &str, s2: &str) -> std::cmp::Ordering {
             if state == Ordering::Equal {
                 state = c1.cmp(&c2);
             }
-            c1 = if at(a, p1).is_ascii_digit() { p1 += 1; at(a, p1 - 1) } else { 0 };
-            c2 = if at(b, p2).is_ascii_digit() { p2 += 1; at(b, p2 - 1) } else { 0 };
+            c1 = if at(a, p1).is_ascii_digit() {
+                p1 += 1;
+                at(a, p1 - 1)
+            } else {
+                0
+            };
+            c2 = if at(b, p2).is_ascii_digit() {
+                p2 += 1;
+                at(b, p2 - 1)
+            } else {
+                0
+            };
             if c1 == 0 && c2 == 0 {
                 break;
             }
@@ -57,17 +67,32 @@ pub fn strverscmp(s1: &str, s2: &str) -> std::cmp::Ordering {
 }
 
 fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder().user_agent("ircbot-updater/1.0").build().into()
+    ureq::Agent::config_builder()
+        .user_agent("ircbot-updater/1.0")
+        .build()
+        .into()
 }
 
 fn fetch(url: &str, limit: u64) -> Option<Vec<u8>> {
     let mut resp = agent().get(url).call().ok()?;
-    resp.body_mut().with_config().limit(limit).read_to_vec().ok()
+    resp.body_mut()
+        .with_config()
+        .limit(limit)
+        .read_to_vec()
+        .ok()
 }
 
 fn download(url: &str, path: &str) -> bool {
-    let Ok(mut resp) = agent().get(url).call() else { return false };
-    let Ok(mut f) = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path) else {
+    let Ok(mut resp) = agent().get(url).call() else {
+        return false;
+    };
+    let Ok(mut f) = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+    else {
         return false;
     };
     let mut reader = resp.body_mut().with_config().limit(MAX_ARCHIVE).reader();
@@ -85,7 +110,8 @@ fn fetch_verified_manifest() -> Result<String, &'static str> {
     let mut pk = [0u8; 32];
     pk.copy_from_slice(&pub_key);
     let man = fetch(BOT_UPDATE_URL, MAX_MANIFEST).ok_or("failed to download release manifest")?;
-    let sig = fetch(BOT_UPDATE_SIG_URL, MAX_MANIFEST).ok_or("failed to download release signature (releases.txt.sig)")?;
+    let sig = fetch(BOT_UPDATE_SIG_URL, MAX_MANIFEST)
+        .ok_or("failed to download release signature (releases.txt.sig)")?;
     let sig_text = String::from_utf8_lossy(&sig);
     let sig_bytes = crypto::b64_decode(sig_text.trim_end());
     let ok = sig_bytes.is_some_and(|s| s.len() == 64 && crypto::ed25519_verify(&pk, &man, &s));
@@ -98,13 +124,23 @@ fn fetch_verified_manifest() -> Result<String, &'static str> {
 /// One manifest line: version date url sha256 deps.
 fn parse_release(line: &str) -> Option<[&str; 5]> {
     let mut t = Tok::new(line);
-    let f = [t.next(" \t")?, t.next(" \t")?, t.next(" \t")?, t.next(" \t")?, t.next(" \t")?];
+    let f = [
+        t.next(" \t")?,
+        t.next(" \t")?,
+        t.next(" \t")?,
+        t.next(" \t")?,
+        t.next(" \t")?,
+    ];
     let caps = [63, 63, 511, 127, 255];
     f.iter().zip(caps).all(|(s, c)| s.len() <= c).then_some(f)
 }
 
 fn valid_dependency_name(dep: &str) -> bool {
-    !dep.is_empty() && dep.len() <= 64 && dep.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.+".contains(&c))
+    !dep.is_empty()
+        && dep.len() <= 64
+        && dep
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"-_.+".contains(&c))
 }
 
 /// A build tool on PATH, or a library pkg-config (or the compiler) knows.
@@ -115,7 +151,9 @@ fn check_dependency(dep: &str) -> bool {
     let script = if ["gcc", "make", "tar", "bash", "cargo", "rustc"].contains(&dep) {
         format!("command -v {dep} >/dev/null 2>&1")
     } else {
-        format!("pkg-config --exists {dep} >/dev/null 2>&1 || echo '#include <{dep}.h>' | gcc -E - >/dev/null 2>&1")
+        format!(
+            "pkg-config --exists {dep} >/dev/null 2>&1 || echo '#include <{dep}.h>' | gcc -E - >/dev/null 2>&1"
+        )
     };
     Command::new("sh")
         .arg("-c")
@@ -129,7 +167,11 @@ fn check_dependency(dep: &str) -> bool {
 
 /// `update`: list the signed releases newer than this build.
 pub fn check_for_updates(state: &mut BotState, nick: &str) {
-    logm!(state, L_DEBUG, "[DEBUG] updater_check_for_updates called.\n");
+    logm!(
+        state,
+        L_DEBUG,
+        "[DEBUG] updater_check_for_updates called.\n"
+    );
     let manifest = match fetch_verified_manifest() {
         Ok(m) => m,
         Err(e) => {
@@ -137,22 +179,50 @@ pub fn check_for_updates(state: &mut BotState, nick: &str) {
             return;
         }
     };
-    ircf!(state, "PRIVMSG {} :--- Available Updates (Current: {}) ---\r\n", nick, BOT_VERSION);
+    ircf!(
+        state,
+        "PRIVMSG {} :--- Available Updates (Current: {}) ---\r\n",
+        nick,
+        BOT_VERSION
+    );
     let mut found = 0;
-    for line in manifest.split('\n').filter(|l| !l.is_empty() && !l.starts_with('#')) {
-        let Some([version, date, _url, _hash, deps]) = parse_release(line) else { continue };
+    for line in manifest
+        .split('\n')
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        let Some([version, date, _url, _hash, deps]) = parse_release(line) else {
+            continue;
+        };
         if strverscmp(version, BOT_VERSION) != std::cmp::Ordering::Greater {
             continue;
         }
         found += 1;
-        let failed: Vec<&str> = deps.split(',').filter(|d| !d.is_empty() && !check_dependency(d)).collect();
-        let status = if failed.is_empty() { "[OK]".to_string() } else { format!("[FAILED: {}]", failed.join(", ")) };
-        ircf!(state, "PRIVMSG {} :{} ({}) - Dependencies: {}\r\n", nick, version, date, status);
+        let failed: Vec<&str> = deps
+            .split(',')
+            .filter(|d| !d.is_empty() && !check_dependency(d))
+            .collect();
+        let status = if failed.is_empty() {
+            "[OK]".to_string()
+        } else {
+            format!("[FAILED: {}]", failed.join(", "))
+        };
+        ircf!(
+            state,
+            "PRIVMSG {} :{} ({}) - Dependencies: {}\r\n",
+            nick,
+            version,
+            date,
+            status
+        );
     }
     if found == 0 {
         ircf!(state, "PRIVMSG {} :Bot is up-to-date.\r\n", nick);
     } else {
-        ircf!(state, "PRIVMSG {} :To upgrade, type: update <version>. IE: update v2.0.0\r\n", nick);
+        ircf!(
+            state,
+            "PRIVMSG {} :To upgrade, type: update <version>. IE: update v2.0.0\r\n",
+            nick
+        );
     }
 }
 
@@ -234,7 +304,12 @@ exec {exe}
 
 /// `update <version>`: download, verify, build and exec the new release.
 pub fn perform_upgrade(state: &mut BotState, nick: &str, version: &str) {
-    logm!(state, L_DEBUG, "[DEBUG] updater_perform_upgrade called for {}.\n", version);
+    logm!(
+        state,
+        L_DEBUG,
+        "[DEBUG] updater_perform_upgrade called for {}.\n",
+        version
+    );
     // Downgrade protection: a replayed old manifest cannot roll us back.
     if strverscmp(version, BOT_VERSION) == std::cmp::Ordering::Less {
         ircf!(
@@ -255,10 +330,16 @@ pub fn perform_upgrade(state: &mut BotState, nick: &str, version: &str) {
     };
     let mut release = None;
     for line in manifest.split('\n').filter(|l| !l.is_empty()) {
-        let Some(f) = parse_release(line) else { continue };
+        let Some(f) = parse_release(line) else {
+            continue;
+        };
         if eq_ic(f[0], version) {
             if !validate_url(f[2]) {
-                ircf!(state, "PRIVMSG {} :Error: Invalid or untrusted URL in release file.\r\n", nick);
+                ircf!(
+                    state,
+                    "PRIVMSG {} :Error: Invalid or untrusted URL in release file.\r\n",
+                    nick
+                );
                 return;
             }
             release = Some((f[2].to_string(), f[3].to_string(), f[4].to_string()));
@@ -266,27 +347,56 @@ pub fn perform_upgrade(state: &mut BotState, nick: &str, version: &str) {
         }
     }
     let Some((url, hash, deps)) = release else {
-        ircf!(state, "PRIVMSG {} :Error: Version '{}' not found in release file.\r\n", nick, version);
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: Version '{}' not found in release file.\r\n",
+            nick,
+            version
+        );
         return;
     };
-    let failed: Vec<&str> = deps.split(',').filter(|d| !d.is_empty() && !check_dependency(d)).collect();
+    let failed: Vec<&str> = deps
+        .split(',')
+        .filter(|d| !d.is_empty() && !check_dependency(d))
+        .collect();
     if !failed.is_empty() {
-        ircf!(state, "PRIVMSG {} :Error: Cannot upgrade. Missing dependencies: {}\r\n", nick, failed.join(", "));
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: Cannot upgrade. Missing dependencies: {}\r\n",
+            nick,
+            failed.join(", ")
+        );
         return;
     }
-    let url_name = url.rsplit('/').next().filter(|s| !s.is_empty() && url.contains('/')).unwrap_or("ircbot.tar.gz");
+    let url_name = url
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty() && url.contains('/'))
+        .unwrap_or("ircbot.tar.gz");
     let Some(archive) = sanitize_filename(url_name) else {
-        ircf!(state, "PRIVMSG {} :Error: Invalid filename in URL.\r\n", nick);
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: Invalid filename in URL.\r\n",
+            nick
+        );
         return;
     };
     ircf!(state, "PRIVMSG {} :Downloading {}...\r\n", nick, archive);
     if !download(&url, &archive) {
-        ircf!(state, "PRIVMSG {} :Error: Failed to download new version.\r\n", nick);
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: Failed to download new version.\r\n",
+            nick
+        );
         return;
     }
     ircf!(state, "PRIVMSG {} :Verifying hash...\r\n", nick);
     if !crypto::sha256_file_hex(&archive).is_some_and(|h| h.eq_ignore_ascii_case(&hash)) {
-        ircf!(state, "PRIVMSG {} :Error: SHA256 hash mismatch! Aborting upgrade.\r\n", nick);
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: SHA256 hash mismatch! Aborting upgrade.\r\n",
+            nick
+        );
         let _ = std::fs::remove_file(&archive);
         return;
     }
@@ -294,7 +404,11 @@ pub fn perform_upgrade(state: &mut BotState, nick: &str, version: &str) {
     let exe = state.executable_path.clone();
     let backup = format!("{exe}.backup");
     let _ = std::fs::rename(&exe, &backup);
-    ircf!(state, "PRIVMSG {} :Hash verified. Creating upgrade script...\r\n", nick);
+    ircf!(
+        state,
+        "PRIVMSG {} :Hash verified. Creating upgrade script...\r\n",
+        nick
+    );
 
     // Created 0700 in one step: no writable window on a script we exec.
     let script = upgrade_script(std::process::id(), &archive, &backup, &exe);
@@ -309,7 +423,11 @@ pub fn perform_upgrade(state: &mut BotState, nick: &str, version: &str) {
             f.set_permissions(std::fs::Permissions::from_mode(0o700))
         });
     if written.is_err() {
-        ircf!(state, "PRIVMSG {} :Error: Could not create upgrade.sh script.\r\n", nick);
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: Could not create upgrade.sh script.\r\n",
+            nick
+        );
         let _ = std::fs::remove_file(&archive);
         let _ = std::fs::rename(&backup, &exe);
         return;
@@ -339,7 +457,10 @@ mod tests {
 
     #[test]
     fn names_and_urls() {
-        assert_eq!(sanitize_filename("v2.3.0.tar.gz").as_deref(), Some("v2.3.0.tar.gz"));
+        assert_eq!(
+            sanitize_filename("v2.3.0.tar.gz").as_deref(),
+            Some("v2.3.0.tar.gz")
+        );
         assert!(sanitize_filename("evil.sh").is_none());
         assert!(validate_url("https://github.com/x/y/archive/v1.tar.gz"));
         assert!(!validate_url("https://github.com/x;rm"));

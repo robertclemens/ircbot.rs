@@ -40,9 +40,15 @@ fn local_time_str() -> String {
 impl Logger {
     pub fn new(level: u32) -> Self {
         let rings = (0..NUM_LOG_LEVELS)
-            .map(|_| LogRing { entries: vec![String::new(); LOG_BUFFER_LINES], idx: 0 })
+            .map(|_| LogRing {
+                entries: vec![String::new(); LOG_BUFFER_LINES],
+                idx: 0,
+            })
             .collect();
-        Logger { level, rings: RefCell::new(rings) }
+        Logger {
+            level,
+            rings: RefCell::new(rings),
+        }
     }
 
     /// Record one line.  Callers' trailing newlines are dropped, and any
@@ -54,13 +60,20 @@ impl Logger {
         let base = base.trim_end_matches(['\n', '\r']);
         let clean: String = base
             .chars()
-            .map(|c| if (c as u32) < 0x20 || c as u32 == 0x7f { '?' } else { c })
+            .map(|c| {
+                if (c as u32) < 0x20 || c as u32 == 0x7f {
+                    '?'
+                } else {
+                    c
+                }
+            })
             .collect();
         let full = format!("[{time_buf}] {clean}");
         let full = trunc(&full, MAX_LOG_LINE_LEN).to_string();
 
         if let Some(i) = level_index(flag)
-            && let Ok(mut rings) = self.rings.try_borrow_mut() {
+            && let Ok(mut rings) = self.rings.try_borrow_mut()
+        {
             let r = &mut rings[i];
             let at = r.idx;
             r.entries[at] = full.clone();
@@ -74,10 +87,21 @@ impl Logger {
         // Past the size cap the file is truncated rather than left to grow.
         if let Ok(md) = std::fs::metadata(LOGFILE)
             && md.len() >= BOT_LOG_FILE_SIZE
-            && let Ok(mut f) = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(LOGFILE) {
+            && let Ok(mut f) = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(LOGFILE)
+        {
             let _ = writeln!(f, "[{time_buf}] Log file truncated (size limit reached)");
         }
-        match OpenOptions::new().append(true).create(true).mode(0o600).open(LOGFILE) {
+        match OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(LOGFILE)
+        {
             Ok(mut f) => {
                 let _ = writeln!(f, "{full}");
             }
@@ -112,7 +136,12 @@ pub fn install_panic_hook() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let what = info.to_string().replace(['\r', '\n'], " ");
-        if let Ok(mut f) = OpenOptions::new().append(true).create(true).mode(0o600).open(LOGFILE) {
+        if let Ok(mut f) = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(LOGFILE)
+        {
             let _ = writeln!(f, "[FATAL] {} - bot terminating.", trunc(&what, 400));
         }
         prev(info);
