@@ -937,6 +937,7 @@ pub fn connect(state: &mut BotState) {
                 let t = now();
                 state.status = S_CONNECTED;
                 state.last_pong_time = t;
+                state.pong_pending = false;
                 state.connection_time = t;
                 state.current_nick = state.target_nick.clone();
                 let nick = state.current_nick.clone();
