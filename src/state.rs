@@ -168,6 +168,8 @@ pub struct BotTreeRow {
     pub name: String,
     pub uuid: String,
     pub version: String,
+    /// Code base ("c" / "rs"); empty when the hub did not say.
+    pub variant: String,
     pub server: String,
     pub uptime: i64,
     pub online: bool,

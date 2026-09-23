@@ -129,6 +129,17 @@ struct BotsRow {
     server: String,
 }
 
+/// The version cell: the version with the code base after it, "2.4.0 (rs)".
+/// A node whose hub did not report a code base shows the bare version.
+fn bots_fmt_version(version: &str, variant: &str) -> String {
+    let v = if version.is_empty() { "-" } else { version };
+    if variant.is_empty() {
+        v.to_string()
+    } else {
+        format!("{v} ({variant})")
+    }
+}
+
 /// A node is the last child at its level when no later row shares its depth
 /// before a shallower one appears; 'd' rows are a flat tail.
 fn tree_is_last(state: &BotState, i: usize) -> bool {
@@ -197,11 +208,7 @@ fn bots_tree_row(state: &BotState, i: usize, last_at: &mut [bool; 10]) -> BotsRo
     let age = (now() - state.bot_tree_ts).max(0);
     BotsRow {
         name: format!("{prefix}{}", trunc(&label, TREE_NAME_MAX + 32)),
-        version: if r.version.is_empty() {
-            "-".into()
-        } else {
-            r.version.clone()
-        },
+        version: bots_fmt_version(&r.version, &r.variant),
         uptime: tree_fmt_uptime(if r.kind == 'h' && !r.online {
             0
         } else {
@@ -224,7 +231,7 @@ fn bots_self_row(state: &BotState) -> BotsRow {
         } else {
             state.current_nick.clone()
         },
-        version: BOT_VERSION.into(),
+        version: bots_fmt_version(BOT_VERSION, BOT_UPDATE_VARIANT),
         uptime: tree_fmt_uptime(now() - state.bot_start_time),
         server: if state.status & S_CONNECTED != 0 && !state.actual_server_name.is_empty() {
             trunc_string(&state.actual_server_name, TREE_SERVER_MAX + 1)
@@ -2787,7 +2794,7 @@ fn admin_help(state: &mut BotState, nick: &str, topic: Option<&str>) {
                 nick,
                 "Syntax: bots - Draw the bot tree: this bot's hub at the root, peer hubs beneath it, each hub's bots under it.",
             );
-            "  Every row shows version, uptime and IRC server (hubs show '(hub)'). Bots that are known but offline are listed last with their last-seen time. With no hub, all trusted bots list on one branch."
+            "  Every row shows version with its code base (2.4.0 (c) or 2.4.0 (rs)), uptime and IRC server (hubs show '(hub)'). Bots that are known but offline are listed last with their last-seen time. With no hub, all trusted bots list on one branch."
         }
         "admins" => "Syntax: admins - List all admins.",
         "opers" => "Syntax: opers - List all opers.",

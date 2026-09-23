@@ -12,7 +12,7 @@ pub const BOT_NAME: &str = "ircbot.rs by trojanman";
 /// made against.
 pub const BOT_VERSION: &str = match option_env!("IRCBOT_VERSION") {
     Some(v) => v,
-    None => "2.4.0",
+    None => "2.4.1",
 };
 pub const PASS_FILE: &str = ".ircbot.pass"; // machine-bound password file
 pub const PBKDF2_ITERATIONS: u32 = 100_000;
@@ -204,6 +204,8 @@ pub const UNBAN_MAX_REMOVALS: i32 = 6;
 // ---- Bot tree ('bots') ------------------------------------------------------------
 pub const MAX_BOT_TREE_ROWS: usize = 256;
 pub const TREE_VERSION_MAX: usize = 15;
+/// "c" / "rs" -- the code base a node runs (bot_tree_row_t.variant).
+pub const TREE_VARIANT_MAX: usize = 7;
 pub const TREE_SERVER_MAX: usize = 63;
 pub const TREE_NAME_MAX: usize = 64;
 pub const BOT_TREE_STALE_AFTER: i64 = 660;

@@ -247,7 +247,12 @@ pub fn send_presence(state: &mut BotState, force: bool) {
     {
         return;
     }
-    let payload = format!("{}|{}|{}", BOT_VERSION, server, state.bot_start_time);
+    // The variant rides last: a hub that predates it reads the start time
+    // with atoll(), which stops at the '|', so older hubs are unaffected.
+    let payload = format!(
+        "{}|{}|{}|{}",
+        BOT_VERSION, server, state.bot_start_time, BOT_UPDATE_VARIANT
+    );
     if send_frame(state, CMD_BOT_PRESENCE, payload.as_bytes()) {
         state.presence_server = server.clone();
         state.last_presence_sent = now;
@@ -489,7 +494,7 @@ fn process_tree(state: &mut BotState, payload: &str) {
         if b.len() < 2 || b[1] != b'|' {
             continue;
         }
-        let f: Vec<&str> = line[2..].splitn(8, '|').take(7).collect();
+        let f: Vec<&str> = line[2..].splitn(9, '|').take(8).collect();
         let n = f.len();
         let mut row = BotTreeRow {
             kind: (b[0] as char).to_ascii_lowercase(),
@@ -505,6 +510,10 @@ fn process_tree(state: &mut BotState, payload: &str) {
                 if n >= 6 && f[5] != "-" {
                     row.version = trunc_string(f[5], TREE_VERSION_MAX + 1);
                 }
+                // The code base (c / rs) came after it; blank if absent.
+                if n >= 7 && f[6] != "-" {
+                    row.variant = trunc_string(f[6], TREE_VARIANT_MAX + 1);
+                }
             }
             'b' if n >= 6 => {
                 row.depth = atoi(f[0]);
@@ -517,6 +526,9 @@ fn process_tree(state: &mut BotState, payload: &str) {
                     row.server = trunc_string(f[4], TREE_SERVER_MAX + 1);
                 }
                 row.uptime = atoll(f[5]);
+                if n >= 7 && f[6] != "-" {
+                    row.variant = trunc_string(f[6], TREE_VARIANT_MAX + 1);
+                }
                 row.online = true;
             }
             'd' if n >= 3 => {
