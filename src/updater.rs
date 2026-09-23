@@ -66,6 +66,53 @@ pub fn strverscmp(s1: &str, s2: &str) -> std::cmp::Ordering {
     c1.cmp(&c2)
 }
 
+/// Release manifests spell versions with a leading 'v' ("v2.3.0") while
+/// BOT_VERSION does not ("2.3.0"), and an admin may type either.  Compare
+/// them on the numeric part alone: strverscmp("v0.0.1", "2.3.0") would
+/// otherwise compare 'v' against '2' and report a downgrade as an upgrade,
+/// which is exactly what the downgrade guard exists to stop.
+fn strip_v(v: &str) -> &str {
+    v.strip_prefix('v')
+        .or_else(|| v.strip_prefix('V'))
+        .unwrap_or(v)
+}
+
+/// updater_version_cmp() in utils.c.
+pub fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    strverscmp(strip_v(a), strip_v(b))
+}
+
+fn version_eq(a: &str, b: &str) -> bool {
+    eq_ic(strip_v(a), strip_v(b))
+}
+
+/// ---- Host capability probe (answered in CMD_UPGRADE_READY) --------------
+/// Both answers describe the RUNNING binary, not the machine in the abstract:
+/// a bot reports what it can be replaced with.  The arch is spelled the way
+/// `uname -m` spells it, to match the manifest; the libc is decided at
+/// compile time because the binary is already linked against one.
+pub fn host_arch() -> String {
+    std::env::consts::ARCH.to_string()
+}
+
+pub fn host_libc() -> String {
+    if cfg!(target_env = "musl") {
+        "musl".to_string()
+    } else if cfg!(target_os = "linux") {
+        "gnu".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+/// The variant this binary was built from.  The C twin answers "c"; both are
+/// wire- and config-compatible, so a node may be flipped either way.  Same
+/// value the compiled release URL carries, so "keep my variant" and the URL
+/// can never disagree.
+pub fn host_variant() -> &'static str {
+    BOT_UPDATE_VARIANT
+}
+
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .user_agent("ircbot-updater/1.0")
@@ -73,7 +120,22 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
+/// A `file://` URL is read straight off disk: ureq speaks HTTP only, while
+/// the C updater gets this for free from libcurl.  Reachable only under the
+/// IRCBOT_UPDATE_BASE override (validate_url() still rejects it otherwise),
+/// and the signature and hash checks are unchanged either way.
+fn file_url_path(url: &str) -> Option<&str> {
+    url.strip_prefix("file://")
+}
+
 fn fetch(url: &str, limit: u64) -> Option<Vec<u8>> {
+    if let Some(path) = file_url_path(url) {
+        let meta = std::fs::metadata(path).ok()?;
+        if meta.len() > limit {
+            return None;
+        }
+        return std::fs::read(path).ok();
+    }
     let mut resp = agent().get(url).call().ok()?;
     resp.body_mut()
         .with_config()
@@ -83,6 +145,10 @@ fn fetch(url: &str, limit: u64) -> Option<Vec<u8>> {
 }
 
 fn download(url: &str, path: &str) -> bool {
+    if let Some(src) = file_url_path(url) {
+        return std::fs::metadata(src).is_ok_and(|m| m.len() <= MAX_ARCHIVE)
+            && std::fs::copy(src, path).is_ok();
+    }
     let Ok(mut resp) = agent().get(url).call() else {
         return false;
     };
@@ -100,17 +166,60 @@ fn download(url: &str, path: &str) -> bool {
 }
 
 /// Fetch the manifest and its signature and verify one against the other.
+/// A non-empty IRCBOT_UPDATE_BASE repoints the updater at a local
+/// ircbot-releases tree (the sandboxed testnet uses a file:// base with no
+/// outbound network).  Signature + SHA-256 verification stay active; only the
+/// github/https host allow-list in validate_url() is relaxed for this base.
+fn update_base() -> Option<String> {
+    if let Ok(b) = HUB_UPDATE_BASE.read()
+        && !b.is_empty()
+    {
+        return Some(b.clone());
+    }
+    std::env::var("IRCBOT_UPDATE_BASE")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// The release base the hub named at CMD_UPGRADE_PREPARE time.  The C twin
+/// puts it in the environment (setenv); `#![forbid(unsafe_code)]` rules that
+/// out here, so it lives in a process-global that update_base() consults
+/// ahead of the env var.  Same effect, same verification: only the
+/// github/https host allow-list is relaxed, never the signature or hash.
+static HUB_UPDATE_BASE: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+
+fn set_hub_update_base(base: &str) -> bool {
+    match HUB_UPDATE_BASE.write() {
+        Ok(mut slot) => {
+            slot.clear();
+            slot.push_str(base);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 fn fetch_verified_manifest() -> Result<String, &'static str> {
-    if BOT_UPDATE_PUBKEY_B64.is_empty() {
+    let base = update_base();
+    // Test key honored only alongside the local-source override (sandbox).
+    let pubkey_b64: String = match (&base, std::env::var("IRCBOT_UPDATE_PUBKEY")) {
+        (Some(_), Ok(k)) if !k.is_empty() => k,
+        _ => BOT_UPDATE_PUBKEY_B64.to_string(),
+    };
+    if pubkey_b64.is_empty() {
         return Err("self-updater disabled (no signing key configured)");
     }
-    let pub_key = crypto::b64_decode(BOT_UPDATE_PUBKEY_B64)
+    let pub_key = crypto::b64_decode(&pubkey_b64)
         .filter(|p| p.len() == 32)
         .ok_or("configured update public key is malformed")?;
     let mut pk = [0u8; 32];
     pk.copy_from_slice(&pub_key);
-    let man = fetch(BOT_UPDATE_URL, MAX_MANIFEST).ok_or("failed to download release manifest")?;
-    let sig = fetch(BOT_UPDATE_SIG_URL, MAX_MANIFEST)
+    let (man_url, sig_url) = match &base {
+        Some(b) => (format!("{b}/releases.txt"), format!("{b}/releases.sig")),
+        None => (BOT_UPDATE_URL.to_string(), BOT_UPDATE_SIG_URL.to_string()),
+    };
+    let man = fetch(&man_url, MAX_MANIFEST).ok_or("failed to download release manifest")?;
+    let sig = fetch(&sig_url, MAX_MANIFEST)
         .ok_or("failed to download release signature (releases.txt.sig)")?;
     let sig_text = String::from_utf8_lossy(&sig);
     let sig_bytes = crypto::b64_decode(sig_text.trim_end());
@@ -193,7 +302,7 @@ pub fn check_for_updates(state: &mut BotState, nick: &str) {
         let Some([version, date, _url, _hash, deps]) = parse_release(line) else {
             continue;
         };
-        if strverscmp(version, BOT_VERSION) != std::cmp::Ordering::Greater {
+        if version_cmp(version, BOT_VERSION) != std::cmp::Ordering::Greater {
             continue;
         }
         found += 1;
@@ -227,9 +336,16 @@ pub fn check_for_updates(state: &mut BotState, nick: &str) {
 }
 
 fn validate_url(url: &str) -> bool {
+    if url.contains([';', '|', '&', '`', '$']) {
+        return false;
+    }
+    if let Some(b) = update_base()
+        && url.starts_with(&b)
+    {
+        return true;
+    }
     url.starts_with("https://")
         && (url.contains("github.com") || url.contains("githubusercontent.com"))
-        && !url.contains([';', '|', '&', '`', '$'])
 }
 
 /// Keep [A-Za-z0-9._-]; the result must end in ".tar.gz".
@@ -311,7 +427,7 @@ pub fn perform_upgrade(state: &mut BotState, nick: &str, version: &str) {
         version
     );
     // Downgrade protection: a replayed old manifest cannot roll us back.
-    if strverscmp(version, BOT_VERSION) == std::cmp::Ordering::Less {
+    if version_cmp(version, BOT_VERSION) == std::cmp::Ordering::Less {
         ircf!(
             state,
             "PRIVMSG {} :Refusing downgrade: {} is older than the running version {}.\r\n",
@@ -333,7 +449,7 @@ pub fn perform_upgrade(state: &mut BotState, nick: &str, version: &str) {
         let Some(f) = parse_release(line) else {
             continue;
         };
-        if eq_ic(f[0], version) {
+        if version_eq(f[0], version) {
             if !validate_url(f[2]) {
                 ircf!(
                     state,
@@ -442,6 +558,444 @@ pub fn perform_upgrade(state: &mut BotState, nick: &str, version: &str) {
     std::process::exit(1);
 }
 
+// ======================================================================
+// Hub-driven upgrade (CMD_UPGRADE_COMMIT) — mirrors utils.c
+//
+// A hub-configured bot never upgrades itself from an IRC command (see the
+// gate in commands.rs); its hub drives the whole network in a rolling plan.
+// This entry point is kept PARALLEL to perform_upgrade() rather than folded
+// into it: that function's QUIT/exec sequence is delicate and is still the
+// entire story for standalone bots, while this path differs in nearly every
+// other respect —
+//   - no admin nick to answer: progress goes to the log, and the outcome to
+//     the hub as CMD_UPGRADE_RESULT after the restart,
+//   - the artifact is chosen by {kind,arch,libc} rather than "first row with
+//     this version" — a prebuilt binary matching this host beats a source
+//     build, and a source build needs its dependencies present,
+//   - the old binary and config are RETAINED as <exe>.prev / <config>.prev,
+//     never deleted, so the hub can order a rollback after the new build is
+//     already running.
+// ======================================================================
+
+/// One artifact row of the release manifest.  Columns 1-5 are the legacy
+/// format `parse_release` already reads; 6-9 were appended for the network
+/// upgrade and are absent from older manifests, which is why they default to
+/// a source build that fits anything.
+struct ManifestRow {
+    url: String,
+    hash: String,
+    deps: String,
+    kind: String,
+    arch: String,
+    libc: String,
+    min_from: String,
+}
+
+impl ManifestRow {
+    /// Does this row's {arch,libc} fit the running host?  "any" fits
+    /// everything, which is what source tarballs and older manifests carry.
+    fn fits_host(&self) -> bool {
+        (self.arch == "any" || eq_ic(&self.arch, &host_arch()))
+            && (self.libc == "any" || eq_ic(&self.libc, &host_libc()))
+    }
+
+    /// Every dependency the row names must be present; a prebuilt binary
+    /// carries "none".  Returns the missing ones.
+    fn missing_deps(&self) -> Vec<&str> {
+        if eq_ic(&self.deps, "none") {
+            return Vec::new();
+        }
+        self.deps
+            .split(',')
+            .filter(|d| !d.is_empty() && !check_dependency(d))
+            .collect()
+    }
+}
+
+/// Parse one manifest line, tolerating the 5-column legacy form.
+fn parse_row(line: &str) -> Option<(String, ManifestRow)> {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    if f.len() < 5 {
+        return None;
+    }
+    let caps = [63, 63, 511, 127, 255, 7, 31, 15, 63];
+    if f.iter().zip(caps).any(|(s, c)| s.len() > c) {
+        return None;
+    }
+    let at = |i: usize, dflt: &str| f.get(i).copied().unwrap_or(dflt).to_string();
+    Some((
+        f[0].to_string(),
+        ManifestRow {
+            url: f[2].to_string(),
+            hash: f[3].to_string(),
+            deps: f[4].to_string(),
+            kind: at(5, "src"),
+            arch: at(6, "any"),
+            libc: at(7, "any"),
+            min_from: at(8, "*"),
+        },
+    ))
+}
+
+/// Choose the artifact for `version`: a usable prebuilt binary for this host
+/// wins, otherwise a source tarball whose build dependencies are installed.
+/// `Err` explains why nothing was usable.
+fn manifest_select(manifest: &str, version: &str) -> Result<ManifestRow, String> {
+    let mut why = "requested version is not in the manifest".to_string();
+    let mut pick: Option<ManifestRow> = None;
+
+    for line in manifest
+        .split('\n')
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        let Some((row_ver, row)) = parse_row(line) else {
+            continue;
+        };
+        if !version_eq(&row_ver, version) {
+            continue;
+        }
+        if !validate_url(&row.url) {
+            why = "untrusted artifact URL in manifest".to_string();
+            continue;
+        }
+        if !row.fits_host() {
+            why = "no artifact for this host arch/libc".to_string();
+            continue;
+        }
+        if row.min_from != "*"
+            && version_cmp(BOT_VERSION, &row.min_from) == std::cmp::Ordering::Less
+        {
+            why = format!(
+                "running version is below the artifact's min_from {}",
+                row.min_from
+            );
+            continue;
+        }
+        let missing = row.missing_deps();
+        if !missing.is_empty() {
+            why = format!("missing build dependencies: {}", missing.join(", "));
+            continue;
+        }
+        // Usable.  Prefer a prebuilt binary; keep looking only if this is a
+        // source row that a later binary row could beat.
+        let is_bin = eq_ic(&row.kind, "bin");
+        pick = Some(row);
+        if is_bin {
+            break;
+        }
+    }
+    pick.ok_or(why)
+}
+
+/// The upgrade script for a hub-driven commit.  `kind` decides the middle of
+/// it: a prebuilt binary is unpacked and moved into place, a source tarball
+/// is compiled first.  Either way the previous binary stays at <exe>.prev —
+/// the hub, not the script, decides whether to keep it.
+fn hub_upgrade_script(pid: u32, kind: &str, archive: &str, prev: &str, exe: &str) -> String {
+    // One rollback path for every failure: put <exe>.prev back and run it, so
+    // a bot that cannot upgrade still comes back on the old build.
+    let build = if eq_ic(kind, "bin") {
+        // Prebuilt: the tarball holds the binary itself, no toolchain needed.
+        // No "run it once" probe — ircbot has no --version flag and starting a
+        // second instance would fight the one we are replacing.  The hub is
+        // the health monitor: it waits for this node to reappear announcing
+        // the new version and sends CMD_UPGRADE_ABORT if it never does.
+        r#"NEW_BIN="$UPGRADE_DIR/ircbot"
+chmod 700 "$NEW_BIN" 2>/dev/null
+[ -x "$NEW_BIN" ] || rollback "artifact binary is not executable""#
+            .to_string()
+    } else {
+        r#"cd "$UPGRADE_DIR" || rollback "build directory vanished"
+if [ -f Cargo.toml ]; then
+  cargo build --release >build.log 2>&1
+  BUILT=target/release/ircbot
+else
+  make clean >/dev/null 2>&1
+  make >make.log 2>&1
+  BUILT=ircbot
+fi
+cd ..
+NEW_BIN="$UPGRADE_DIR/$BUILT"
+[ -f "$NEW_BIN" ] || rollback "build failed (see $UPGRADE_DIR)""#
+            .to_string()
+    };
+    format!(
+        r#"#!/bin/bash
+set -u
+OLD_PID={pid}
+for i in $(seq 1 30); do
+  kill -0 $OLD_PID 2>/dev/null || break
+  sleep 1
+done
+UPGRADE_DIR="./bot_build_tmp"
+rm -rf "$UPGRADE_DIR"
+mkdir "$UPGRADE_DIR" || exit 1
+rollback() {{
+  echo "[UPGRADE] FAILED: $1 — restoring previous build"
+  mv -f "{prev}" "{exe}" 2>/dev/null
+  rm -f "{PID_FILE}" "{UPGRADE_MARKER_FILE}"
+  rm -rf "$UPGRADE_DIR" "{archive}"
+  exec "{exe}"
+}}
+tar -xzf "{archive}" --strip-components=1 -C "$UPGRADE_DIR" 2>/dev/null || rollback "could not extract artifact"
+{build}
+mv -f "$NEW_BIN" "{exe}" || rollback "could not install new binary"
+chmod 700 "{exe}"
+rm -f "{PID_FILE}"
+(sleep 5; rm -rf "$UPGRADE_DIR" "{archive}" "./upgrade.sh" 2>/dev/null) &
+exec "{exe}"
+"#
+    )
+}
+
+/// ---- Upgrade hand-off marker -------------------------------------------
+/// exec() throws away everything the old process knew, so the upgrade id and
+/// the version we were aiming at are left in a file for the new binary to
+/// find.  Read exactly once, on the first authenticated hub link after the
+/// restart, and removed there.
+pub fn marker_write(upgrade_id: &str, target_ver: &str) -> bool {
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(UPGRADE_MARKER_FILE)
+        .and_then(|mut f| f.write_all(format!("{upgrade_id}|{target_ver}\n").as_bytes()))
+        .is_ok()
+}
+
+/// Read and consume the marker.  `None` for every ordinary start.
+pub fn take_pending_upgrade() -> Option<(String, String)> {
+    let body = std::fs::read_to_string(UPGRADE_MARKER_FILE).ok();
+    // Consumed whatever it said: a marker we cannot parse must not be retried
+    // on every reconnect for the rest of this process's life.
+    let _ = std::fs::remove_file(UPGRADE_MARKER_FILE);
+    let line = body?;
+    let line = line.trim_end_matches(['\r', '\n']);
+    let (id, ver) = line.split_once('|')?;
+    (!id.is_empty() && !ver.is_empty()).then(|| (id.to_string(), ver.to_string()))
+}
+
+/// Put back the binary and config a hub-driven upgrade retained, then restart
+/// onto them.  Used for CMD_UPGRADE_ABORT: by the time it arrives the new
+/// build is already the running process, so undoing it means another exec.
+/// Returns false when there is nothing retained to go back to.
+pub fn hub_rollback(state: &mut BotState, reason: &str) -> bool {
+    let exe = state.executable_path.clone();
+    let prev_exe = format!("{exe}{UPGRADE_PREV_SUFFIX}");
+    let prev_cfg = format!("{CONFIG_FILE}{UPGRADE_PREV_SUFFIX}");
+    if !std::path::Path::new(&prev_exe).exists() {
+        logm!(
+            state,
+            L_INFO,
+            "[UPGRADE] Rollback requested ({}) but no retained binary\n",
+            reason
+        );
+        return false;
+    }
+    logm!(
+        state,
+        L_INFO,
+        "[UPGRADE] Rolling back to the retained build: {}\n",
+        reason
+    );
+    // Config first: if the restart races us, the old binary must not come up
+    // against a config only the newer build understands.
+    if std::path::Path::new(&prev_cfg).exists() && std::fs::rename(&prev_cfg, CONFIG_FILE).is_err()
+    {
+        logm!(
+            state,
+            L_INFO,
+            "[UPGRADE] Could not restore {}; keeping the current one\n",
+            prev_cfg
+        );
+    }
+    if std::fs::rename(&prev_exe, &exe).is_err() {
+        logm!(state, L_INFO, "[UPGRADE] Could not restore {}\n", prev_exe);
+        return false;
+    }
+    let _ = std::fs::remove_file(UPGRADE_MARKER_FILE);
+
+    ircf!(
+        state,
+        "QUIT :Upgrade aborted; restoring previous build...\r\n"
+    );
+    irc_client::disconnect(state);
+    dcc::close_all(state, "Bot rolling back; closing.");
+    crate::hub_client::disconnect(state);
+    state.pid_file = None;
+    let _ = std::fs::remove_file(PID_FILE);
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let err = Command::new(&exe).exec();
+    eprintln!("exec rollback failed: {err}");
+    std::process::exit(1);
+}
+
+/// Run the upgrade the hub just committed us to.  `Err` means nothing was
+/// touched (the caller answers CMD_UPGRADE_RESULT fail and stays on the
+/// current build); on success this does not return — the process is replaced
+/// and reports in after the restart.
+pub fn hub_commit(
+    state: &mut BotState,
+    upgrade_id: &str,
+    target_ver: &str,
+    variant: &str,
+    base: &str,
+) -> Result<(), String> {
+    // The hub may point us at a different release base than the compiled-in
+    // one (the testnet serves a local ircbot-releases tree).  It travels the
+    // same path as the operator-set env var, so signature and hash checks are
+    // unchanged — see update_base().
+    let want_variant = if variant.is_empty() {
+        host_variant()
+    } else {
+        variant
+    };
+    if want_variant.len() > 7
+        || want_variant.contains(['/', ';', '|', '&', '`', '$', ' ', '\t', '\r', '\n'])
+    {
+        return Err("rejected malformed variant from hub".to_string());
+    }
+    {
+        // The hub names the release tree ROOT; the variant picks the subtree.
+        // That is what lets one network-wide run leave each node on its own
+        // kind of build — and lets an admin move a node from the Rust build to
+        // the C one by naming the other variant.
+        let root = if base.is_empty() {
+            BOT_UPDATE_BASE
+        } else {
+            base
+        };
+        if root.len() >= 512 || root.contains([';', '|', '&', '`', '$', ' ', '\t', '\r', '\n']) {
+            return Err("rejected malformed manifest base from hub".to_string());
+        }
+        if !set_hub_update_base(&format!("{root}/{want_variant}")) {
+            return Err("could not record the hub's manifest base".to_string());
+        }
+    }
+    // Same downgrade guard as the standalone path: a validly signed but stale
+    // manifest must not be able to walk us back onto a known-bad build.
+    match version_cmp(target_ver, BOT_VERSION) {
+        std::cmp::Ordering::Less => return Err("refusing downgrade".to_string()),
+        std::cmp::Ordering::Equal => {
+            return Err("already running the target version".to_string());
+        }
+        std::cmp::Ordering::Greater => {}
+    }
+    // An unattended restart needs the machine-bound password file; without it
+    // the new binary would stop at a password prompt with nobody to answer.
+    if !std::path::Path::new(PASS_FILE).exists() {
+        return Err(format!("no {PASS_FILE}; unattended restart is impossible"));
+    }
+    logm!(
+        state,
+        L_INFO,
+        "[UPGRADE] Hub commit {}: {} -> {} (variant {})\n",
+        upgrade_id,
+        BOT_VERSION,
+        target_ver,
+        want_variant
+    );
+
+    let manifest = fetch_verified_manifest().map_err(|e| e.to_string())?;
+    let row = manifest_select(&manifest, target_ver)?;
+
+    let url_name = row
+        .url
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("ircbot.tar.gz");
+    let archive =
+        sanitize_filename(url_name).ok_or("artifact filename in manifest is not acceptable")?;
+
+    // Every release artifact is named "<product>-…tar.gz" (see the releases
+    // repo README).  A base override that names the OTHER product's tree
+    // would otherwise hand this daemon the wrong binary and install it over
+    // itself — fail closed here, where nothing has been downloaded yet.
+    if !archive.starts_with("ircbot-") {
+        return Err("manifest artifact is not a ircbot release".to_string());
+    }
+
+    logm!(
+        state,
+        L_INFO,
+        "[UPGRADE] Fetching {} artifact {}\n",
+        row.kind,
+        archive
+    );
+    if !download(&row.url, &archive) {
+        return Err("artifact download failed".to_string());
+    }
+    if !crypto::sha256_file_hex(&archive).is_some_and(|h| h.eq_ignore_ascii_case(&row.hash)) {
+        let _ = std::fs::remove_file(&archive);
+        return Err("artifact SHA-256 mismatch".to_string());
+    }
+
+    // Flush the live config, then snapshot the pair we may have to restore.
+    // The config is copied (the running bot still needs it); the binary is
+    // renamed, which is atomic and leaves <exe>.prev ready for a rollback.
+    config::write_with_state_pass(state);
+    let exe = state.executable_path.clone();
+    let prev_exe = format!("{exe}{UPGRADE_PREV_SUFFIX}");
+    let prev_cfg = format!("{CONFIG_FILE}{UPGRADE_PREV_SUFFIX}");
+    if std::fs::copy(CONFIG_FILE, &prev_cfg).is_err() {
+        let _ = std::fs::remove_file(&archive);
+        return Err("could not snapshot config for rollback".to_string());
+    }
+    if std::fs::rename(&exe, &prev_exe).is_err() {
+        let _ = std::fs::remove_file(&prev_cfg);
+        let _ = std::fs::remove_file(&archive);
+        return Err("could not retain previous binary".to_string());
+    }
+
+    // From here a failure is the script's to handle: it restores <exe>.prev
+    // and restarts the old build rather than leaving the node with no binary.
+    let script = hub_upgrade_script(std::process::id(), &row.kind, &archive, &prev_exe, &exe);
+    let staged = marker_write(upgrade_id, target_ver)
+        && OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o700)
+            .open("upgrade.sh")
+            .and_then(|mut f| {
+                f.write_all(script.as_bytes())?;
+                f.set_permissions(std::fs::Permissions::from_mode(0o700))
+            })
+            .is_ok();
+    if !staged {
+        let _ = std::fs::remove_file(UPGRADE_MARKER_FILE);
+        let _ = std::fs::rename(&prev_exe, &exe);
+        let _ = std::fs::remove_file(&prev_cfg);
+        let _ = std::fs::remove_file(&archive);
+        return Err("could not stage the upgrade script".to_string());
+    }
+
+    logm!(
+        state,
+        L_INFO,
+        "[UPGRADE] Installing {} and restarting\n",
+        target_ver
+    );
+    ircf!(
+        state,
+        "QUIT :Upgrading to {} (hub-managed)...\r\n",
+        target_ver
+    );
+    irc_client::disconnect(state);
+    dcc::close_all(state, "Bot upgrading; closing.");
+    crate::hub_client::disconnect(state);
+    state.pid_file = None;
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let err = Command::new("./upgrade.sh").exec();
+    // exec failed: put the old binary back so the node is not left dead.
+    let _ = std::fs::rename(&prev_exe, &exe);
+    let _ = std::fs::remove_file(UPGRADE_MARKER_FILE);
+    eprintln!("exec upgrade.sh failed: {err}");
+    std::process::exit(1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,6 +1007,51 @@ mod tests {
         assert_eq!(strverscmp("2.3.0", "2.3.0"), Equal);
         assert_eq!(strverscmp("2.3.0", "2.3.1"), Less);
         assert_eq!(strverscmp("v2.3.0", "2.3.0"), Greater);
+    }
+
+    /// The downgrade guard compares through version_cmp, which must ignore a
+    /// leading 'v' on either side — strverscmp alone ranks "v0.0.1" above
+    /// "2.3.0" because it compares 'v' against '2'.
+    #[test]
+    fn version_cmp_ignores_v_prefix() {
+        assert_eq!(strverscmp("v0.0.1", "2.3.0"), Greater);
+        assert_eq!(version_cmp("v0.0.1", "2.3.0"), Less);
+        assert_eq!(version_cmp("v2.3.0", "2.3.0"), Equal);
+        assert_eq!(version_cmp("2.4.0", "v2.3.0"), Greater);
+        assert!(version_eq("v2.3.0", "2.3.0"));
+    }
+
+    /// A prebuilt binary for this host beats the source row; an unusable
+    /// binary row falls back to source rather than failing the upgrade.
+    #[test]
+    fn manifest_prefers_matching_binary() {
+        let src = "v9.0.0 2026-09-20 https://github.com/x/y/v9.tar.gz aa none src any any *";
+        let bin = format!(
+            "v9.0.0 2026-09-20 https://github.com/x/y/v9-bin.tar.gz bb none bin {} {} *",
+            host_arch(),
+            host_libc()
+        );
+        let other =
+            "v9.0.0 2026-09-20 https://github.com/x/y/v9-sparc.tar.gz cc none bin sparc64 gnu *";
+
+        let m = format!("# comment\n{src}\n{bin}\n");
+        assert_eq!(manifest_select(&m, "9.0.0").unwrap().kind, "bin");
+        let m = format!("{other}\n{src}\n");
+        assert_eq!(manifest_select(&m, "v9.0.0").unwrap().kind, "src");
+        let m = format!("{other}\n");
+        assert!(manifest_select(&m, "v9.0.0").is_err());
+        assert!(manifest_select(&m, "v1.0.0").is_err());
+    }
+
+    /// min_from is a floor on the version we may upgrade FROM: a row that
+    /// demands more than we run is skipped, which is what makes the hub walk
+    /// the intermediate releases.
+    #[test]
+    fn manifest_honors_min_from() {
+        let row = "v9.0.0 2026-09-20 https://github.com/x/y/v9.tar.gz aa none src any any 99.0.0";
+        assert!(manifest_select(row, "9.0.0").is_err());
+        let row = "v9.0.0 2026-09-20 https://github.com/x/y/v9.tar.gz aa none src any any 1.0.0";
+        assert!(manifest_select(row, "9.0.0").is_ok());
     }
 
     #[test]

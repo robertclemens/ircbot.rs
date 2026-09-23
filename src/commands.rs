@@ -1133,6 +1133,16 @@ fn admin_command(
                 }
             }
         }
+        // In-place 'update' is for standalone bots only.  A hub-configured bot
+        // is upgraded by its hub (hub_admin-initiated rolling upgrade), never
+        // via an IRC/DCC command.  The hub-driven path calls
+        // updater::perform_upgrade() directly and is NOT gated here.
+        "update" if !state.hubs.is_empty() => say(
+            state,
+            nick,
+            "Updates are hub-managed on this bot; run upgrades from hub_admin. \
+In-place 'update' is only available on standalone (hub-less) bots.",
+        ),
         "update" => match a.a1 {
             Some(v) => updater::perform_upgrade(state, nick, v),
             None => updater::check_for_updates(state, nick),

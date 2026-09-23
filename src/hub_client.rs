@@ -23,7 +23,7 @@ use crate::state::{
     BotState, BotTreeRow, ChanReq, ChanStatus, HubAuthState, MaskRecord, S_CONNECTED, UserRecord,
     lww_accepts, opt_accepts,
 };
-use crate::{bot_comms, channel, config, ircf, logm};
+use crate::{bot_comms, channel, config, ircf, logm, updater};
 
 /// Unsent bytes past which a hub that stopped reading is dropped.
 const HUB_WBUF_MAX: usize = 4 * 1024 * 1024;
@@ -264,6 +264,216 @@ pub fn send_presence(state: &mut BotState, force: bool) {
                 }
             );
         }
+    }
+}
+
+// ---- Network upgrade (hub-orchestrated rolling upgrade) ------------------
+// The bot is a follower here.  It answers CMD_UPGRADE_PREPARE with what it is
+// and whether it could take the target build, touches nothing until
+// CMD_UPGRADE_COMMIT names the same upgrade, and restores the retained build
+// on CMD_UPGRADE_ABORT.  None of this is reachable from IRC or DCC: the
+// frames only arrive on the authenticated hub link, which is the whole point
+// of the standalone-only gate on the 'update' command.
+
+/// Copy `src` into a '|'-free, control-byte-free field.  Reasons carry text
+/// that originated in a manifest, and the wire format splits on '|'.
+fn upgrade_field(src: &str) -> String {
+    src.chars()
+        .map(|c| match c {
+            '|' => '/',
+            c if (c as u32) < 0x20 || c == '\u{7f}' => ' ',
+            c => c,
+        })
+        .take(191)
+        .collect()
+}
+
+/// id|uuid|cur_ver|variant|arch|libc|ready|reason
+fn send_upgrade_ready(state: &mut BotState, id: &str, ready: bool, reason: &str) {
+    let clean = upgrade_field(reason);
+    let payload = format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}",
+        id,
+        state.bot_uuid,
+        BOT_VERSION,
+        updater::host_variant(),
+        updater::host_arch(),
+        updater::host_libc(),
+        if ready { 1 } else { 0 },
+        clean
+    );
+    send_frame(state, CMD_UPGRADE_READY, payload.as_bytes());
+    logm!(
+        state,
+        L_INFO,
+        "[UPGRADE] {} upgrade {}{}{}\n",
+        if ready { "Ready for" } else { "Cannot take" },
+        id,
+        if clean.is_empty() { "" } else { ": " },
+        clean
+    );
+}
+
+/// id|uuid|status|new_ver|detail
+pub fn send_upgrade_result(state: &mut BotState, id: &str, status: &str, detail: &str) {
+    let payload = format!(
+        "{}|{}|{}|{}|{}",
+        id,
+        state.bot_uuid,
+        status,
+        BOT_VERSION,
+        upgrade_field(detail)
+    );
+    send_frame(state, CMD_UPGRADE_RESULT, payload.as_bytes());
+}
+
+/// Called once per authenticated link.  If this process is the product of a
+/// hub-driven upgrade, the marker left behind by updater::hub_commit() says
+/// which run it belongs to; report whether we came up on the version that run
+/// was aiming at.  The hub also infers success from the presence frame, so a
+/// lost RESULT costs nothing.
+pub fn report_upgrade_result(state: &mut BotState) {
+    let Some((id, want)) = updater::take_pending_upgrade() else {
+        return;
+    };
+    let ok = updater::version_cmp(BOT_VERSION, &want) == std::cmp::Ordering::Equal;
+    logm!(
+        state,
+        L_INFO,
+        "[UPGRADE] Restarted after {}: running {} (wanted {})\n",
+        id,
+        BOT_VERSION,
+        want
+    );
+    let status = if ok { "ok" } else { "version-mismatch" };
+    send_upgrade_result(state, &id, status, if ok { "" } else { &want });
+}
+
+/// id|target_ver|variant|kind|min_from|manifest_base — the hub is asking
+/// whether we could move to target_ver.  Answer only; nothing is downloaded
+/// and nothing on disk is touched until COMMIT.
+fn handle_upgrade_prepare(state: &mut BotState, payload: &str) {
+    // id|ver|variant|kind|min_from|base — base is a bounded field, not the
+    // tail: a hub's peer-facing PREPARE appends the hubs' own target and base
+    // after it, and anything past the sixth field is not the bot's.
+    let f: Vec<&str> = payload.split('|').collect();
+    if f.len() < 2 || f[0].is_empty() || f[1].is_empty() || f[0].len() > 63 || f[1].len() > 63 {
+        logm!(state, L_INFO, "[UPGRADE] Malformed UPGRADE_PREPARE\n");
+        return;
+    }
+    let (id, ver) = (f[0], f[1]);
+    let variant = f.get(2).copied().unwrap_or("");
+    let min_from = f.get(4).copied().unwrap_or("");
+    let base = f.get(5).copied().unwrap_or("");
+
+    let mut reason = "";
+    let ready = match updater::version_cmp(ver, BOT_VERSION) {
+        std::cmp::Ordering::Equal => {
+            reason = "already running the target version";
+            false
+        }
+        std::cmp::Ordering::Less => {
+            reason = "target is older than the running version";
+            false
+        }
+        std::cmp::Ordering::Greater => {
+            if !min_from.is_empty()
+                && min_from != "*"
+                && updater::version_cmp(BOT_VERSION, min_from) == std::cmp::Ordering::Less
+            {
+                // The hub walks the intermediate releases when it sees this.
+                reason = "running version is below the target's min_from";
+                false
+            } else if !std::path::Path::new(PASS_FILE).exists() {
+                // Without the machine-bound password file the replacement
+                // binary would stop at a prompt with nobody to answer it.
+                reason = "no .ircbot.pass; cannot restart unattended";
+                false
+            } else if !state.executable_path.starts_with('/') {
+                reason = "executable path is not absolute";
+                false
+            } else {
+                true
+            }
+        }
+    };
+
+    if ready {
+        // Remember the plan: COMMIT repeats only the id and the version.
+        state.upgrade_id = id.to_string();
+        state.upgrade_target = ver.to_string();
+        state.upgrade_variant = if variant.is_empty() {
+            updater::host_variant().to_string()
+        } else {
+            variant.to_string()
+        };
+        state.upgrade_base = base.to_string();
+        state.upgrade_prepared = now();
+    }
+    // The artifact kind is chosen from the manifest at COMMIT, so f[3] is
+    // read for the wire format's sake and not used here.
+    let id = id.to_string();
+    send_upgrade_ready(state, &id, ready, reason);
+}
+
+/// id|target_ver|variant — go.  Only an id we acknowledged at PREPARE, and
+/// only while that acknowledgement is still fresh, may commit.
+fn handle_upgrade_commit(state: &mut BotState, payload: &str) {
+    let f: Vec<&str> = payload.splitn(3, '|').collect();
+    if f.len() < 2 || f[0].is_empty() || f[1].is_empty() || f[0].len() > 63 || f[1].len() > 63 {
+        logm!(state, L_INFO, "[UPGRADE] Malformed UPGRADE_COMMIT\n");
+        return;
+    }
+    let (id, ver) = (f[0].to_string(), f[1].to_string());
+    let variant = f.get(2).copied().unwrap_or("").to_string();
+
+    if state.upgrade_id.is_empty() || state.upgrade_id != id {
+        send_upgrade_result(state, &id, "fail", "no matching UPGRADE_PREPARE");
+        return;
+    }
+    if state.upgrade_target != ver {
+        send_upgrade_result(state, &id, "fail", "commit version differs from prepare");
+        return;
+    }
+    if now() - state.upgrade_prepared > UPGRADE_PREPARE_TTL {
+        state.upgrade_id.clear();
+        send_upgrade_result(state, &id, "fail", "prepare expired");
+        return;
+    }
+
+    let variant = if variant.is_empty() {
+        state.upgrade_variant.clone()
+    } else {
+        variant
+    };
+    let base = state.upgrade_base.clone();
+    // On success hub_commit() does not return: the process is replaced and
+    // report_upgrade_result() reports in after the restart.
+    if let Err(e) = updater::hub_commit(state, &id, &ver, &variant, &base) {
+        // Nothing was changed on disk; stay on this build and say why.
+        logm!(state, L_INFO, "[UPGRADE] Commit {} refused: {}\n", id, e);
+        send_upgrade_result(state, &id, "fail", &e);
+        state.upgrade_id.clear();
+    }
+}
+
+/// id|reason — put the retained build back.  By the time this arrives the new
+/// binary is usually already the running process, so undoing it is another
+/// exec; a bot that has nothing retained just says so.
+fn handle_upgrade_abort(state: &mut BotState, payload: &str) {
+    let (id, reason) = payload.split_once('|').unwrap_or((payload, ""));
+    let id = if id.is_empty() { "-" } else { id }.to_string();
+    let reason = if reason.is_empty() {
+        "hub aborted the upgrade".to_string()
+    } else {
+        upgrade_field(reason)
+    };
+    logm!(state, L_INFO, "[UPGRADE] Abort {}: {}\n", id, reason);
+    state.upgrade_id.clear();
+    state.upgrade_prepared = 0;
+    // A successful rollback execs; the hub sees the old version reappear.
+    if !updater::hub_rollback(state, &reason) {
+        send_upgrade_result(state, &id, "aborted", "nothing retained to roll back to");
     }
 }
 
@@ -1372,6 +1582,9 @@ fn handle_response(state: &mut BotState, cmd: u8, payload: &str) {
                 }
             }
         }
+        CMD_UPGRADE_PREPARE if !payload.is_empty() => handle_upgrade_prepare(state, payload),
+        CMD_UPGRADE_COMMIT if !payload.is_empty() => handle_upgrade_commit(state, payload),
+        CMD_UPGRADE_ABORT if !payload.is_empty() => handle_upgrade_abort(state, payload),
         CMD_BOT_MSG if !payload.is_empty() => {
             logm!(
                 state,
@@ -1763,6 +1976,9 @@ fn handle_ack(state: &mut BotState, body: &[u8]) {
     push_config(state);
     // No presence for us on this hub yet: report unconditionally.
     send_presence(state, true);
+    // If this process is the product of a hub-driven upgrade, close that run
+    // out now that there is a hub to tell.
+    report_upgrade_result(state);
     if state.admin_delta_pending {
         // After the config push, so the hub already knows v|2.
         logm!(

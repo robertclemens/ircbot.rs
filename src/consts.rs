@@ -4,7 +4,16 @@
 
 // ---- Identity / files (the "only edit this section" block of bot.h) -------
 pub const BOT_NAME: &str = "ircbot.rs by trojanman";
-pub const BOT_VERSION: &str = "2.3.0";
+/// Overridable at build time (`IRCBOT_VERSION=2.4.0 cargo build --release`)
+/// so a release build can stamp its own version without editing the tree —
+/// the testnet builds a bumped-version artifact this way.  Mirrors the
+/// `#ifndef BOT_VERSION` guard in bot.h.  This is the version the bot
+/// reports in CMD_BOT_PRESENCE, and the one every upgrade comparison is
+/// made against.
+pub const BOT_VERSION: &str = match option_env!("IRCBOT_VERSION") {
+    Some(v) => v,
+    None => "2.4.0",
+};
 pub const PASS_FILE: &str = ".ircbot.pass"; // machine-bound password file
 pub const PBKDF2_ITERATIONS: u32 = 100_000;
 pub const VERSION_RESPONSE: &str = "A robot may not injure a human being";
@@ -14,10 +23,29 @@ pub const SALT_SIZE: usize = 16;
 pub const DEFAULT_LOG_LEVEL: u32 = 63;
 pub const LOGFILE: &str = ".ircbot.log";
 pub const BOT_LOG_FILE_SIZE: u64 = 10 * 1024 * 1024;
+/// Hand-off note written just before a hub-driven upgrade execs the new
+/// binary: the restarted process reads the upgrade id from here and
+/// answers CMD_UPGRADE_RESULT (bot.h UPGRADE_MARKER_FILE).
+pub const UPGRADE_MARKER_FILE: &str = ".ircbot.upgrade";
+/// Retained previous binary/config, kept (not deleted) after a hub-driven
+/// upgrade so CMD_UPGRADE_ABORT can put the node back.
+pub const UPGRADE_PREV_SUFFIX: &str = ".prev";
+/// How long a CMD_UPGRADE_PREPARE stays commitable.
+pub const UPGRADE_PREPARE_TTL: i64 = 900;
+/// The release tree ROOT; one variant subdirectory below it holds that build's
+/// manifest.  Keeping the root separate is what lets a hub-driven upgrade flip
+/// a node between the C and Rust builds: `updater::hub_commit` appends the
+/// variant it was told to install, so one network-wide run can leave each node
+/// on its own kind of build, or move it across.  Mirrors `BOT_UPDATE_BASE` in
+/// bot.h.
+pub const BOT_UPDATE_BASE: &str =
+    "https://raw.githubusercontent.com/robertclemens/ircbot-releases/main/ircbot";
+/// The variant THIS build is: the standalone `update` command stays on it.
+pub const BOT_UPDATE_VARIANT: &str = "rs";
 pub const BOT_UPDATE_URL: &str =
-    "https://raw.githubusercontent.com/robertclemens/ircbot/main/releases/releases.txt";
+    "https://raw.githubusercontent.com/robertclemens/ircbot-releases/main/ircbot/rs/releases.txt";
 pub const BOT_UPDATE_SIG_URL: &str =
-    "https://raw.githubusercontent.com/robertclemens/ircbot/main/releases/releases.sig";
+    "https://raw.githubusercontent.com/robertclemens/ircbot-releases/main/ircbot/rs/releases.sig";
 /// Base64 of the raw Ed25519 public key that signs releases.txt.  Empty
 /// disables the self-updater (fail closed).
 pub const BOT_UPDATE_PUBKEY_B64: &str = "qkXMh/F8TC+cnKuIwrP5TJIynfrLBD+MDUwvkyh9lBU=";
@@ -156,6 +184,12 @@ pub const CMD_BOT_TREE: u8 = 0x58;
 pub const CMD_CHAN_REQUEST: u8 = 0x59;
 pub const CMD_CHAN_ACTION: u8 = 0x5A;
 pub const CMD_CHAN_REPLY: u8 = 0x5B;
+// Network-wide upgrade coordination (mirrors irchub/hub.h + ircbot/bot.h).
+pub const CMD_UPGRADE_PREPARE: u8 = 0x5E;
+pub const CMD_UPGRADE_READY: u8 = 0x5F;
+pub const CMD_UPGRADE_COMMIT: u8 = 0x60;
+pub const CMD_UPGRADE_RESULT: u8 = 0x61;
+pub const CMD_UPGRADE_ABORT: u8 = 0x62;
 
 // ---- Channel-access requests (unban / invite / key) -----------------------------
 pub const CHAN_REQUEST_MIN_INTERVAL: i64 = 5;

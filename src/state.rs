@@ -350,6 +350,17 @@ pub struct BotState {
     pub bot_tree_ts: i64,
     pub presence_server: String,
     pub last_presence_sent: i64,
+    /// The hub-driven upgrade this bot has acknowledged (CMD_UPGRADE_PREPARE).
+    /// COMMIT carries only the id and the version, so the release base the hub
+    /// named at PREPARE time is remembered here; an id that never went through
+    /// PREPARE, or one older than UPGRADE_PREPARE_TTL, is refused.  Volatile:
+    /// never written to the config, and the upgrade itself hands over through
+    /// UPGRADE_MARKER_FILE because exec() takes all of this with it.
+    pub upgrade_id: String,
+    pub upgrade_target: String,
+    pub upgrade_variant: String,
+    pub upgrade_base: String,
+    pub upgrade_prepared: i64,
 }
 
 impl BotState {
@@ -436,6 +447,11 @@ impl BotState {
             bot_tree_ts: 0,
             presence_server: String::new(),
             last_presence_sent: 0,
+            upgrade_id: String::new(),
+            upgrade_target: String::new(),
+            upgrade_variant: String::new(),
+            upgrade_base: String::new(),
+            upgrade_prepared: 0,
         }
     }
 
