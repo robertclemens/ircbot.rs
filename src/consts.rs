@@ -12,7 +12,7 @@ pub const BOT_NAME: &str = "ircbot.rs by trojanman";
 /// made against.
 pub const BOT_VERSION: &str = match option_env!("IRCBOT_VERSION") {
     Some(v) => v,
-    None => "2.4.2",
+    None => "2.4.3",
 };
 pub const PASS_FILE: &str = ".ircbot.pass"; // machine-bound password file
 pub const PBKDF2_ITERATIONS: u32 = 100_000;

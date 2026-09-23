@@ -1,6 +1,6 @@
 [package]
 name = "ircbot"
-version = "2.4.2"
+version = "2.4.3"
 edition = "2024"
 rust-version = "1.89"
 description = "IRC bot with an encrypted hub mesh (safe-Rust port of ircbot.c)"

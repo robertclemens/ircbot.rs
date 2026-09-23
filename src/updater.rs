@@ -113,6 +113,25 @@ pub fn host_variant() -> &'static str {
     BOT_UPDATE_VARIANT
 }
 
+/// Install the rustls provider once, and say whether HTTPS is usable at all.
+///
+/// ureq is built with `rustls-no-provider`, so it reads the process default
+/// and panics if there is none.  irc_client installs it too, but only on the
+/// first TLS IRC connection -- a bot on a plaintext server reaches the
+/// updater without one.  graviola *asserts* on the CPU features it needs, so
+/// the construction is wrapped: on a CPU it does not support only the updater
+/// is unavailable, instead of the bot dying mid-upgrade.
+fn tls_ready() -> bool {
+    use std::sync::OnceLock;
+    static OK: OnceLock<bool> = OnceLock::new();
+    *OK.get_or_init(|| {
+        std::panic::catch_unwind(|| {
+            let _ = rustls_graviola::default_provider().install_default();
+        })
+        .is_ok()
+    })
+}
+
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .user_agent("ircbot-updater/1.0")
@@ -136,6 +155,9 @@ fn fetch(url: &str, limit: u64) -> Option<Vec<u8>> {
         }
         return std::fs::read(path).ok();
     }
+    if !tls_ready() {
+        return None;
+    }
     let mut resp = agent().get(url).call().ok()?;
     resp.body_mut()
         .with_config()
@@ -148,6 +170,9 @@ fn download(url: &str, path: &str) -> bool {
     if let Some(src) = file_url_path(url) {
         return std::fs::metadata(src).is_ok_and(|m| m.len() <= MAX_ARCHIVE)
             && std::fs::copy(src, path).is_ok();
+    }
+    if !tls_ready() {
+        return false;
     }
     let Ok(mut resp) = agent().get(url).call() else {
         return false;
