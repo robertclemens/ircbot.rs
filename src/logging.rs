@@ -17,6 +17,8 @@ pub struct LogRing {
 pub struct Logger {
     /// Bitmask of L_* levels written to LOGFILE (the config's l| line).
     pub level: u32,
+    /// LOGFILE cap in bytes (the config's L| line, else BOT_LOG_FILE_SIZE).
+    pub max_size: u64,
     rings: RefCell<Vec<LogRing>>,
 }
 
@@ -47,6 +49,7 @@ impl Logger {
             .collect();
         Logger {
             level,
+            max_size: BOT_LOG_FILE_SIZE,
             rings: RefCell::new(rings),
         }
     }
@@ -84,9 +87,10 @@ impl Logger {
             return;
         }
 
-        // Past the size cap the file is truncated rather than left to grow.
+        // Past the size cap the file is truncated rather than left to grow,
+        // and this line is then written after the truncation notice.
         if let Ok(md) = std::fs::metadata(LOGFILE)
-            && md.len() >= BOT_LOG_FILE_SIZE
+            && md.len() >= self.max_size
             && let Ok(mut f) = OpenOptions::new()
                 .write(true)
                 .create(true)

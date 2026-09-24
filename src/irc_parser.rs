@@ -326,18 +326,28 @@ fn on_welcome(state: &mut BotState, params: &str) {
     irc_client::note_registered(state);
     // 001's first parameter is the nick the server actually registered.
     let srv_nick = params.split(' ').next().unwrap_or("");
-    if !srv_nick.is_empty() && srv_nick.len() < MAX_NICK && state.current_nick != srv_nick {
-        logm!(
-            state,
-            L_INFO,
-            "[INFO] Server registered me as {} (was {})\n",
-            srv_nick,
-            if state.current_nick.is_empty() {
-                "unset"
-            } else {
-                state.current_nick.as_str()
-            }
-        );
+    // Registered under anything but the target nick is news for the hub even
+    // when current_nick already says so: a 433 during registration switches
+    // current_nick to the fallback without a push, and a hub link that came
+    // up before that has only the target.
+    let renamed = state.current_nick != srv_nick;
+    if !srv_nick.is_empty()
+        && srv_nick.len() < MAX_NICK
+        && (renamed || !eq_ic(srv_nick, &state.target_nick))
+    {
+        if renamed {
+            logm!(
+                state,
+                L_INFO,
+                "[INFO] Server registered me as {} (was {})\n",
+                srv_nick,
+                if state.current_nick.is_empty() {
+                    "unset"
+                } else {
+                    state.current_nick.as_str()
+                }
+            );
+        }
         state.current_nick = srv_nick.to_string();
         state.current_nick_ts = now();
         if state.hub_connected && state.hub_authenticated {

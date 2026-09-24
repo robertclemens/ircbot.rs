@@ -183,7 +183,11 @@ fn tree_prefix(depth: i32, last_at: &[bool], is_last: bool, has_kids: bool) -> S
     out
 }
 
-fn bots_tree_row(state: &BotState, i: usize, last_at: &mut [bool; 10]) -> BotsRow {
+fn bots_tree_row(
+    state: &BotState,
+    i: usize,
+    last_at: &mut [bool; MAX_TREE_DEPTH as usize + 1],
+) -> BotsRow {
     let r = &state.bot_tree[i];
     let is_last = tree_is_last(state, i);
     if r.depth >= 0 && (r.depth as usize) < last_at.len() {
@@ -1063,23 +1067,52 @@ fn admin_command(
         }
         "setlog" => {
             let Some(arg1) = a.a1 else {
-                say(
+                let cap = state.log.max_size;
+                ircf!(
                     state,
+                    "PRIVMSG {} :Syntax: setlog <loglevel> [maxbytes] :: LOGLEVELS: 0=NONE,15=INFO,63=DEBUG :: log file is {} bytes max\r\n",
                     nick,
-                    "Syntax: setlog <loglevel> :: LOGLEVELS: 0=NONE,15=INFO,63=DEBUG",
+                    cap
                 );
                 return;
             };
-            if arg1.bytes().all(|c| c.is_ascii_digit()) {
+            // Digits only: the level is a 6-bit mask, the size a byte count.
+            let digits = |s: &str, max: usize| {
+                !s.is_empty() && s.len() <= max && s.bytes().all(|c| c.is_ascii_digit())
+            };
+            let size = match a.a2 {
+                None => Some(state.log.max_size),
+                Some(s) if digits(s, 10) => s.parse::<u64>().ok(),
+                Some(_) => None,
+            };
+            if !digits(arg1, 2) || atoi(arg1) as u32 > DEFAULT_LOG_LEVEL {
+                ircf!(
+                    state,
+                    "PRIVMSG {} :Invalid log level. Give a mask from 0 to {}.\r\n",
+                    nick,
+                    DEFAULT_LOG_LEVEL
+                );
+            } else if let Some(sz) =
+                size.filter(|v| (BOT_LOG_SIZE_MIN..=BOT_LOG_SIZE_MAX).contains(v))
+            {
                 let lvl = atoi(arg1);
                 state.log.level = lvl as u32;
-                ircf!(state, "PRIVMSG {} :Log level set to {}.\r\n", nick, lvl);
+                state.log.max_size = sz;
+                ircf!(
+                    state,
+                    "PRIVMSG {} :Log level set to {}, log file {} bytes max.\r\n",
+                    nick,
+                    lvl,
+                    sz
+                );
                 config::write_with_state_pass(state);
             } else {
-                say(
+                ircf!(
                     state,
+                    "PRIVMSG {} :Invalid log size. Give bytes from {} to {}.\r\n",
                     nick,
-                    "Invalid log level. Please provide a valid integer.",
+                    BOT_LOG_SIZE_MIN,
+                    BOT_LOG_SIZE_MAX
                 );
             }
         }
@@ -2369,7 +2402,7 @@ fn cmd_bots(state: &mut BotState, nick: &str, a: Args<'_>) {
     let cap = reply_row_cap(state);
     let mut rows_omitted = 0;
     for pass in 0..2 {
-        let mut last_at = [false; 10];
+        let mut last_at = [false; MAX_TREE_DEPTH as usize + 1];
         let mut shown = 0usize;
         if have_tree {
             for i in 0..state.bot_tree.len() {
@@ -2571,10 +2604,8 @@ fn cmd_add_hub(state: &mut BotState, nick: &str, a: Args<'_>) {
         );
         return;
     }
-    if state.hubs.len() >= MAX_SERVERS {
-        say(state, nick, "Error: Hub list is full.");
-        return;
-    }
+    // The key is validated before the capacity check, so a malformed key is
+    // named as such even on a full list.
     let Some(dec) = crypto::b64_decode(key).filter(|d| d.len() == 32 || d.len() == HUB_KEY_RAW_LEN)
     else {
         say(
@@ -2584,6 +2615,10 @@ fn cmd_add_hub(state: &mut BotState, nick: &str, a: Args<'_>) {
         );
         return;
     };
+    if state.hubs.len() >= MAX_SERVERS {
+        say(state, nick, "Error: Hub list is full.");
+        return;
+    }
     let mut ed_pub = [0u8; 32];
     ed_pub.copy_from_slice(&dec[..32]);
     state.hubs.push(crate::state::HubEntry {
@@ -2855,7 +2890,7 @@ fn admin_help(state: &mut BotState, nick: &str, topic: Option<&str>) {
         }
         "saveconf" => "Syntax: saveconf - Immediately save config file.",
         "setlog" => {
-            "Syntax: setlog <loglevel> - Set loglevel for output to a log file. 0=NONE,15=INFO,63=DEBUG."
+            "Syntax: setlog <loglevel> [maxbytes] - Set loglevel for output to a log file, and optionally its size cap. 0=NONE,15=INFO,63=DEBUG."
         }
         "getlog" => {
             ircf!(

@@ -600,6 +600,11 @@ fn main() {
     logging::install_panic_hook();
 
     let args: Vec<String> = std::env::args().collect();
+    // -checkupdate [variant]: verify the release channel and exit; needs no
+    // config, no password and no PID lock.
+    if let Some(i) = args.iter().skip(1).position(|a| a == "-checkupdate") {
+        std::process::exit(updater::check_cli(args.get(i + 2).map(String::as_str)));
+    }
     let do_setup = args.iter().skip(1).any(|a| a == "-setup");
     let do_passfile = args.iter().skip(1).any(|a| a == "-p");
 

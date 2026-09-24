@@ -405,6 +405,10 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
                 }
             }
             b'l' => state.log.level = crate::cstr::atoi(data) as u32,
+            b'L' => {
+                let cap = data.trim().parse::<u64>().unwrap_or(0);
+                state.log.max_size = cap.clamp(BOT_LOG_SIZE_MIN, BOT_LOG_SIZE_MAX);
+            }
             b'u' => state.user = trunc_string(data, 64),
             b'g' => state.gecos = trunc_string(data, 128),
             b'v' => state.vhost = trunc_string(data, 128),
@@ -762,6 +766,9 @@ fn serialize(state: &BotState) -> Option<Zeroizing<String>> {
     }
     if state.log.level != DEFAULT_LOG_LEVEL {
         push(&format!("l|{}\n", state.log.level as i32));
+    }
+    if state.log.max_size != BOT_LOG_FILE_SIZE {
+        push(&format!("L|{}\n", state.log.max_size));
     }
     push(&format!("u|{}\n", state.user));
     push(&format!("g|{}\n", state.gecos));

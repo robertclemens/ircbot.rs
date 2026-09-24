@@ -234,11 +234,8 @@ fn fetch_verified_manifest() -> Result<String, &'static str> {
     if pubkey_b64.is_empty() {
         return Err("self-updater disabled (no signing key configured)");
     }
-    let pub_key = crypto::b64_decode(&pubkey_b64)
-        .filter(|p| p.len() == 32)
+    let pk = crypto::update_pubkey_b64_decode(&pubkey_b64)
         .ok_or("configured update public key is malformed")?;
-    let mut pk = [0u8; 32];
-    pk.copy_from_slice(&pub_key);
     let (man_url, sig_url) = match &base {
         Some(b) => (format!("{b}/releases.txt"), format!("{b}/releases.sig")),
         None => (BOT_UPDATE_URL.to_string(), BOT_UPDATE_SIG_URL.to_string()),
@@ -300,6 +297,53 @@ fn check_dependency(dep: &str) -> bool {
 }
 
 /// `update`: list the signed releases newer than this build.
+/// `ircbot -checkupdate [variant]`: fetch the release manifest and its
+/// signature exactly as a hub-driven upgrade does — the release tree
+/// `<base>/<variant>`, the compiled-in base and pinned key unless
+/// IRCBOT_UPDATE_BASE says otherwise — verify one against the other, and
+/// report.  Nothing past the manifest is downloaded and nothing is installed,
+/// so an operator (or the testnet) can prove a host reaches and trusts the
+/// real release channel — TLS, CA store, pinned key — without upgrading
+/// anything.  Returns the process exit code: 0 = verified.
+pub fn check_cli(variant: Option<&str>) -> i32 {
+    let want = variant.filter(|v| !v.is_empty()).unwrap_or(host_variant());
+    if want.len() > 7 || want.contains(['/', ';', '|', '&', '`', '$', ' ', '\t', '\r', '\n']) {
+        println!("checkupdate: FAIL malformed variant");
+        return 1;
+    }
+    if update_base().is_none() && !set_hub_update_base(&format!("{BOT_UPDATE_BASE}/{want}")) {
+        println!("checkupdate: FAIL could not record the release base");
+        return 1;
+    }
+    let base = update_base().unwrap_or_default();
+    let manifest = match fetch_verified_manifest() {
+        Ok(m) => m,
+        Err(e) => {
+            println!("checkupdate: FAIL {e} ({base})");
+            return 1;
+        }
+    };
+    let mut rows = 0;
+    let mut newest = String::new();
+    for line in manifest.lines() {
+        let Some(version) = line.split_whitespace().next() else {
+            continue;
+        };
+        if line.starts_with('#') {
+            continue;
+        }
+        rows += 1;
+        if newest.is_empty() || version_cmp(version, &newest) == std::cmp::Ordering::Greater {
+            newest = version.to_string();
+        }
+    }
+    println!(
+        "checkupdate: OK {want} manifest verified: {rows} release row(s), newest {}, running {BOT_VERSION}",
+        if newest.is_empty() { "-" } else { &newest }
+    );
+    0
+}
+
 pub fn check_for_updates(state: &mut BotState, nick: &str) {
     logm!(
         state,

@@ -363,6 +363,11 @@ pub struct BotState {
     pub upgrade_variant: String,
     pub upgrade_base: String,
     pub upgrade_prepared: i64,
+    /// The run whose build this process IS, from UPGRADE_MARKER_FILE when the
+    /// upgraded binary first reports in.  An ABORT rolls back to `<exe>.prev`
+    /// only for this run — `.prev` otherwise holds the build from before some
+    /// earlier, completed run, and a bot that refused a COMMIT never moved.
+    pub upgrade_installed_id: String,
 }
 
 impl BotState {
@@ -454,6 +459,7 @@ impl BotState {
             upgrade_variant: String::new(),
             upgrade_base: String::new(),
             upgrade_prepared: 0,
+            upgrade_installed_id: String::new(),
         }
     }
 

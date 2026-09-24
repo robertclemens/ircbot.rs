@@ -22,7 +22,11 @@ pub const PID_FILE: &str = ".ircbot.pid";
 pub const SALT_SIZE: usize = 16;
 pub const DEFAULT_LOG_LEVEL: u32 = 63;
 pub const LOGFILE: &str = ".ircbot.log";
+/// Default LOGFILE cap; the config's L|<bytes> line overrides it.
 pub const BOT_LOG_FILE_SIZE: u64 = 10 * 1024 * 1024;
+/// Bounds on L| ('setlog <level> <maxbytes>'): the hub's SET_LOG_SIZE range.
+pub const BOT_LOG_SIZE_MIN: u64 = 1024;
+pub const BOT_LOG_SIZE_MAX: u64 = 1024 * 1024 * 1024;
 /// Hand-off note written just before a hub-driven upgrade execs the new
 /// binary: the restarted process reads the upgrade id from here and
 /// answers CMD_UPGRADE_RESULT (bot.h UPGRADE_MARKER_FILE).
@@ -203,6 +207,10 @@ pub const UNBAN_MAX_REMOVALS: i32 = 6;
 
 // ---- Bot tree ('bots') ------------------------------------------------------------
 pub const MAX_BOT_TREE_ROWS: usize = 256;
+/// Deepest row we draw.  A hub hangs every hub further out beneath the hub
+/// that links to it, so a chain of N hubs is N levels deep (plus its bots);
+/// a deeper row is drawn at this depth rather than dropped.
+pub const MAX_TREE_DEPTH: i32 = 32;
 pub const TREE_VERSION_MAX: usize = 15;
 /// "c" / "rs" -- the code base a node runs (bot_tree_row_t.variant).
 pub const TREE_VARIANT_MAX: usize = 7;

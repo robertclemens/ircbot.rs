@@ -342,6 +342,7 @@ pub fn report_upgrade_result(state: &mut BotState) {
         return;
     };
     let ok = updater::version_cmp(BOT_VERSION, &want) == std::cmp::Ordering::Equal;
+    state.upgrade_installed_id = id.clone();
     logm!(
         state,
         L_INFO,
@@ -476,6 +477,20 @@ fn handle_upgrade_abort(state: &mut BotState, payload: &str) {
     logm!(state, L_INFO, "[UPGRADE] Abort {}: {}\n", id, reason);
     state.upgrade_id.clear();
     state.upgrade_prepared = 0;
+    // Only the run that installed the build we are running may take it back.
+    // A bot that refused the COMMIT (a bad hash, no .ircbot.pass) never moved,
+    // and its <exe>.prev is the build from before an earlier, completed run:
+    // rolling back to it would walk a healthy node off the mesh's version.
+    if id == "-" || id != state.upgrade_installed_id {
+        logm!(
+            state,
+            L_INFO,
+            "[UPGRADE] Abort {}: this bot is not running that run's build; nothing to roll back\n",
+            id
+        );
+        send_upgrade_result(state, &id, "aborted", "not moved by this run");
+        return;
+    }
     // A successful rollback execs; the hub sees the old version reappear.
     if !updater::hub_rollback(state, &reason) {
         send_upgrade_result(state, &id, "aborted", "nothing retained to roll back to");
@@ -542,9 +557,7 @@ fn process_tree(state: &mut BotState, payload: &str) {
         if row.name == "-" {
             row.name.clear();
         }
-        if !(0..=8).contains(&row.depth) {
-            row.depth = 0;
-        }
+        row.depth = row.depth.clamp(0, MAX_TREE_DEPTH);
         rows.push(row);
     }
     state.bot_tree = rows;
