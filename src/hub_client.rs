@@ -120,6 +120,56 @@ fn send_frame(state: &mut BotState, cmd: u8, payload: &[u8]) -> bool {
     send_raw(state, &frame)
 }
 
+/// Send every pending activity report (auth::mark_used) to the hub, chunked
+/// under MAX_BUFFER.  A record is cleared only once its frame went out; with
+/// no hub link they wait for the next authentication.
+pub fn send_activity(state: &mut BotState) {
+    if !state.hub_authenticated || state.hub.is_none() {
+        return;
+    }
+    let cap = MAX_BUFFER - 64;
+    let nu = state.user_records.len();
+    let total = nu + state.mask_records.len();
+    let mut buf = String::new();
+    let mut first = 0; // first record index in the current chunk
+    for i in 0..=total {
+        let line = if i < nu {
+            let u = &state.user_records[i];
+            (u.act_pending > 0).then(|| format!("a|{}|{}\n", u.uuid, u.act_pending))
+        } else if i < total {
+            let m = &state.mask_records[i - nu];
+            (m.act_pending > 0).then(|| format!("m|{}|{}|{}\n", m.uuid, m.mask, m.act_pending))
+        } else {
+            None
+        };
+        let w = line.as_ref().map_or(0, String::len);
+        // Flush when the chunk is full or at the end.
+        if !buf.is_empty() && (i == total || buf.len() + w > cap) {
+            if !send_frame(state, CMD_ACTIVITY, buf.as_bytes()) {
+                break;
+            }
+            for j in first..i {
+                if j < nu {
+                    state.user_records[j].act_pending = 0;
+                } else {
+                    state.mask_records[j - nu].act_pending = 0;
+                }
+            }
+            buf.clear();
+        }
+        if buf.is_empty() {
+            first = i;
+        }
+        if let Some(l) = line {
+            buf.push_str(&l);
+        }
+    }
+}
+
+pub fn send_activity_query(state: &mut BotState, payload: &str) -> bool {
+    send_frame(state, CMD_ACTIVITY_QUERY, payload.as_bytes())
+}
+
 /// "irchub-bot-challenge-v1|" uuid "|" hub_eph_pub challenge, signed.
 fn sign_challenge(state: &mut BotState, challenge: &[u8], hub_eph_pub: &[u8]) -> Option<[u8; 64]> {
     let (ed, _x) = bot_key_decode(state)?;
@@ -529,6 +579,11 @@ fn process_tree(state: &mut BotState, payload: &str) {
                 if n >= 7 && f[6] != "-" {
                     row.variant = trunc_string(f[6], TREE_VARIANT_MAX + 1);
                 }
+                // Then the absolute start time, which replaces the uptime.
+                if n >= 8 {
+                    row.started = atoll(f[7]);
+                    row.has_started = true;
+                }
             }
             'b' if n >= 6 => {
                 row.depth = atoi(f[0]);
@@ -543,6 +598,10 @@ fn process_tree(state: &mut BotState, payload: &str) {
                 row.uptime = atoll(f[5]);
                 if n >= 7 && f[6] != "-" {
                     row.variant = trunc_string(f[6], TREE_VARIANT_MAX + 1);
+                }
+                if n >= 8 {
+                    row.started = atoll(f[7]);
+                    row.has_started = true;
                 }
                 row.online = true;
             }
@@ -1447,6 +1506,7 @@ fn handle_response(state: &mut BotState, cmd: u8, payload: &str) {
             }
         }
         CMD_BOT_TREE => process_tree(state, payload),
+        CMD_ACTIVITY_REPLY => crate::commands::activity_reply(state, payload),
         CMD_CONFIG_PULL => logm!(state, L_INFO, "[HUB] Hub requested config sync\n"),
         CMD_CONFIG_DATA => {
             logm!(
@@ -2004,6 +2064,8 @@ fn handle_ack(state: &mut BotState, body: &[u8]) {
     // If this process is the product of a hub-driven upgrade, close that run
     // out now that there is a hub to tell.
     report_upgrade_result(state);
+    // Activity reports held while the hub was unreachable.
+    send_activity(state);
     if state.admin_delta_pending {
         // After the config push, so the hub already knows v|2.
         logm!(

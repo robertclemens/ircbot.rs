@@ -534,6 +534,7 @@ fn run_config_wizard() -> io::Result<()> {
                 is_active: true,
                 last_used: 0,
                 timestamp: t,
+                act_pending: 0,
             });
         }
     }
@@ -716,9 +717,12 @@ fn run(password: Zeroizing<String>, pid_file: fs::File) -> i32 {
     while state.status & S_DIE == 0 && !shutdown.load(Ordering::Relaxed) {
         irc_client::check_status(&mut state);
         channel::check_joins(&mut state);
+        commands::activity_tick(&mut state, now());
 
         // Debounced flush of last_seen / last_used (set on every successful
         // admin auth): at most once per CONFIG_WRITE_DEBOUNCE_S, local only.
+        // The times reach the hub as CMD_ACTIVITY instead, once per record per
+        // clock hour (auth::mark_used).
         let t = now();
         if state.config_dirty && t - state.last_config_write >= CONFIG_WRITE_DEBOUNCE_S {
             config::write_local_with_state_pass(&state);

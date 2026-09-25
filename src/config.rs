@@ -362,6 +362,7 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
                         last_seen: ul.last_seen,
                         timestamp: ul.timestamp,
                         last_auth_reply: 0,
+                        act_pending: 0,
                     });
                 } else {
                     // Pre-UUID shapes, tagged for migration; their password is
@@ -582,6 +583,7 @@ fn load_mask_line(state: &mut BotState, data: &str) {
                 is_active: f[2].starts_with("add"),
                 last_used: atoll(f[3]),
                 timestamp: atoll(f[4]),
+                act_pending: 0,
             });
         }
     } else {
@@ -606,6 +608,7 @@ fn load_mask_line(state: &mut BotState, data: &str) {
             is_active: op != "del",
             last_used: 0,
             timestamp: if ts > 0 { ts } else { now() },
+            act_pending: 0,
         });
     }
 }
@@ -671,6 +674,7 @@ fn migrate_legacy_records(state: &mut BotState) {
             is_active: m.is_active,
             last_used: 0,
             timestamp: m.timestamp,
+            act_pending: 0,
         });
     }
     for (i, u) in state.user_records.iter().enumerate() {
@@ -706,6 +710,7 @@ fn migrate_legacy_records(state: &mut BotState) {
                 is_active: u.is_active,
                 last_used: 0,
                 timestamp: ts,
+                act_pending: 0,
             });
         }
     }

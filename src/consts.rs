@@ -195,6 +195,28 @@ pub const CMD_UPGRADE_COMMIT: u8 = 0x60;
 pub const CMD_UPGRADE_RESULT: u8 = 0x61;
 pub const CMD_UPGRADE_ABORT: u8 = 0x62;
 
+// ---- Activity (last seen / last used), mirrors ircbot/bot.h + irchub/hub.h.
+// last_seen / last_used are max-merged outside LWW.  auth::mark_used stores
+// the exact time and, on a record's first use within an ACTIVITY_BUCKET (a
+// clock hour), reports that time to the hub as CMD_ACTIVITY; with no hub link
+// the latest such time waits per record and goes out after the next hub
+// authentication.  admins / opers / match ask the hub for the network-wide
+// times (CMD_ACTIVITY_QUERY), park the command for up to
+// ACTIVITY_QUERY_TIMEOUT seconds, and show max(hub, local) per row; with no
+// hub or no answer they show the local times.
+//   CMD_ACTIVITY        a|<user_uuid>|<ts>  /  m|<user_uuid>|<mask>|<ts>
+//   CMD_ACTIVITY_QUERY  <req_id>|users  /  <req_id>|masks|<user_uuid or *>
+//   CMD_ACTIVITY_REPLY  <req_id>|<more>, then a|/m| lines; more=0 last
+pub const CMD_ACTIVITY: u8 = 0x69;
+pub const CMD_ACTIVITY_QUERY: u8 = 0x6A;
+pub const CMD_ACTIVITY_REPLY: u8 = 0x6B;
+pub const ACTIVITY_BUCKET: i64 = 3600;
+/// Hub times further ahead than this are refused.
+pub const ACTIVITY_MAX_FUTURE: i64 = 300;
+pub const ACTIVITY_QUERY_TIMEOUT: i64 = 3;
+pub const MAX_ACTIVITY_QUERIES: usize = 4;
+pub const ACTIVITY_REQ_ID_MAX: usize = 32;
+
 // ---- Channel-access requests (unban / invite / key) -----------------------------
 pub const CHAN_REQUEST_MIN_INTERVAL: i64 = 5;
 pub const CHAN_REQUEST_RETRY_TIME: i64 = 60;

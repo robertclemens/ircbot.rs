@@ -20,8 +20,8 @@ use crate::consts::*;
 use crate::crypto::{self, Key32};
 use crate::cstr::{Tok, atoi, display_width, eq_ic, now, pad_right, trunc, trunc_string};
 use crate::state::{
-    A2rCtx, BotState, ChanStatus, MaskRecord, S_CONNECTED, S_DIE, TrustedBot, UserRecord,
-    has_control_bytes, is_rfc_nick, is_valid_bot_nick, lww_next_ts,
+    A2rCtx, ActivityQuery, ActqKind, BotState, ChanStatus, MaskRecord, S_CONNECTED, S_DIE,
+    TrustedBot, UserRecord, has_control_bytes, is_rfc_nick, is_valid_bot_nick, lww_next_ts,
 };
 use crate::{auth, bot_comms, channel, config, dcc, hub_client, irc_client, ircf, logm, updater};
 
@@ -209,15 +209,23 @@ fn bots_tree_row(
     } else {
         r.name.clone()
     };
-    let age = (now() - state.bot_tree_ts).max(0);
+    // A hub that sends the node's start time leaves the uptime to us (a
+    // clock skew past it is "-", not a negative).  An older hub stamped the
+    // uptime when it pushed, so a live node has been up that much longer by
+    // now.  An unlinked hub has no uptime at all.
+    let t = now();
+    let age = (t - state.bot_tree_ts).max(0);
+    let up = if r.kind == 'h' && !r.online {
+        0
+    } else if r.has_started {
+        if r.started > 0 { t - r.started } else { 0 }
+    } else {
+        r.uptime + age
+    };
     BotsRow {
         name: format!("{prefix}{}", trunc(&label, TREE_NAME_MAX + 32)),
         version: bots_fmt_version(&r.version, &r.variant),
-        uptime: tree_fmt_uptime(if r.kind == 'h' && !r.online {
-            0
-        } else {
-            r.uptime + age
-        }),
+        uptime: tree_fmt_uptime(up),
         server: if r.kind == 'h' {
             "(hub)".into()
         } else if r.server.is_empty() {
@@ -1117,9 +1125,12 @@ fn admin_command(
             }
         }
         "getlog" => cmd_getlog(state, nick, a),
-        "admins" => cmd_list_users(state, nick, 'a'),
-        "opers" => cmd_list_users(state, nick, 'o'),
-        "match" => cmd_match(state, nick, a),
+        "admins" => activity_run(state, nick, ActqKind::Admins, ""),
+        "opers" => activity_run(state, nick, ActqKind::Opers, ""),
+        "match" => match a.a1 {
+            Some(arg1) => activity_run(state, nick, ActqKind::Match, arg1),
+            None => say(state, nick, "Syntax: match <name|*>"),
+        },
         "+admin" | "+oper" => cmd_add_user(state, nick, cmd == "+admin", a),
         "-admin" | "-oper" => cmd_del_user(state, nick, if cmd == "-admin" { 'a' } else { 'o' }, a),
         "+usermask" => cmd_add_usermask(state, nick, a),
@@ -1986,6 +1997,172 @@ fn cmd_getlog(state: &mut BotState, nick: &str, a: Args<'_>) {
     );
 }
 
+// ---- admins / opers / match: network-wide activity -----------------------------
+// The command asks the hub for its last-seen / last-used times
+// (CMD_ACTIVITY_QUERY) and is parked until the answer, or
+// ACTIVITY_QUERY_TIMEOUT, whichever comes first; the IRC loop keeps running
+// meanwhile.  The hub's times are max-merged into the local records, so every
+// row shows max(hub, local); with no hub or no answer, the local times.
+
+fn activity_render(state: &mut BotState, nick: &str, kind: ActqKind, arg: &str) {
+    match kind {
+        ActqKind::Match => cmd_match(state, nick, arg),
+        ActqKind::Admins => cmd_list_users(state, nick, 'a'),
+        ActqKind::Opers => cmd_list_users(state, nick, 'o'),
+    }
+}
+
+/// Ask the hub and park the command.  False when it must be answered now:
+/// no hub, no free slot, or nothing the hub could add.
+fn activity_park(state: &mut BotState, nick: &str, kind: ActqKind, arg: &str) -> bool {
+    if !state.hub_authenticated
+        || state.hub.is_none()
+        || state.activity_queries.len() >= MAX_ACTIVITY_QUERIES
+        || nick.len() >= A2_NICK_MAX
+        || arg.len() >= 64
+    {
+        return false;
+    }
+    let what = match kind {
+        ActqKind::Admins | ActqKind::Opers => "users".to_string(),
+        ActqKind::Match if arg == "*" => "masks|*".to_string(),
+        ActqKind::Match => {
+            // A trusted bot, or unknown: local only.
+            let Some(u) = state
+                .user_records
+                .iter()
+                .find(|u| u.is_active && eq_ic(&u.name, arg))
+            else {
+                return false;
+            };
+            format!("masks|{}", u.uuid)
+        }
+    };
+    let mut rnd = [0u8; 8];
+    if !crypto::random_bytes(&mut rnd) {
+        return false;
+    }
+    let id: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
+    if !hub_client::send_activity_query(state, &format!("{id}|{what}")) {
+        return false;
+    }
+    // A ~A2S command's reply key; wiped when the command is answered.
+    let a2r = A2rCtx {
+        active: state.a2r.active,
+        key: state.a2r.key.clone(),
+        aad: state.a2r.aad.clone(),
+        nick: state.a2r.nick.clone(),
+        seq: state.a2r.seq,
+    };
+    let dcc = state.dcc_reply.map(|i| (i, state.dcc[i].dcc_token));
+    logm!(state, L_DEBUG, "[ACTIVITY] query {} sent ({})\n", id, what);
+    state.activity_queries.push(ActivityQuery {
+        id,
+        kind,
+        arg: arg.to_string(),
+        nick: nick.to_string(),
+        dcc,
+        a2r,
+        deadline: now() + ACTIVITY_QUERY_TIMEOUT,
+    });
+    true
+}
+
+fn activity_run(state: &mut BotState, nick: &str, kind: ActqKind, arg: &str) {
+    if !activity_park(state, nick, kind, arg) {
+        activity_render(state, nick, kind, arg);
+    }
+}
+
+/// Answer a parked command in the context it arrived in, then drop it (its
+/// reply key is zeroized on drop).  A command from a DCC chat that has
+/// closed since is dropped unanswered.
+fn activity_finish(state: &mut BotState, q: ActivityQuery) {
+    let dcc_gone = q.dcc.is_some_and(|(i, tok)| {
+        state.dcc[i].phase != dcc::DccPhase::Open || state.dcc[i].dcc_token != tok
+    });
+    if dcc_gone {
+        return;
+    }
+    let saved_a2r = std::mem::replace(&mut state.a2r, q.a2r);
+    let saved_dcc = std::mem::replace(&mut state.dcc_reply, q.dcc.map(|(i, _)| i));
+    activity_render(state, &q.nick, q.kind, &q.arg);
+    state.a2r = saved_a2r;
+    state.dcc_reply = saved_dcc;
+}
+
+/// Max-merge one hub-reported time into a local one (in memory only: the
+/// next config flush persists it along with anything else).
+fn activity_merge(slot: &mut i64, ts_s: &str, t: i64) {
+    let Ok(ts) = ts_s.parse::<i64>() else { return };
+    if ts > 0 && ts <= t + ACTIVITY_MAX_FUTURE && ts > *slot {
+        *slot = ts;
+    }
+}
+
+/// CMD_ACTIVITY_REPLY: `<req_id>|<more>` then `a|uuid|ts` / `m|uuid|mask|ts`.
+pub fn activity_reply(state: &mut BotState, payload: &str) {
+    let mut lines = payload.split('\n');
+    let Some((id, more)) = lines.next().and_then(|h| h.split_once('|')) else {
+        return;
+    };
+    let more = more != "0";
+    if id.len() > ACTIVITY_REQ_ID_MAX {
+        return;
+    }
+    let Some(qi) = state.activity_queries.iter().position(|q| q.id == id) else {
+        return; // timed out already, or not ours
+    };
+    let t = now();
+    for line in lines {
+        // uuid is field 1; the time is always the last field, so a mask may
+        // hold a '|' of its own.
+        let b = line.as_bytes();
+        let Some(last) = line.rfind('|') else {
+            continue;
+        };
+        if b.len() < 2 + 36 + 2 || b[1] != b'|' || last < 2 + 36 {
+            continue;
+        }
+        let Some(uuid) = line.get(2..38) else {
+            continue;
+        };
+        let ts = &line[last + 1..];
+        if b[0] == b'a' && last == 38 {
+            for u in state.user_records.iter_mut().filter(|u| u.uuid == uuid) {
+                activity_merge(&mut u.last_seen, ts, t);
+            }
+        } else if b[0] == b'm' && b[38] == b'|' && last > 39 {
+            let mask = &line[39..last];
+            for m in state
+                .mask_records
+                .iter_mut()
+                .filter(|m| m.uuid == uuid && eq_ic(&m.mask, mask))
+            {
+                activity_merge(&mut m.last_used, ts, t);
+            }
+        }
+    }
+    if !more {
+        let q = state.activity_queries.remove(qi);
+        activity_finish(state, q);
+    }
+}
+
+/// Answer, from local times, every parked command the hub did not.
+pub fn activity_tick(state: &mut BotState, t: i64) {
+    while let Some(qi) = state.activity_queries.iter().position(|q| t >= q.deadline) {
+        let q = state.activity_queries.remove(qi);
+        logm!(
+            state,
+            L_DEBUG,
+            "[ACTIVITY] query {}: no hub answer, showing local times\n",
+            q.id
+        );
+        activity_finish(state, q);
+    }
+}
+
 fn cmd_list_users(state: &mut BotState, nick: &str, typ: char) {
     let what = if typ == 'a' { "admins" } else { "opers" };
     let name_w = state
@@ -2034,11 +2211,7 @@ fn cmd_list_users(state: &mut BotState, nick: &str, typ: char) {
     say(state, nick, FOOT);
 }
 
-fn cmd_match(state: &mut BotState, nick: &str, a: Args<'_>) {
-    let Some(arg1) = a.a1 else {
-        say(state, nick, "Syntax: match <name|*>");
-        return;
-    };
+fn cmd_match(state: &mut BotState, nick: &str, arg1: &str) {
     let all = arg1 == "*";
     ircf!(
         state,
@@ -2217,6 +2390,7 @@ fn cmd_add_user(state: &mut BotState, nick: &str, add_admin: bool, a: Args<'_>) 
         is_active: true,
         last_used: 0,
         timestamp: now,
+        act_pending: 0,
     });
     config::write_with_state_pass(state);
     hub_client::push_admin_delta(state);
@@ -2320,6 +2494,7 @@ fn cmd_add_usermask(state: &mut BotState, nick: &str, a: Args<'_>) {
             is_active: true,
             last_used: 0,
             timestamp: now(),
+            act_pending: 0,
         });
     }
     config::write_with_state_pass(state);

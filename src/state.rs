@@ -68,6 +68,8 @@ pub struct UserRecord {
     pub timestamp: i64,
     /// Runtime only: ~A2K rate limit.
     pub last_auth_reply: i64,
+    /// Runtime only: CMD_ACTIVITY time not yet sent.
+    pub act_pending: i64,
 }
 
 /// A parsed a|/o| line body.  `legacy` is true when field 3 carried a
@@ -120,6 +122,8 @@ pub struct MaskRecord {
     pub is_active: bool,
     pub last_used: i64,
     pub timestamp: i64,
+    /// Runtime only: CMD_ACTIVITY time not yet sent.
+    pub act_pending: i64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -172,6 +176,10 @@ pub struct BotTreeRow {
     pub variant: String,
     pub server: String,
     pub uptime: i64,
+    /// Absolute start time, 0 = unknown.
+    pub started: i64,
+    /// The hub sent `started`: the uptime is ours to work out.
+    pub has_started: bool,
     pub online: bool,
 }
 
@@ -245,6 +253,29 @@ pub struct A2rCtx {
     pub seq: u64,
 }
 
+/// Which listing a parked activity query answers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ActqKind {
+    Admins,
+    Opers,
+    Match,
+}
+
+/// One admins / opers / match command parked on CMD_ACTIVITY_QUERY, with
+/// everything needed to answer it later: the asker, the DCC chat it came in
+/// on (slot + dcc_token, so a reused slot is not mistaken for it) and a ~A2S
+/// command's reply key (wiped as soon as the command is answered).
+pub struct ActivityQuery {
+    pub id: String,
+    pub kind: ActqKind,
+    /// match: the name, or "*".
+    pub arg: String,
+    pub nick: String,
+    pub dcc: Option<(usize, u32)>,
+    pub a2r: A2rCtx,
+    pub deadline: i64,
+}
+
 /// Hub handshake progress.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum HubAuthState {
@@ -308,6 +339,8 @@ pub struct BotState {
     /// its owner go down the chat instead of to IRC.
     pub dcc_reply: Option<usize>,
     pub a2r: A2rCtx,
+    /// admins / opers / match waiting on a CMD_ACTIVITY_REPLY (commands).
+    pub activity_queries: Vec<ActivityQuery>,
     pub recent_nonces: NonceCache,
     pub admin_nonces: NonceCache,
 
@@ -418,6 +451,7 @@ impl BotState {
                 .collect(),
             dcc_reply: None,
             a2r: A2rCtx::default(),
+            activity_queries: Vec::new(),
             recent_nonces: NonceCache::new(NONCE_CACHE_SIZE),
             admin_nonces: NonceCache::new(MAX_SEEN_HASHES),
             user_records: Vec::new(),

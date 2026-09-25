@@ -67,16 +67,30 @@ pub fn user_candidates(state: &BotState, user_host: &str) -> Vec<(usize, usize)>
     out
 }
 
+/// True when `now` opens a new ACTIVITY_BUCKET after `prev`: the first use
+/// within a clock hour, the only one reported to the hub.
+fn activity_new_bucket(prev: i64, now: i64) -> bool {
+    prev / ACTIVITY_BUCKET < now / ACTIVITY_BUCKET
+}
+
 /// Record a successful authentication; the debounced flush in main persists
-/// last_seen / last_used.
+/// last_seen / last_used.  The first use of a record within a clock hour is
+/// also reported to the hub (CMD_ACTIVITY), with this use's exact time.
 pub fn mark_used(state: &mut BotState, user: Option<usize>, mask_idx: Option<usize>, now: i64) {
     if let Some(u) = user.and_then(|u| state.user_records.get_mut(u)) {
+        if activity_new_bucket(u.last_seen, now) {
+            u.act_pending = now;
+        }
         u.last_seen = now;
     }
     if let Some(m) = mask_idx.and_then(|m| state.mask_records.get_mut(m)) {
+        if activity_new_bucket(m.last_used, now) {
+            m.act_pending = now;
+        }
         m.last_used = now;
     }
     state.config_dirty = true;
+    crate::hub_client::send_activity(state);
 }
 
 /// Drop a leading '~' from the ident of nick!ident@host: stored masks and
