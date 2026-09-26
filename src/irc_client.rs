@@ -182,6 +182,12 @@ impl ServerCertVerifier for AcceptAnyCert {
 fn tls_config() -> Option<Arc<ClientConfig>> {
     static CFG: OnceLock<Option<Arc<ClientConfig>>> = OnceLock::new();
     CFG.get_or_init(|| {
+        // graviola asserts its CPU features on the first handshake; on a CPU
+        // that lacks one, refuse TLS here (the connect fails and is logged)
+        // instead of letting that assert take the whole bot down.
+        if crate::updater::tls_cpu_missing().is_some() {
+            return None;
+        }
         // Also the process default, which is what ureq's rustls-no-provider
         // build reads for the updater's HTTPS fetches.
         let _ = rustls_graviola::default_provider().install_default();
@@ -901,11 +907,14 @@ pub fn connect(state: &mut BotState) {
                         logm!(state, L_INFO, "[INFO] Secure TLS connection established.\n");
                         established = Some((stream, Some(tls)));
                     }
-                    None => logm!(
-                        state,
-                        L_INFO,
-                        "[INFO] SSL handshake failed. Trying insecure.\n"
-                    ),
+                    None => match crate::updater::tls_unusable_reason() {
+                        Some(why) => logm!(state, L_INFO, "[INFO] No TLS: {}.\n", why),
+                        None => logm!(
+                            state,
+                            L_INFO,
+                            "[INFO] SSL handshake failed. Trying insecure.\n"
+                        ),
+                    },
                 }
             } else {
                 logm!(state, L_INFO, "[INFO] Insecure connection established.\n");

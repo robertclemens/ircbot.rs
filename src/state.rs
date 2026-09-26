@@ -401,6 +401,20 @@ pub struct BotState {
     /// only for this run — `.prev` otherwise holds the build from before some
     /// earlier, completed run, and a bot that refused a COMMIT never moved.
     pub upgrade_installed_id: String,
+    /// An upgrade's "ok" not sent yet: held until this bot is back in every
+    /// channel it held ops in before the restart, opped, or UPGRADE_OPS_WAIT
+    /// has passed (hub_client::upgrade_ready_tick).  Volatile.
+    pub upgrade_report: Option<UpgradeReport>,
+}
+
+/// A held upgrade "ok" (see BotState::upgrade_report).
+#[derive(Clone, Debug, Default)]
+pub struct UpgradeReport {
+    pub id: String,
+    /// Channels to be back in, opped, before reporting.
+    pub ops: Vec<String>,
+    /// When the restarted build first had a hub to report to.
+    pub since: i64,
 }
 
 impl BotState {
@@ -494,6 +508,7 @@ impl BotState {
             upgrade_base: String::new(),
             upgrade_prepared: 0,
             upgrade_installed_id: String::new(),
+            upgrade_report: None,
         }
     }
 

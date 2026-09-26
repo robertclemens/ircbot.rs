@@ -12,7 +12,7 @@ pub const BOT_NAME: &str = "ircbot.rs by trojanman";
 /// made against.
 pub const BOT_VERSION: &str = match option_env!("IRCBOT_VERSION") {
     Some(v) => v,
-    None => "2.4.4",
+    None => "2.4.5",
 };
 pub const PASS_FILE: &str = ".ircbot.pass"; // machine-bound password file
 pub const PBKDF2_ITERATIONS: u32 = 100_000;
@@ -36,6 +36,24 @@ pub const UPGRADE_MARKER_FILE: &str = ".ircbot.upgrade";
 pub const UPGRADE_PREV_SUFFIX: &str = ".prev";
 /// How long a CMD_UPGRADE_PREPARE stays commitable.
 pub const UPGRADE_PREPARE_TTL: i64 = 900;
+/// Per-transfer budget (seconds) for the manifest read a PREPARE answer
+/// makes: the bot serves nothing else while it blocks.
+pub const UPGRADE_QUICK_TIMEOUT: u64 = 8;
+/// The updater's ordinary transfer budget (seconds), COMMIT's download
+/// included (bot.h UPDATE_FETCH_TIMEOUT).
+pub const UPDATE_FETCH_TIMEOUT: u64 = 300;
+/// The upgrade script's startup watchdog: how long the new build's daemon
+/// has to be up before the script keeps it (bot.h UPGRADE_WATCH_SECS).
+pub const UPGRADE_WATCH_SECS: u32 = 20;
+/// After an upgrade restart the bot holds its "ok" until it is back in every
+/// channel it held ops in before, opped — at most this long (seconds), then
+/// it reports "ok" anyway with what is missing (bot.h UPGRADE_OPS_WAIT).
+pub const UPGRADE_OPS_WAIT: i64 = 180;
+/// The first bot version with `-selftest`: an older build would not know the
+/// flag and would start a second daemon instead (bot.h SELFTEST_MIN_BOT).
+pub const SELFTEST_MIN_BOT: &str = "2.4.5";
+/// How long a staged build's `-selftest` may run before it is killed.
+pub const SELFTEST_TIMEOUT: u64 = 15;
 /// The release tree ROOT; one variant subdirectory below it holds that build's
 /// manifest.  Keeping the root separate is what lets a hub-driven upgrade flip
 /// a node between the C and Rust builds: `updater::hub_commit` appends the

@@ -606,6 +606,12 @@ fn main() {
     if let Some(i) = args.iter().skip(1).position(|a| a == "-checkupdate") {
         std::process::exit(updater::check_cli(args.get(i + 2).map(String::as_str)));
     }
+    // -selftest: could this build run here?  Loads the config exactly as a
+    // start would, then exits — no daemon, no PID lock, no network.  A hub-
+    // driven upgrade runs the staged new build with it before swapping.
+    if args.iter().skip(1).any(|a| a == "-selftest") {
+        std::process::exit(selftest());
+    }
     let do_setup = args.iter().skip(1).any(|a| a == "-setup");
     let do_passfile = args.iter().skip(1).any(|a| a == "-p");
 
@@ -668,6 +674,39 @@ fn main() {
     };
     let code = run(password, pid_file);
     std::process::exit(code);
+}
+
+/// `ircbot -selftest`: prints `selftest: OK ircbot <version> <variant>` and
+/// returns 0, or `selftest: FAIL <reason>` and 1.  Never writes the config
+/// (config::READ_ONLY): the running build still owns it.
+fn selftest() -> i32 {
+    let fail = |why: &str| {
+        println!("selftest: FAIL {why}");
+        1
+    };
+    if let Some(why) = updater::tls_unusable_reason() {
+        return fail(&why);
+    }
+    if fs::metadata(CONFIG_FILE).is_err() {
+        return fail(&format!("no {CONFIG_FILE}"));
+    }
+    let Some(password) = passfile_load(PASS_FILE) else {
+        return fail(&format!("{PASS_FILE} missing or unreadable"));
+    };
+    let registry = match Poll::new().and_then(|p| p.registry().try_clone()) {
+        Ok(r) => r,
+        Err(e) => return fail(&format!("poll: {e}")),
+    };
+    let mut state = BotState::new(registry);
+    config::READ_ONLY.store(true, Ordering::Relaxed);
+    if !config::load(&mut state, &password, CONFIG_FILE) {
+        return fail("the config did not load (see the log)");
+    }
+    println!(
+        "selftest: OK ircbot {BOT_VERSION} {}",
+        updater::host_variant()
+    );
+    0
 }
 
 /// Load the config and run the poll loop until `die` or a signal.
@@ -734,6 +773,7 @@ fn run(password: Zeroizing<String>, pid_file: fs::File) -> i32 {
         if !state.hubs.is_empty() {
             hub_client::connect(&mut state);
             hub_client::heartbeat(&mut state);
+            hub_client::upgrade_ready_tick(&mut state);
         }
 
         match poll.poll(&mut events, Some(Duration::from_secs(1))) {

@@ -20,8 +20,8 @@ use crate::cstr::{
 };
 use crate::net::{self, ReadOutcome};
 use crate::state::{
-    BotState, BotTreeRow, ChanReq, ChanStatus, HubAuthState, MaskRecord, S_CONNECTED, UserRecord,
-    lww_accepts, opt_accepts,
+    BotState, BotTreeRow, ChanReq, ChanStatus, HubAuthState, MaskRecord, S_AUTHED, S_CONNECTED,
+    UserRecord, lww_accepts, opt_accepts,
 };
 use crate::{bot_comms, channel, config, ircf, logm, updater};
 
@@ -388,21 +388,115 @@ pub fn send_upgrade_result(state: &mut BotState, id: &str, status: &str, detail:
 /// was aiming at.  The hub also infers success from the presence frame, so a
 /// lost RESULT costs nothing.
 pub fn report_upgrade_result(state: &mut BotState) {
-    let Some((id, want)) = updater::take_pending_upgrade() else {
+    // A report already held (the hub link dropped and came back) keeps its
+    // clock; the tick sends it.
+    if state.upgrade_report.is_some() {
+        upgrade_ready_tick(state);
+        return;
+    }
+    let Some(p) = updater::take_pending_upgrade() else {
         return;
     };
-    let ok = updater::version_cmp(BOT_VERSION, &want) == std::cmp::Ordering::Equal;
-    state.upgrade_installed_id = id.clone();
+    let ok = updater::version_cmp(BOT_VERSION, &p.version) == std::cmp::Ordering::Equal
+        && (p.variant.is_empty() || p.variant == updater::host_variant());
+    state.upgrade_installed_id = p.id.clone();
+    let wanted = if p.variant.is_empty() {
+        p.version.clone()
+    } else {
+        format!("{}/{}", p.version, p.variant)
+    };
     logm!(
         state,
         L_INFO,
-        "[UPGRADE] Restarted after {}: running {} (wanted {})\n",
-        id,
+        "[UPGRADE] Restarted after {}: running {}/{} (wanted {})\n",
+        p.id,
         BOT_VERSION,
-        want
+        updater::host_variant(),
+        wanted
     );
-    let status = if ok { "ok" } else { "version-mismatch" };
-    send_upgrade_result(state, &id, status, if ok { "" } else { &want });
+    if !ok {
+        let detail = format!("wanted {wanted}");
+        send_upgrade_result(state, &p.id, "version-mismatch", &detail);
+        return;
+    }
+    // The build is right; "done" waits until this bot is back where it was —
+    // in every channel it held ops in, opped — so the hub's next wave never
+    // takes a channel's last ops away (Addendum A1).
+    // Same log lines as the C twin (the testnet reads them).
+    logm!(
+        state,
+        L_INFO,
+        "[UPGRADE] Reporting done once back{}{}\n",
+        if p.ops.is_empty() { " on IRC" } else { " and re-opped in " },
+        p.ops.join(" ")
+    );
+    state.upgrade_report = Some(crate::state::UpgradeReport {
+        id: p.id,
+        ops: p.ops,
+        since: now(),
+    });
+    upgrade_ready_tick(state);
+}
+
+/// Is this bot back where it was before an upgrade restart?  `Ok` when IRC
+/// is registered and every channel in `want_ops` is joined and opped; else
+/// the detail an "ok" sent at the cap carries.  `chans` is (name, joined,
+/// opped) for every channel the bot knows.
+pub fn ops_ready(
+    irc_registered: bool,
+    want_ops: &[String],
+    chans: &[(&str, bool, bool)],
+) -> Result<(), String> {
+    if !irc_registered {
+        return Err("back; IRC not reconnected".to_string());
+    }
+    let missing: Vec<&str> = want_ops
+        .iter()
+        .filter(|w| {
+            !chans
+                .iter()
+                .any(|(n, joined, opped)| n.eq_ignore_ascii_case(w) && *joined && *opped)
+        })
+        .map(String::as_str)
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("back; not re-opped in {}", missing.join(" ")))
+    }
+}
+
+/// Main-loop step: send a held upgrade "ok" once the bot is back in its
+/// channels with ops, or at UPGRADE_OPS_WAIT with what is still missing.
+pub fn upgrade_ready_tick(state: &mut BotState) {
+    let Some(rep) = state.upgrade_report.as_ref() else {
+        return;
+    };
+    if !state.hub_authenticated {
+        return;
+    }
+    let chans: Vec<(&str, bool, bool)> = state
+        .chans
+        .iter()
+        .map(|c| (c.name.as_str(), c.status == ChanStatus::In, c.i_am_opped))
+        .collect();
+    let ready = ops_ready(state.status & S_AUTHED != 0, &rep.ops, &chans);
+    let detail = match ready {
+        Ok(()) => String::new(),
+        Err(d) if now() - rep.since >= UPGRADE_OPS_WAIT => d,
+        Err(_) => return,
+    };
+    let id = rep.id.clone();
+    state.upgrade_report = None;
+    logm!(
+        state,
+        L_INFO,
+        "[UPGRADE] Reporting {} done{}{}\n",
+        id,
+        if detail.is_empty() { "" } else { ": " },
+        detail
+    );
+    send_upgrade_result(state, &id, "ok", &detail);
 }
 
 /// id|target_ver|variant|kind|min_from|manifest_base — the hub is asking
@@ -422,38 +516,12 @@ fn handle_upgrade_prepare(state: &mut BotState, payload: &str) {
     let min_from = f.get(4).copied().unwrap_or("");
     let base = f.get(5).copied().unwrap_or("");
 
-    let mut reason = "";
-    let ready = match updater::version_cmp(ver, BOT_VERSION) {
-        std::cmp::Ordering::Equal => {
-            reason = "already running the target version";
-            false
-        }
-        std::cmp::Ordering::Less => {
-            reason = "target is older than the running version";
-            false
-        }
-        std::cmp::Ordering::Greater => {
-            if !min_from.is_empty()
-                && min_from != "*"
-                && updater::version_cmp(BOT_VERSION, min_from) == std::cmp::Ordering::Less
-            {
-                // The hub walks the intermediate releases when it sees this.
-                reason = "running version is below the target's min_from";
-                false
-            } else if !std::path::Path::new(PASS_FILE).exists() {
-                // Without the machine-bound password file the replacement
-                // binary would stop at a prompt with nobody to answer it.
-                reason = "no .ircbot.pass; cannot restart unattended";
-                false
-            } else if !state.executable_path.starts_with('/') {
-                reason = "executable path is not absolute";
-                false
-            } else {
-                true
-            }
-        }
-    };
-
+    // Everything COMMIT will need is checked now — including the signed
+    // manifest for the wanted build and whether this CPU can fetch it — so a
+    // "ready" answer is one COMMIT can keep.
+    let check = updater::hub_prepare_check(state, ver, variant, min_from, base);
+    let ready = check.is_ok();
+    let reason = check.err().unwrap_or_default();
     if ready {
         // Remember the plan: COMMIT repeats only the id and the version.
         state.upgrade_id = id.to_string();
@@ -469,7 +537,22 @@ fn handle_upgrade_prepare(state: &mut BotState, payload: &str) {
     // The artifact kind is chosen from the manifest at COMMIT, so f[3] is
     // read for the wire format's sake and not used here.
     let id = id.to_string();
-    send_upgrade_ready(state, &id, ready, reason);
+    send_upgrade_ready(state, &id, ready, &reason);
+}
+
+/// A COMMIT refused because the RELEASE is bad — tampered, corrupt, the
+/// wrong product — is still answered "fail" although nothing here changed:
+/// every node would hit the same artifact, and the run must stop rather than
+/// retry it across the mesh.  Any other refusal is this bot's own: "skip".
+fn commit_err_is_integrity(err: &str) -> bool {
+    [
+        "SHA-256 mismatch",
+        "signature INVALID",
+        "is not a ircbot release",
+        "untrusted artifact URL",
+    ]
+    .iter()
+    .any(|m| err.contains(m))
 }
 
 /// id|target_ver|variant — go.  Only an id we acknowledged at PREPARE, and
@@ -483,17 +566,28 @@ fn handle_upgrade_commit(state: &mut BotState, payload: &str) {
     let (id, ver) = (f[0].to_string(), f[1].to_string());
     let variant = f.get(2).copied().unwrap_or("").to_string();
 
+    // Every refusal here touched nothing, so it is answered "skip": this bot
+    // stays healthy on its build and the driver takes it out of the run
+    // instead of aborting everyone else's upgrade.
     if state.upgrade_id.is_empty() || state.upgrade_id != id {
-        send_upgrade_result(state, &id, "fail", "no matching UPGRADE_PREPARE");
+        // No run state (restarted since PREPARE?).  Already on that build
+        // means the COMMIT's work is done.
+        let there = updater::version_cmp(BOT_VERSION, &ver) == std::cmp::Ordering::Equal
+            && (variant.is_empty() || variant == updater::host_variant());
+        if there {
+            send_upgrade_result(state, &id, "ok", "");
+        } else {
+            send_upgrade_result(state, &id, "skip", "no matching UPGRADE_PREPARE");
+        }
         return;
     }
     if state.upgrade_target != ver {
-        send_upgrade_result(state, &id, "fail", "commit version differs from prepare");
+        send_upgrade_result(state, &id, "skip", "commit version differs from prepare");
         return;
     }
     if now() - state.upgrade_prepared > UPGRADE_PREPARE_TTL {
         state.upgrade_id.clear();
-        send_upgrade_result(state, &id, "fail", "prepare expired");
+        send_upgrade_result(state, &id, "skip", "prepare expired");
         return;
     }
 
@@ -508,7 +602,12 @@ fn handle_upgrade_commit(state: &mut BotState, payload: &str) {
     if let Err(e) = updater::hub_commit(state, &id, &ver, &variant, &base) {
         // Nothing was changed on disk; stay on this build and say why.
         logm!(state, L_INFO, "[UPGRADE] Commit {} refused: {}\n", id, e);
-        send_upgrade_result(state, &id, "fail", &e);
+        let status = if commit_err_is_integrity(&e) {
+            "fail"
+        } else {
+            "skip"
+        };
+        send_upgrade_result(state, &id, status, &e);
         state.upgrade_id.clear();
     }
 }
@@ -2100,5 +2199,48 @@ mod tests {
             Some(("#a".into(), String::new(), 0, "add".into(), 8))
         );
         assert_eq!(parse_hub_chan("#a"), None);
+    }
+
+    /// The held upgrade "ok": ready only when IRC is back and every channel
+    /// opped in before the restart is joined and opped again (names compare
+    /// case-insensitively, as IRC does).
+    #[test]
+    fn upgrade_ops_ready() {
+        let want = vec!["#a".to_string(), "#B".to_string()];
+        assert_eq!(
+            ops_ready(false, &want, &[]),
+            Err("back; IRC not reconnected".into())
+        );
+        assert_eq!(ops_ready(true, &[], &[]), Ok(()));
+        assert_eq!(
+            ops_ready(true, &want, &[("#a", true, true), ("#b", true, false)]),
+            Err("back; not re-opped in #B".into())
+        );
+        assert_eq!(
+            ops_ready(true, &want, &[("#A", true, true)]),
+            Err("back; not re-opped in #B".into())
+        );
+        assert_eq!(
+            ops_ready(
+                true,
+                &want,
+                &[("#A", true, true), ("#b", true, true), ("#c", false, false)]
+            ),
+            Ok(())
+        );
+        // Opped but not joined (status reset on a part) is not back.
+        assert_eq!(
+            ops_ready(true, &want[..1], &[("#a", false, true)]),
+            Err("back; not re-opped in #a".into())
+        );
+    }
+
+    #[test]
+    fn integrity_errors_stay_fail() {
+        assert!(commit_err_is_integrity("artifact SHA-256 mismatch"));
+        assert!(!commit_err_is_integrity(
+            "new build failed its selftest: selftest: FAIL x"
+        ));
+        assert!(!commit_err_is_integrity("artifact download failed"));
     }
 }

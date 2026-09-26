@@ -278,6 +278,10 @@ fn decrypt_file(
     None
 }
 
+/// Set by `-selftest`: load() must not rewrite the file the running build
+/// owns, whatever migration it would otherwise do.
+pub static READ_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// config_load(): false when the file is missing, does not decrypt, or lacks
 /// a nick, server or ident.
 pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
@@ -542,12 +546,14 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
         );
     }
 
-    // Rewrite once if anything above changed the on-disk shape.
-    if needs_migration
-        || migrated_from_legacy
-        || legacy_user_lines > 0
-        || dropped_botpass
-        || identity_minted
+    // Rewrite once if anything above changed the on-disk shape — never from
+    // `-selftest`, which only asks whether this build could read it.
+    if !READ_ONLY.load(std::sync::atomic::Ordering::Relaxed)
+        && (needs_migration
+            || migrated_from_legacy
+            || legacy_user_lines > 0
+            || dropped_botpass
+            || identity_minted)
     {
         write(state, password);
     }
