@@ -61,6 +61,20 @@ sub cryptx_hint {
 #   /botcmd   <bot_nick> <command> [args...]   - auto-authenticates, then sends
 #   /botauth  <bot_nick>                       - drop the cached key, re-auth now
 #   /botforget <bot_nick>                      - drop the cached key (and pin)
+#   /botunlock                                 - enter the key's passphrase now
+#   /botlock                                   - forget the unlocked key now
+#
+# Passphrase-protected keys (keygen asks for one; irchub/docs/console.md §9):
+# the first /botcmd that needs the key asks for the passphrase and waits.
+# Type it and press Enter: the keys never reach the input line (it shows
+# stars) or its history, and nothing is sent (an empty line cancels; a pasted
+# line is taken too).  The key then stays unlocked for bot_auth_passwd_expire
+# from the unlock, then the script asks again:
+#   /set bot_auth_passwd_expire 6h    (default 1h; 0 = ask for every command;
+#                                      30m, 2d, a number of seconds, or never
+#                                      = until /botlock or /script unload)
+# Three wrong passphrases in a row lock the prompt for 30 s.  Changing
+# bot_auth_keyfile or bot_auth_passwd_expire locks the key.
 #
 # Sealed replies (on by default): commands go out as "~A2S <b64>", which asks
 # the bot to seal its answers too ("~A2R <b64>", only this command's sender
@@ -80,10 +94,10 @@ sub cryptx_hint {
 # sent as typed), so the chat reads like any other.
 #
 # Compare a bot's key fingerprint (printed here on every successful auth)
-# against that bot's own 'status' output or hub_admin's bot list before
+# against that bot's own 'status' output or the hub console's 'bot list' before
 # trusting it for the first time.
 
-our $VERSION = '6.1.0';
+our $VERSION = '6.2.0';
 our %IRSSI = (
     authors     => 'rclemens',
     contact     => '',
@@ -115,22 +129,96 @@ sub fingerprint {
     return join(':', $hex =~ /(....)/g);
 }
 
-# Load the combined Ed25519+X25519 private key from $path (first line,
-# standard base64 with padding, decoding to exactly 64 bytes: ed_priv(32) ||
-# x_priv(32)).  Returns a hashref { ed_priv, x_priv, ed_pub, x_pub, pub64,
-# warning }; dies with a one-line message on any failure.  `warning` is a
-# mode-permission message (or undef) — the caller decides how to show it.
-sub load_key {
+# irckey-v2 (a passphrase-protected .private.b64, irchub/docs/console.md §9):
+# "irckey-v2 scrypt <log2N> <r> <p> <salt> <nonce> <ct>".  Reader bounds as in
+# keygen: a hostile file costs at most 128 * r * N = 256 MB.
+use constant IRCKEY_TAG => 'irckey-v2';
+
+sub _b64_exact {
+    my ($text, $n) = @_;
+    die "malformed irckey-v2 line\n"
+        if length($text) != 4 * int(($n + 2) / 3) || $text !~ m{\A[A-Za-z0-9+/]+={0,2}\z};
+    my $raw = decode_base64($text);
+    die "malformed irckey-v2 line\n" if length($raw) != $n;
+    return $raw;
+}
+
+# The 64-byte private key inside an irckey-v2 line; dies on a malformed line,
+# out-of-range scrypt settings (checked before any work), a wrong passphrase
+# or any edit to the line.
+sub irckey_open {
+    my ($line, $pass) = @_;
+    die "malformed irckey-v2 line\n"
+        if length($line) >= 512 || $line =~ /  / || $line =~ / \z/;
+    my @f = split / /, $line, -1;
+    die "malformed irckey-v2 line\n"
+        if @f != 8 || $f[0] ne IRCKEY_TAG || $f[1] ne 'scrypt';
+    my @lim = ([14, 18], [1, 8], [1, 4]);
+    for my $i (0 .. 2) {
+        my $v = $f[2 + $i];
+        die "irckey-v2 scrypt settings out of range\n"
+            if $v !~ /\A\d{1,3}\z/ || $v < $lim[$i][0] || $v > $lim[$i][1];
+    }
+    my ($log2n, $r, $p) = @f[2 .. 4];
+    my $salt  = _b64_exact($f[5], 16);
+    my $nonce = _b64_exact($f[6], 12);
+    my $ct    = _b64_exact($f[7], 80);
+    my $aad   = substr($line, 0, rindex($line, ' '));
+    my $key = Crypt::KeyDerivation::scrypt_pbkdf($pass, $salt, 1 << $log2n, $r, $p, 32);
+    my ($body, $tag) = (substr($ct, 0, 64), substr($ct, 64));   # plain scalars for the XS
+    my $pt = eval { Crypt::AuthEnc::GCM::gcm_decrypt_verify('AES', $key, $nonce, $aad,
+                                                             $body, $tag) };
+    substr($key, 0, 32, "\0" x 32);
+    die "wrong passphrase (or a damaged key file)\n" if !defined $pt || length($pt) != 64;
+    return $pt;
+}
+
+# True if the keyfile at $path is an irckey-v2 (passphrase) key.
+sub key_is_protected {
     my ($path) = @_;
     open(my $fh, '<', $path) or die "keyfile '$path': $!\n";
     my $line = <$fh>;
     close($fh);
-    die "keyfile '$path' is empty\n" if !defined $line;
-    $line =~ s/^\s+|\s+$//g;
-    die "keyfile '$path' is empty\n" if !length $line;
+    return defined $line && index($line, IRCKEY_TAG . ' ') == 0;
+}
 
-    my $raw = eval { decode_base64($line) };
-    die "keyfile '$path': invalid base64\n" if !defined $raw || !length $raw;
+# bot_auth_passwd_expire: "1h", "30m", "90s", "2d", "3600" -> seconds;
+# "never" -> -1; undef if unreadable.  0 = ask for every command.
+sub parse_expire {
+    my ($t) = @_;
+    $t = lc($t // '');
+    $t =~ s/^\s+|\s+$//g;
+    return -1 if $t eq 'never';
+    return undef unless $t =~ /\A(\d{1,12})([smhd]?)\z/;
+    my $secs = $1 * { '' => 1, s => 1, m => 60, h => 3600, d => 86400 }->{$2};
+    return $secs <= 366 * 86400 ? $secs : undef;
+}
+
+# Load the combined Ed25519+X25519 private key from $path: the plain first
+# line (standard base64 with padding, decoding to exactly 64 bytes:
+# ed_priv(32) || x_priv(32)), or an irckey-v2 line opened with $pass (dies
+# "locked" without one).  Returns a hashref { ed_priv, x_priv, ed_pub, x_pub,
+# pub64, warning, plain }; dies with a one-line message on any failure.
+# `warning` is a mode-permission message (or undef) — the caller decides how
+# to show it; `plain` is true for a key without a passphrase.
+sub load_key {
+    my ($path, $pass) = @_;
+    open(my $fh, '<', $path) or die "keyfile '$path': $!\n";
+    my $line = <$fh>;
+    close($fh);
+    die "keyfile '$path' is empty\n" if !defined $line;
+    my $plain = index($line, IRCKEY_TAG . ' ') != 0;
+    my $raw;
+    if ($plain) {
+        $line =~ s/^\s+|\s+$//g;
+        die "keyfile '$path' is empty\n" if !length $line;
+        $raw = eval { decode_base64($line) };
+        die "keyfile '$path': invalid base64\n" if !defined $raw || !length $raw;
+    } else {
+        die "locked\n" if !defined $pass;
+        $line =~ s/[\r\n]+\z//;
+        $raw = irckey_open($line, $pass);
+    }
     die "keyfile '$path': decoded key must be 64 bytes, got " . length($raw) . "\n"
         if length($raw) != 64;
 
@@ -163,6 +251,7 @@ sub load_key {
         x_pub   => $x_pub,
         pub64   => $pub64,
         warning => $warning,
+        plain   => $plain,
     };
 }
 
@@ -390,16 +479,240 @@ sub _expire_pending {
     }
 }
 
+use constant PASSWD_EXPIRE_DEFAULT => 3600;
+use constant PASS_MAX       => 1024;  # passphrase bytes, as keygen
+use constant PROMPT_TIMEOUT => 120;   # seconds the passphrase prompt waits
+use constant FAIL_LIMIT     => 3;     # wrong passphrases before the prompt pauses
+use constant FAIL_PAUSE     => 30;    # seconds of that pause
+use constant LOCKED         => 'locked';  # _load_key() error: ask for the passphrase
+
+# The unlocked passphrase-protected key: { key, path, until (undef = never),
+# once (passwd_expire 0: lock after this command) }.  Locking wipes the key.
+our %UNLOCKED;
+# The passphrase prompt while it waits: { path, t, typed => [chars], esc
+# (inside an escape sequence), pending => [...] }.
+our %CAPTURE;
+our %FAILS = (n => 0, until => 0);
+our %WARNED;      # keyfiles already warned about having no passphrase
+our %SETTINGS_SEEN;
+
+# The input line (Irssi::TextUI; absent under a test stub).
+sub _input_set {
+    my ($t) = @_;
+    Irssi::gui_input_set($t) if defined &Irssi::gui_input_set;
+}
+
+sub _wipe_key {
+    my ($k) = @_;
+    return if !$k;
+    for (qw(ed_priv x_priv)) {
+        substr($k->{$_}, 0, length $k->{$_}, "\0" x length $k->{$_}) if defined $k->{$_};
+    }
+}
+
+sub _lock {
+    my ($why) = @_;
+    my $had = %UNLOCKED ? 1 : 0;
+    _wipe_key($UNLOCKED{key});
+    %UNLOCKED = ();
+    Irssi::print("bot_auth: $why") if $had && defined $why;
+}
+
+sub _expire_secs {
+    my $v = Irssi::settings_get_str('bot_auth_passwd_expire');
+    my $secs = parse_expire($v);
+    if (!defined $secs) {
+        Irssi::print("bot_auth: bot_auth_passwd_expire '$v' is not e.g. 30m, 1h, 6h, 1d, "
+                   . '0 or never; using 1h');
+        return PASSWD_EXPIRE_DEFAULT;
+    }
+    return $secs;
+}
+
 sub _load_key {
     my $path = Irssi::settings_get_str('bot_auth_keyfile');
     return (undef, 'no keyfile set — /set bot_auth_keyfile <path>')
         if !defined $path || !length $path;
+    my $prot = eval { key_is_protected($path) };
+    if ($@) {
+        (my $e = $@) =~ s/\n\z//;
+        return (undef, "keyfile error: $e");
+    }
+    if ($prot) {
+        return ($UNLOCKED{key}, undef)
+            if %UNLOCKED && $UNLOCKED{path} eq $path
+            && (!defined $UNLOCKED{until} || time() < $UNLOCKED{until});
+        _lock(%UNLOCKED ? 'key locked again (passwd_expire)' : undef);
+        return (undef, LOCKED);
+    }
     my $key = eval { load_key($path) };
     if ($@) {
         (my $e = $@) =~ s/\n\z//;
         return (undef, "keyfile error: $e");
     }
+    if (!$WARNED{$path}++) {
+        Irssi::print("bot_auth: keyfile '$path' has no passphrase — add one with: "
+                   . "keygen --passwd $path");
+    }
     return ($key, undef);
+}
+
+# passwd_expire 0: lock once nothing more is waiting for the key.
+sub _used_once {
+    _lock() if $UNLOCKED{once} && !%PENDING && !%CAPTURE;
+}
+
+# Arm the passphrase prompt; $pending (a /botcmd's server tag, bot and
+# command) runs after a successful unlock.
+sub _ask_passphrase {
+    my ($pending) = @_;
+    my $path = Irssi::settings_get_str('bot_auth_keyfile');
+    my $now  = time();
+    if ($now < $FAILS{until}) {
+        return Irssi::print('bot_auth: too many wrong passphrases; try again in '
+                          . ($FAILS{until} - $now + 1) . ' s.');
+    }
+    if (%CAPTURE) {
+        push @{ $CAPTURE{pending} }, $pending
+            if $pending && @{ $CAPTURE{pending} } < MAX_QUEUE;
+        return Irssi::print('bot_auth: still waiting for the passphrase (an empty line cancels).');
+    }
+    %CAPTURE = (path => $path, t => $now, typed => [], esc => 0,
+                pending => [$pending ? $pending : ()]);
+    _input_set('');
+    Irssi::print("bot_auth: passphrase for $path: type it and press Enter — it never "
+               . 'reaches the input line or its history and is never sent (an empty '
+               . 'line cancels).');
+}
+
+# The prompt's state, the prompt closed and the input line cleared.
+sub _end_capture {
+    my %cap = %CAPTURE;
+    %CAPTURE = ();
+    _input_set('');
+    return \%cap;
+}
+
+sub _cancel_capture {
+    my ($why) = @_;
+    return if !%CAPTURE;
+    my $cap = _end_capture();
+    my $n = @{ $cap->{pending} };
+    $_ = "\0" for @{ $cap->{typed} };
+    Irssi::print("bot_auth: $why" . ($n ? "; dropped $n command(s)" : ''));
+}
+
+sub _try_unlock {
+    my ($cap) = @_;
+    my $pass = join('', @{ $cap->{typed} });
+    $_ = "\0" for @{ $cap->{typed} };
+    my $n = @{ $cap->{pending} };
+    if (!length $pass) {
+        return Irssi::print('bot_auth: passphrase prompt cancelled'
+                          . ($n ? "; dropped $n command(s)" : ''));
+    }
+    utf8::encode($pass) if utf8::is_utf8($pass);
+    my $key = length($pass) <= PASS_MAX ? eval { load_key($cap->{path}, $pass) } : undef;
+    my $err = $@ || (length($pass) > PASS_MAX ? "passphrase too long\n" : '');
+    substr($pass, 0, length $pass, "\0" x length $pass);
+    if (!$key) {
+        $err =~ s/\n\z//;
+        if (++$FAILS{n} >= FAIL_LIMIT) {
+            %FAILS = (n => 0, until => time() + FAIL_PAUSE);
+        }
+        return Irssi::print("bot_auth: $err" . ($n ? "; dropped $n command(s)" : ''));
+    }
+    %FAILS = (n => 0, until => 0);
+    my $secs = _expire_secs();
+    my $now  = time();
+    _lock();
+    %UNLOCKED = (key => $key, path => $cap->{path}, once => $secs == 0,
+                 until => $secs < 0 ? undef
+                        : $now + ($secs == 0 ? AUTH_TIMEOUT : $secs));
+    if ($secs < 0) {
+        Irssi::print('bot_auth: key unlocked until /botlock.');
+    } elsif ($secs == 0) {
+        Irssi::print('bot_auth: key unlocked for this command.');
+    } else {
+        my @t = localtime($now + $secs);
+        Irssi::print(sprintf('bot_auth: key unlocked until %02d:%02d:%02d (passwd_expire).',
+                             @t[2, 1, 0]));
+    }
+    for my $p (@{ $cap->{pending} }) {
+        my $server = Irssi::server_find_tag($p->[0]);
+        if (!$server || !$server->{connected}) {
+            Irssi::print("bot_auth: not connected to $p->[0] any more; dropped a command.");
+            next;
+        }
+        _handle_botcmd($server, $p->[1], $p->[2]);
+    }
+    _used_once();
+}
+
+# While the passphrase prompt waits, every key goes to it: the input line only
+# ever shows stars, and nothing reaches its history or the server.  Escape
+# sequences (arrows, function keys) are skipped.
+sub sig_gui_key {
+    my ($key) = @_;
+    return if !%CAPTURE;
+    Irssi::signal_stop();
+    my $typed = $CAPTURE{typed};
+    if ($CAPTURE{esc}) {
+        # ESC [ ... final byte, or ESC O x, or ESC x
+        if ($CAPTURE{esc} == 1 && ($key == 91 || $key == 79)) { $CAPTURE{esc} = 2; return; }
+        $CAPTURE{esc} = 0 if $CAPTURE{esc} == 1 || ($key >= 0x40 && $key <= 0x7e);
+        return;
+    }
+    if ($key == 10 || $key == 13) {
+        _try_unlock(_end_capture());
+        return;
+    }
+    if ($key == 27) { $CAPTURE{esc} = 1; return; }
+    if ($key == 127 || $key == 8) {
+        pop @$typed;
+    } elsif ($key >= 32 && @$typed < PASS_MAX) {
+        my $ch = chr($key);
+        utf8::encode($ch);
+        push @$typed, $ch;
+    }
+    _input_set('*' x scalar(@$typed));
+}
+
+# The active window's input history, oldest first (Irssi 1.2+; undef when
+# this Irssi cannot list or delete entries).
+sub _history {
+    return undef if !defined &Irssi::active_win;
+    my $win = Irssi::active_win() or return undef;
+    return undef if !$win->can('get_history_entries') || !$win->can('delete_history_entries');
+    return ($win, [ $win->get_history_entries() ]);
+}
+
+# A paste holding a newline never raises "gui key pressed": Irssi adds the
+# line to the input history and emits "send command" itself.  While the
+# prompt waits, that line is the passphrase: it is taken, dropped from the
+# history and never sent.
+sub sig_send_command {
+    my ($line) = @_;
+    return if !%CAPTURE;
+    my ($win, $hist) = _history();
+    if ($win) {
+        # Commands from scripts (ours included) skip the history: let them by.
+        return if !@$hist || ($hist->[-1]{text} // '') ne $line;
+        $win->delete_history_entries(grep { ($_->{text} // '') eq $line } @$hist);
+    } else {
+        Irssi::print('bot_auth: this Irssi cannot delete history entries; '
+                   . 'the pasted passphrase is still in the input history.');
+    }
+    Irssi::signal_stop();
+    my $typed = $CAPTURE{typed};
+    my $n = @$typed;
+    # The input line held one star per key typed before the paste.
+    my $pasted = substr($line, 0, $n) eq '*' x $n ? substr($line, $n) : $line;
+    $pasted =~ tr/\x00-\x1f\x7f//d;
+    utf8::encode($pasted) if utf8::is_utf8($pasted);
+    push @$typed, $pasted if length $pasted;
+    substr($pasted, 0, length $pasted, "\0" x length $pasted);
+    _try_unlock(_end_capture());
 }
 
 sub pin_lookup {
@@ -501,6 +814,8 @@ sub _handle_botcmd {
     my ($server, $bot_nick, $command_line) = @_;
 
     my ($key, $err) = _load_key();
+    return _ask_passphrase([$server->{tag}, $bot_nick, $command_line])
+        if $err && $err eq LOCKED;
     return Irssi::print("bot_auth: $err") if $err;
     Irssi::print("bot_auth: " . $key->{warning}) if $key->{warning};
 
@@ -510,6 +825,7 @@ sub _handle_botcmd {
     my $bot_pub64 = $KEY_CACHE{$ck};
     if (defined $bot_pub64) {
         _send_command($server, $bot_nick, $server->{nick}, $key, $bot_pub64, $command_line);
+        _used_once();
         return;
     }
 
@@ -559,6 +875,10 @@ sub cmd_botauth {
         if !defined $bot_nick || !length $bot_nick;
 
     my ($key, $err) = _load_key();
+    if ($err && $err eq LOCKED) {
+        _ask_passphrase();
+        return Irssi::print("bot_auth: run /botauth $bot_nick again once the key is unlocked.");
+    }
     return Irssi::print("bot_auth: $err") if $err;
 
     delete $KEY_CACHE{_ck($server->{tag}, $bot_nick)};
@@ -611,7 +931,11 @@ sub sig_notice {
     my ($tsn) = @$pend;
 
     my ($key, $err) = _load_key();
-    return Irssi::print("bot_auth: $err") if $err;
+    if ($err) {
+        delete $QUEUE{$ck};
+        return Irssi::print('bot_auth: ' . ($err eq LOCKED
+            ? "the key locked before $nick answered; /botunlock and try again" : $err));
+    }
 
     my $b64 = substr($text, 5);
     my $bot_pub64 = open_lockbox($key, $nick, $mynick, $tsn, $b64);
@@ -647,6 +971,7 @@ sub sig_notice {
     if ($q) {
         _send_command($server, $nick, $mynick, $key, $bot_pub64, $_) for @$q;
     }
+    _used_once();
 }
 
 # A bot's ~A2R reply shown in place of the frame, marked as sealed: "message
@@ -694,6 +1019,8 @@ sub sig_send_text {
     Irssi::signal_stop();
     return Irssi::print(cryptx_hint()) if !$CRYPTX_OK;
     my ($key, $err) = _load_key();
+    return Irssi::print('bot_auth: the key is locked -- not sent; /botunlock first')
+        if $err && $err eq LOCKED;
     return Irssi::print("bot_auth: $err -- not sent") if $err;
     my $bot_pub64 = $KEY_CACHE{$ck};
     return Irssi::print("bot_auth: no key for $bot this session (/botauth $bot) -- not sent")
@@ -701,23 +1028,71 @@ sub sig_send_text {
     my $srv = Irssi::server_find_tag($dcc->{servertag});
     Irssi::signal_emit('message dcc own', $dcc, $text)
         if _seal_and_send($ck, $srv, $dcc, $bot, $DCC_NICK{$ck}, $key, $bot_pub64, $text);
+    _used_once();
+}
+
+sub cmd_botunlock {
+    return Irssi::print(cryptx_hint()) if !$CRYPTX_OK;
+    my ($key, $err) = _load_key();
+    if ($err && $err eq LOCKED) {
+        _ask_passphrase();
+    } elsif ($err) {
+        Irssi::print("bot_auth: $err");
+    } elsif ($key->{plain}) {
+        Irssi::print('bot_auth: the keyfile has no passphrase; nothing to unlock.');
+    } else {
+        Irssi::print('bot_auth: already unlocked' . (defined $UNLOCKED{until}
+            ? ' for ' . ($UNLOCKED{until} > time() ? $UNLOCKED{until} - time() : 0) . ' more s'
+            : ' until /botlock') . '.');
+    }
+}
+
+sub cmd_botlock {
+    _cancel_capture('passphrase prompt cancelled');
+    my $had = %UNLOCKED ? 1 : 0;
+    _lock();
+    Irssi::print($had ? 'bot_auth: key locked.' : 'bot_auth: key was not unlocked.');
+}
+
+# Changing bot_auth_keyfile or bot_auth_passwd_expire locks the key.
+sub sig_setup_changed {
+    my $now = join("\x1e", map { Irssi::settings_get_str($_) }
+                                 qw(bot_auth_keyfile bot_auth_passwd_expire));
+    my $was = $SETTINGS_SEEN{v};
+    $SETTINGS_SEEN{v} = $now;
+    return if !defined $was || $was eq $now;
+    _cancel_capture('keyfile/passwd_expire changed: passphrase prompt cancelled');
+    _lock('keyfile/passwd_expire changed: key locked.');
 }
 
 sub timer_check {
     _expire_pending($_) for keys %PENDING;
+    my $now = time();
+    _lock('key locked again (passwd_expire); the next /botcmd asks for the passphrase.')
+        if %UNLOCKED && defined $UNLOCKED{until} && $now >= $UNLOCKED{until};
+    _cancel_capture('passphrase prompt timed out')
+        if %CAPTURE && $now - $CAPTURE{t} > PROMPT_TIMEOUT;
 }
 
 # Registration is guarded so this file can be `do`-loaded under a minimal
 # stub Irssi package (a test harness) without dying before the pure functions
 # above (load_key/build_auth/open_lockbox/build_command/fingerprint) exist.
+eval { require Irssi::TextUI; 1 };   # gui_input_set for the passphrase prompt
 eval {
     Irssi::settings_add_str('bot_auth', 'bot_auth_keyfile', '');
     Irssi::settings_add_str('bot_auth', 'bot_auth_pinfile', '');
     Irssi::settings_add_bool('bot_auth', 'bot_auth_sealed_replies', 1);
     Irssi::settings_add_str('bot_auth', 'bot_auth_sealed_marker', "\xF0\x9F\x94\x92");  # U+1F512
+    Irssi::settings_add_str('bot_auth', 'bot_auth_passwd_expire', '1h');
+    sig_setup_changed();
     Irssi::command_bind('botcmd',    \&cmd_botcmd);
     Irssi::command_bind('botauth',   \&cmd_botauth);
     Irssi::command_bind('botforget', \&cmd_botforget);
+    Irssi::command_bind('botunlock', \&cmd_botunlock);
+    Irssi::command_bind('botlock',   \&cmd_botlock);
+    Irssi::signal_add_first('gui key pressed', \&sig_gui_key);
+    Irssi::signal_add_first('send command', \&sig_send_command);
+    Irssi::signal_add('setup changed', \&sig_setup_changed);
     Irssi::signal_add_first('event notice', \&sig_notice);
     Irssi::signal_add_first('message private', \&sig_message_private);
     Irssi::signal_add_first('message irc notice', \&sig_message_private);

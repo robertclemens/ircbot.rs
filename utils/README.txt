@@ -1,5 +1,5 @@
-ircbot/utils — client tools and config utilities
-=================================================
+ircbot/utils — client tools
+===========================
 
 Admins and opers command the bot with a Curve25519 keypair.  There are no
 admin, oper or bot passwords any more; the only password left is your bot's
@@ -7,20 +7,36 @@ config-file password.  Design: irchub/docs/passwordless.md.
 
 
 
-/* keygen.c :: make a keypair — build: gcc -O2 -Wall -o keygen keygen.c -lcrypto */
+/* keygen :: make a keypair — built by `cargo build --release` (target/release/keygen) */
 
     ./keygen robert          # or just ./keygen and type the name when asked
 
-Writes, in the current directory (never overwriting an existing file):
+It asks for an optional passphrase (twice, echo off; empty = none) and
+writes, in the current directory or in -d <dir> (never overwriting a file):
 
-    YYYYMMDDHHMMSS_robert.private.b64   mode 0600 — yours alone: hub_admin and
-                                        your IRC script use it
+    YYYYMMDDHHMMSS_robert.private.b64   0600 — yours alone: your IRC script and
+                                        bot-auth use it
     YYYYMMDDHHMMSS_robert.public.b64    give this to an admin
+    YYYYMMDDHHMMSS_robert_ed25519       0600 — the SSH key for the hub console
+    YYYYMMDDHHMMSS_robert_ed25519.pub        (admins; PuTTYgen imports it)
 
-and prints the public key and its fingerprint (e.g. 763e:58a6:2dfd:ae02).  The
-private key is never printed.  keygen.c is byte-identical to irchub/keygen.c.
+Both private files are under the same passphrase (the IRC key as an
+"irckey-v2 scrypt ..." line, the SSH key as a standard encrypted OpenSSH
+key).  keygen prints the public key, its fingerprint (e.g.
+763e:58a6:2dfd:ae02) and a ~/.ssh/config block; the private key is never
+printed.  Later:
 
-Without keygen (OpenSSL 1.1.1 or newer):
+    ./keygen --passwd YYYYMMDDHHMMSS_robert.private.b64
+        add / change / remove the passphrase (rewrites the SSH pair too; the
+        public key stays the same, so nothing on the hubs or bots changes)
+
+Scripts: --no-passphrase, --passphrase-file <0600 file>,
+--old-passphrase-file <0600 file>.  keygen (utils/keygen.rs) is the Rust
+port of the shared C keygen.c, byte-identical to irchub.rs/src/bin/keygen.rs:
+same files, same output.
+Formats: irchub/docs/console.md §9.
+
+Without keygen (OpenSSL 1.1.1 or newer; a key without a passphrase):
 
     umask 077
     openssl genpkey -algorithm ED25519 -out ed.pem
@@ -31,7 +47,8 @@ Without keygen (OpenSSL 1.1.1 or newer):
       openssl pkey -in x.pem  -pubout -outform DER | tail -c 32 ) | openssl base64 -A > NAME.public.b64
     shred -u ed.pem x.pem      # or rm -f — the .pem files hold the private key
 
-An admin then adds you with your PUBLIC key: hub_admin "Add Admin/Oper", or on
+An admin then adds you with your PUBLIC key: the hub console's "admin add" /
+"oper add", or on
 IRC (when the network is not in hub-only-mutation mode, opt 'h'):
 
     +admin <name> <pubkey> <nick!user@host>
@@ -50,13 +67,39 @@ The scripts below do this automatically: the first /botcmd to a bot
 authenticates (the lockbox notice is hidden and the bot key's fingerprint is
 printed), later commands go straight through.  The bot key is kept in memory
 for the session; restarting the IRC client means one fresh auth.  Compare the
-fingerprint once with the bot's 'status' (Pubkey line) or hub_admin's bot list.
+fingerprint once with the bot's 'status' (Pubkey line) or the hub console's
+'bot list'.
 
 Optional pin file: once set, each bot's key is remembered and a DIFFERENT key
 for the same nick is refused with a loud warning (possible man-in-the-middle,
 or the bot was rekeyed — /botforget <bot> accepts the new key).
 
 Old password-based scripts (~A1 / ~A1c) no longer work: the bot ignores them.
+
+
+
+// Passphrase-protected keys: unlock once, for a while
+
+A key made with a passphrase is locked until you unlock it.  The scripts ask
+the first time a command needs the key (the command waits), or on
+/botunlock; you type the passphrase into the input line, where it is masked
+(irssi and HexChat: the keys never reach the input line, it shows stars;
+WeeChat: the bar shows stars and the line stays out of the history).  It is
+never sent or shown; an empty line cancels.  The key then stays unlocked
+for passwd_expire from the moment you unlocked it (default 1h), then the
+script asks again; /botlock forgets it at once:
+
+    irssi     /set bot_auth_passwd_expire 6h
+    HexChat   /BOTCMD passwd_expire 6h
+    WeeChat   /set plugins.var.python.ircbot_weechat_auth.passwd_expire 6h
+    mIRC      /set %bot_auth_passwd_expire 6h
+
+    values: 0 (ask for every command), 30m, 6h, 1d, a number of seconds, or
+    never (until /botlock or the client exits) — your call on the risk.
+
+Three wrong passphrases in a row pause the prompt for 30 s.  Changing the
+keyfile or passwd_expire locks the key.  A key without a passphrase still
+works; the scripts say once per session that it has none.
 
 
 
@@ -132,6 +175,8 @@ work on a chat too: paste the line into the chat window.
     /set bot_auth_pinfile /home/you/.ircbot_bot_pins        (optional)
     /botcmd <bot_nick> <command> [args]
     /botauth <bot_nick>      re-authenticate      /botforget <bot_nick>   drop key (and pin)
+    /botunlock               enter the passphrase /botlock                forget the unlocked key
+    /set bot_auth_passwd_expire 1h                   (passphrase keys, see above)
 
 
 
@@ -142,7 +187,8 @@ work on a chat too: paste the line into the chat window.
     /BOTCMD keyfile /home/you/20260914120000_you.private.b64
     /BOTCMD pinfile /home/you/.ircbot_bot_pins                (optional; "off" disables)
     /BOTCMD <bot_nick> <command> [args]
-    /BOTAUTH <bot_nick>      /BOTFORGET <bot_nick>
+    /BOTAUTH <bot_nick>      /BOTFORGET <bot_nick>      /BOTUNLOCK      /BOTLOCK
+    /BOTCMD passwd_expire 1h                                (passphrase keys, see above)
 
 
 
@@ -153,16 +199,17 @@ work on a chat too: paste the line into the chat window.
     /set plugins.var.python.ircbot_weechat_auth.keyfile /home/you/20260914120000_you.private.b64
     /set plugins.var.python.ircbot_weechat_auth.pinfile /home/you/.ircbot_bot_pins   (optional)
     /botcmd <bot_nick> <command> [args]       (run it from a buffer on the bot's network)
-    /botauth <bot_nick>      /botforget <bot_nick>
+    /botauth <bot_nick>      /botforget <bot_nick>      /botunlock      /botlock
+    /set plugins.var.python.ircbot_weechat_auth.passwd_expire 1h   (passphrase keys)
 
 
 
-/* bot-auth.c  (command-line client; also the engine behind bot-auth.mrc) */
+/* bot-auth  (command-line client; also the engine behind bot-auth.mrc) */
 
-    gcc -O2 -Wall -Wextra -o bot-auth bot-auth.c -lcrypto
-    Windows (MSYS2 MinGW 64-bit shell):
-        pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl
-        gcc -O2 -Wall -o bot-auth.exe bot-auth.c -lcrypto -static
+    cargo build --release            -> target/release/bot-auth  (utils/bot_auth.rs)
+    Windows (bot-auth.exe for mIRC), from a Rust toolchain with the target added:
+        rustup target add x86_64-pc-windows-gnu
+        cargo build --release --bin bot-auth --target x86_64-pc-windows-gnu
 
 Three steps, by hand (any client that can send a raw line works, e.g. repartee):
 
@@ -181,9 +228,26 @@ Sealed replies from the command line:
     ./bot-auth reply RK <botnick> <yournick> < lines-with-~A2R
         -> the answer in plaintext, one line per reply line; delete RK afterwards
 
+Passphrase-protected keys: the key holder
+
+    ./bot-auth unlock KEY.private.b64 [--expire 1h|30m|6h|1d|secs|never]
+        asks for the passphrase (echo off) and starts a background key holder
+        that keeps the key in locked memory until the expiry (default 1h)
+    ./bot-auth status KEY.private.b64      "unlocked <secs|never>" or "locked"
+    ./bot-auth lock KEY.private.b64        end it now (the key is wiped)
+
+While it runs, auth / open / cmd use it: it signs and does the X25519 step,
+and the private key never leaves it.  It listens on a 0600 socket in a 0700
+directory ($XDG_RUNTIME_DIR/bot-auth, else /tmp/bot-auth-<uid>) and answers
+only your own user; on Windows a named pipe only you can open.  The C and
+Rust bot-auth share it.  Without it, a passphrase-protected key makes
+bot-auth ask for the passphrase on the terminal for that one call (never on
+Windows), or print "bot-auth: LOCKED: ..." and exit 4.
+
 The command is read from stdin, never from the command line (ps(1) would show
 it).  Exit status: 1 usage/IO error, 2 verification failure, 3 pinned key
-changed.  Commands must fit one IRC line (about 200 characters).
+changed, 4 the key is locked.  Commands must fit one IRC line (about 200
+characters).
 
 
 
@@ -193,7 +257,14 @@ changed.  Commands must fit one IRC line (about 200 characters).
     /set %bot_auth_exe     C:\path\to\bot-auth.exe
     /set %bot_auth_keyfile C:\path\to\20260914120000_you.private.b64
     /set %bot_auth_pinfile C:\path\to\bot_pins.txt       (optional)
+    /set %bot_auth_passwd_expire 1h                     (optional, passphrase keys)
     /botcmd <bot_nick> <command> [args]      /botauth <bot_nick>      /botforget <bot_nick>
+    /botunlock      /botlock
+
+With a passphrase-protected key, the first command opens a bot-auth window
+that asks for the passphrase and closes itself once the key holder runs;
+the waiting commands are then sent.  The passphrase never passes through
+mIRC.
 
 mIRC has no Curve25519 or AES-GCM, so every crypto step runs in bot-auth.exe;
 the command text reaches it through a temp file that is deleted right away
@@ -203,38 +274,6 @@ script has not been exercised in mIRC by the developers — report problems.
 repartee: its sandboxed Lua has no crypto binding, no clock and no CSPRNG, so
 a native script is not possible; use bot-auth by hand (above) and repartee's
 raw-line command.
-
-
-
-/* encrypt_config.c :: Compile instructions: gcc -O2 -Wall encrypt_config.c -o encrypt_config -lcrypto */
-
-    ./encrypt_config <plaintext_file> <encrypted_out>
-
-encrypt_config builds a bot config file from plaintext, e.g. to pre-load channels, users (a|/o| lines carry the
-user's PUBLIC key: a|<uuid>|<name>|<pubkey>|add|<last_seen>|<ts>|) and usermasks without sending commands to the bot.
-
-The config password is prompted for after the tool starts (twice, no echo); it is never given on the command line,
-where ps(1) and shell history would see it. For scripting, pipe it in instead: when stdin is not a terminal the first
-line of stdin is the password (echo pw | ./encrypt_config plain.txt .ircbot.cnf). The output is written mode 0600 via
-a temp file and rename, so a failed run never leaves a half-written config. Input over MAX_CONFIG_SIZE (the bot's load
-limit), and input that is not a plaintext config (e.g. an already-encrypted file), is refused.
-
-
-
-/* decrypt_config.c :: Compile instructions: gcc -O2 -Wall decrypt_config.c -o decrypt_config -lcrypto */
-
-    ./decrypt_config [config_file]              (default: .ircbot.cnf)
-    ./decrypt_config .ircbot.cnf > plain.txt    (then encrypt_config plain.txt .ircbot.cnf; shred plain.txt)
-
-decrypt_config is a debugging tool to look at the contents of your config file (it holds the bot's private key in
-the k| line — treat the output accordingly).
-
-The config password is prompted for after the tool starts (no echo), or piped in on stdin as above. stdout carries the
-raw plaintext and nothing else, so it can be redirected or piped; the prompt goes to the terminal and errors to stderr.
-
-Both tools share config_tool.h (must sit next to them when compiling); it defines SALT_SIZE, PBKDF2_ITERATIONS, MAX_PASS
-and MAX_CONFIG_SIZE, which must match the bot's src/consts.rs so the file format cannot drift from the bot's. Passwords longer than MAX_PASS-1
-characters are rejected rather than silently truncated.
 
 
 

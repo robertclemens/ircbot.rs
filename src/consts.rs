@@ -20,7 +20,12 @@ pub const VERSION_RESPONSE: &str = "A robot may not injure a human being";
 pub const CONFIG_FILE: &str = ".ircbot.cnf";
 pub const PID_FILE: &str = ".ircbot.pid";
 pub const SALT_SIZE: usize = 16;
-pub const DEFAULT_LOG_LEVEL: u32 = 63;
+/// The log FILE is off by default: a production bot writes nothing to disk
+/// until `setlog` (l| in the config) turns it on.  The in-memory ring that
+/// `getlog` reads is fed at every level.
+pub const DEFAULT_LOG_LEVEL: u32 = 0;
+/// Every log type (L_MSG..L_DEBUG): the largest mask `setlog` takes.
+pub const LOG_LEVEL_MAX: u32 = 63;
 pub const LOGFILE: &str = ".ircbot.log";
 /// Default LOGFILE cap; the config's L|<bytes> line overrides it.
 pub const BOT_LOG_FILE_SIZE: u64 = 10 * 1024 * 1024;

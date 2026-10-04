@@ -945,7 +945,7 @@ fn help_auth(state: &mut BotState, nick: &str) {
     const LINES: &[&str] = &[
         "Admins and opers sign in with their Curve25519 key; there are no passwords. Use a client script from ircbot/utils (irssi, hexchat, weechat, mIRC via bot-auth.exe, or the bot-auth CLI) pointed at your .private.b64.",
         "On the first command to a bot the script sends a signed ~A2A request; the bot answers with a ~A2K notice carrying its public key (the script shows its fingerprint). Commands then travel sealed as ~A2 frames; as ~A2S, the bot's replies are sealed too (~A2R) and the script shows them decrypted, marked with a lock.",
-        "Compare that fingerprint once with this bot's 'status' or hub_admin's bot list. After a bot 'rekey', run /botforget <bot> so the script fetches the new key.",
+        "Compare that fingerprint once with this bot's 'status' or the hub console's 'bot list'. After a bot 'rekey', run /botforget <bot> so the script fetches the new key.",
     ];
     for l in LINES {
         say(state, nick, l);
@@ -999,7 +999,7 @@ fn admin_command(
     {
         ircf!(
             state,
-            "PRIVMSG {} :Error: '{}' is disabled — network is in hub-only-mutation mode (opt 'h'). Use hub_admin.\r\n",
+            "PRIVMSG {} :Error: '{}' is disabled — network is in hub-only-mutation mode (opt 'h'). Use the hub console.\r\n",
             nick,
             c
         );
@@ -1093,12 +1093,12 @@ fn admin_command(
                 Some(s) if digits(s, 10) => s.parse::<u64>().ok(),
                 Some(_) => None,
             };
-            if !digits(arg1, 2) || atoi(arg1) as u32 > DEFAULT_LOG_LEVEL {
+            if !digits(arg1, 2) || atoi(arg1) as u32 > LOG_LEVEL_MAX {
                 ircf!(
                     state,
                     "PRIVMSG {} :Invalid log level. Give a mask from 0 to {}.\r\n",
                     nick,
-                    DEFAULT_LOG_LEVEL
+                    LOG_LEVEL_MAX
                 );
             } else if let Some(sz) =
                 size.filter(|v| (BOT_LOG_SIZE_MIN..=BOT_LOG_SIZE_MAX).contains(v))
@@ -1185,13 +1185,13 @@ fn admin_command(
             }
         }
         // In-place 'update' is for standalone bots only.  A hub-configured bot
-        // is upgraded by its hub (hub_admin-initiated rolling upgrade), never
+        // is upgraded by its hub (console-initiated rolling upgrade), never
         // via an IRC/DCC command.  The hub-driven path calls
         // updater::perform_upgrade() directly and is NOT gated here.
         "update" if !state.hubs.is_empty() => say(
             state,
             nick,
-            "Updates are hub-managed on this bot; run upgrades from hub_admin. \
+            "Updates are hub-managed on this bot; run upgrades from the hub console. \
 In-place 'update' is only available on standalone (hub-less) bots.",
         ),
         "update" => match a.a1 {
@@ -2946,7 +2946,7 @@ fn admin_help(state: &mut BotState, nick: &str, topic: Option<&str>) {
             say(
                 state,
                 nick,
-                " |   (hub-only-mutation mode: users, masks, keys, channels via hub_admin)",
+                " |   (hub-only-mutation mode: users, masks, keys, channels via the hub console)",
             );
         } else {
             say(

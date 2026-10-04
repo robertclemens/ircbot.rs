@@ -8,8 +8,6 @@
 /ircbot.rs
 utils/bot-auth
 utils/keygen
-utils/encrypt_config
-utils/decrypt_config
 *.o
 
 # Runtime state, logs and secrets

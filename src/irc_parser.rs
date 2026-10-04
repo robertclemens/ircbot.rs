@@ -427,12 +427,14 @@ fn on_mode(state: &mut BotState, params: &str) {
         return;
     }
     handle_mode_change(state, target, modes, args);
-    // Key / invite-only changes go to the hub.
+    // Key / invite-only changes go to the hub, and to our own config: with no
+    // hub to echo them back, a key we learned and saved must not outlive a -k.
     if (modes.contains('k') || modes.contains('i'))
         && let Some(ci) = channel::find(state, target).filter(|&ci| state.chans[ci].is_managed)
     {
         state.chans[ci].timestamp = lww_next_ts(state.chans[ci].timestamp);
         hub_client::push_channel(state, ci);
+        crate::config::write_with_state_pass(state);
     }
 }
 

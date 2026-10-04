@@ -20,7 +20,7 @@ There are no admin, oper or bot passwords: bots, admins and opers are each ident
       chips since ~2014 have (aes, pclmulqdq, ssse3, avx, avx2, adx, bmi1, bmi2) or,
       on aarch64, aes/sha2/pmull/neon (Raspberry Pi 5 yes, Pi 4 and earlier no)
     * No OpenSSL or libcurl: crypto, TLS and HTTPS are Rust crates
-    * The optional helpers in utils/ (bot-auth, keygen, encrypt_config, decrypt_config) are C and need gcc + libssl-dev
+    * The helpers in utils/ (bot-auth, keygen) are Rust too: `cargo build --release` builds them next to `ircbot` in `target/release/`
 
 ### How to use:
 1) Take a look at src/consts.rs if you want to set any custom time intervals. Defaults should be good so I recommend leaving alone unless you run into something later.
@@ -31,7 +31,7 @@ There are no admin, oper or bot passwords: bots, admins and opers are each ident
 3) Run `"./ircbot -setup"`
     * This loads the config wizard to create your initial config file.
     * You will be prompted to set a config password during setup.
-    * The bot generates its own keypair and prints its UUID, public key and key fingerprint. Register a hub-managed bot in hub_admin's "Add Bot" with that UUID and public key; standalone bots trust each other with `+bot <nick!user@host> <UUID> <public key>`.
+    * The bot generates its own keypair and prints its UUID, public key and key fingerprint. Register a hub-managed bot in the hub's SSH console with `bot add <nick> <uuid> <pubkey>`; standalone bots trust each other with `+bot <nick!user@host> <UUID> <public key>`.
     * Hub-managed: admins and opers come from the hub. Standalone: the wizard asks for the first admin's **public** key — paste it, or give the path of their `<ts>_<name>.public.b64` (a `.private.b64` is refused).
 
 4) Start ircbot. The bot daemonizes automatically on startup. There are two ways to provide the config password:
@@ -53,14 +53,15 @@ There are no admin, oper or bot passwords: bots, admins and opers are each ident
         ```
         */5 * * * * /home/user/ircbot/ircbot 1>/dev/null 2>/dev/null
         ```
+        No `cd` is needed: the bot always works in its own directory, whatever directory it is started from (`.ircbot.cnf`, `.ircbot.pass`, `.ircbot.pid` and `.ircbot.log` live beside the binary). Run one binary per bot, in a directory owned by you and not writable by group or others — the bot refuses to start otherwise.
 
 5) Make your keypair. Every admin and oper has their own:
     ```
-    gcc -O2 -o utils/keygen utils/keygen.c -lcrypto && ./utils/keygen robert
+    cargo build --release && ./target/release/keygen robert
     ```
-    This writes `YYYYMMDDHHMMSS_robert.private.b64` (mode 0600 — it never leaves your machine) and `YYYYMMDDHHMMSS_robert.public.b64`, and prints the public key and its fingerprint. Without keygen, `utils/README.txt` has the equivalent openssl recipe. Give the **public** key to an admin: they add you in hub_admin, or on IRC with `+admin <name> <pubkey> <nick!user@host>` / `+oper <name> <pubkey> <nick!user@host>` when the network is not in hub-only-mutation mode (opt `h`). `chkey <name> <pubkey>` replaces a key (opers may change their own).
+    This asks for an optional passphrase and writes `YYYYMMDDHHMMSS_robert.private.b64` (0600 — it never leaves your machine), `YYYYMMDDHHMMSS_robert.public.b64`, and the hub-console SSH key `YYYYMMDDHHMMSS_robert_ed25519` (+ `.pub`), both private files under the same passphrase, and prints the public key and its fingerprint (`-d <dir>` writes elsewhere; `keygen --passwd <file>` adds/changes the passphrase later). With a passphrase, the IRC scripts ask for it and keep the key unlocked for `passwd_expire` (default 1h), and `bot-auth unlock` does the same for the command line and mIRC — see `utils/README.txt`. Without keygen, `utils/README.txt` has the equivalent openssl recipe (for a key without a passphrase). Give the **public** key to an admin: they add you in the hub console (`admin add` / `oper add`), or on IRC with `+admin <name> <pubkey> <nick!user@host>` / `+oper <name> <pubkey> <nick!user@host>` when the network is not in hub-only-mutation mode (opt `h`). `chkey <name> <pubkey>` replaces a key (opers may change their own).
 
-6) To send commands to your bot, your IRC client script signs a short auth request with your private key (`~A2A`). If your hostmask and signature match an admin or oper record, the bot answers with a NOTICE lockbox (`~A2K`) that only your key can open, containing the bot's public key. From then on each command is sealed to the bot (`~A2`, AES-256-GCM over an X25519 key agreement); the bot rejects anything more than 30 seconds old or replayed. The scripts do all of this automatically — the first command to a bot authenticates, prints the bot key's fingerprint (compare it once with `status` or hub_admin's bot list) and keeps the key for the session. Ready-made client scripts live in `utils/`:
+6) To send commands to your bot, your IRC client script signs a short auth request with your private key (`~A2A`). If your hostmask and signature match an admin or oper record, the bot answers with a NOTICE lockbox (`~A2K`) that only your key can open, containing the bot's public key. From then on each command is sealed to the bot (`~A2`, AES-256-GCM over an X25519 key agreement); the bot rejects anything more than 30 seconds old or replayed. The scripts do all of this automatically — the first command to a bot authenticates, prints the bot key's fingerprint (compare it once with `status` or the hub console's `bot list`) and keeps the key for the session. Ready-made client scripts live in `utils/`:
 * IRSSI: `ircbot_irssi_auth.pl` — needs CryptX (`cpan CryptX`). Put it in `~/.irssi/scripts/` and `/script load ircbot_irssi_auth.pl`, or `~/.irssi/scripts/autorun/` to load on start.
     * /set bot_auth_keyfile /path/to/YYYYMMDDHHMMSS_you.private.b64
     * /set bot_auth_pinfile /path/to/bot_pins        (optional: refuse a changed bot key)
@@ -71,7 +72,7 @@ There are no admin, oper or bot passwords: bots, admins and opers are each ident
 * WeeChat: `ircbot_weechat_auth.py` — needs `python3-cryptography`. Copy to `~/.weechat/python/` and `/python load ircbot_weechat_auth.py`.
     * /set plugins.var.python.ircbot_weechat_auth.keyfile /path/to/YYYYMMDDHHMMSS_you.private.b64
     * /botcmd botnick help
-* Command line and mIRC: `bot-auth.c` (`auth` / `open` / `cmd` / `fp`) and `bot-auth.mrc`, which drives `bot-auth.exe`.
+* Command line and mIRC: `bot-auth` (`utils/bot_auth.rs`: `auth` / `open` / `cmd` / `reply` / `fp`) and `bot-auth.mrc`, which drives `bot-auth.exe`.
 
 On IRC, `help +admin` and `help auth` explain the keypair and the handshake. Old password scripts (`~A1` / `~A1c`) no longer work.
 
@@ -82,6 +83,8 @@ See `utils/README.txt` for the other transports and for why these scripts must n
 ### Changelog
 
 * Unreleased (passwordless branch)
+    * Change: `encrypt_config` / `decrypt_config` (and `utils/config_tool.rs`) are gone from the tree; general use does not need them. They live on as test helpers in ircbot-testnet (`tools/`)
+    * Enhancement: The utils/ tools (`keygen`, `bot-auth`) are ported 1:1 to Rust and built by `cargo build --release`; the tree no longer contains C. Same files, output and exit codes as the C tools. Upgrade scripts build `--bin ircbot` only
     * Enhancement: Sealed replies. A command sent as `~A2S` (the irssi, HexChat and WeeChat scripts' default) is answered with `~A2R` frames only its sender can open; the scripts show them decrypted, marked with a lock. `~A2` is still answered in plaintext. In a DCC chat the scripts also seal text typed straight into the chat window. `bot-auth cmd --sealed` / `bot-auth reply` for the command line
     * Enhancement: `dcc` admin command: a passive DCC CHAT offer the bot completes by connecting out (it never listens). Sealed commands sent down the chat are answered there, unpaced; the client scripts route `/botcmd` through an open chat
     * Enhancement: Bot nicks set by `-setup`, `chnick` or a peer's `SETNICK` must be valid RFC 2812 nicks (length limit unchanged). A nick the server refuses (432) is not retried, and at registration the bot falls back to an alternate built from the nick's valid characters

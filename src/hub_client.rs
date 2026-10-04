@@ -427,7 +427,11 @@ pub fn report_upgrade_result(state: &mut BotState) {
         state,
         L_INFO,
         "[UPGRADE] Reporting done once back{}{}\n",
-        if p.ops.is_empty() { " on IRC" } else { " and re-opped in " },
+        if p.ops.is_empty() {
+            " on IRC"
+        } else {
+            " and re-opped in "
+        },
         p.ops.join(" ")
     );
     state.upgrade_report = Some(crate::state::UpgradeReport {

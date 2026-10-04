@@ -284,8 +284,8 @@ fn run_config_wizard() -> io::Result<()> {
         println!("\n  Bot UUID:        {}", state.bot_uuid);
         println!("  Bot public key:  {}", crypto::b64_encode(&pub_key));
         println!("  Key fingerprint: {}", crypto::key_fingerprint(&pub_key));
-        println!("\n  Save these — when registering this bot in hub_admin's");
-        println!("  'Add Bot' menu the hub will ask for the UUID and pubkey above.");
+        println!("\n  Save these — when registering this bot on the hub console");
+        println!("  ('bot add <nick> <uuid> <pubkey>') the hub needs the UUID and pubkey above.");
         println!("  (Standalone bots: other bots trust this one with");
         println!("  '+bot <nick!user@host> <UUID> <public key>'.)");
         print!("\n  Press Enter to continue...");
@@ -333,7 +333,7 @@ fn run_config_wizard() -> io::Result<()> {
         // they are not asked for.
         println!("\n--- Management Mode ---");
         println!("Hub-managed: admins, usermasks and channels live on the hub and are");
-        println!("  managed with hub_admin. This bot only needs hub addresses and");
+        println!("  managed on the hub console. This bot only needs hub addresses and");
         println!("  their pinned public keys.");
         println!("Standalone:  this bot owns its own admin list and channels.\n");
         let hub_managed = !get_input("Hub-managed? (Y/n)", 16).starts_with(['n', 'N']);
@@ -406,7 +406,7 @@ fn run_config_wizard() -> io::Result<()> {
                 if state.hubs.len() == 1 { "" } else { "s" }
             );
             println!("\n  Admins, usermasks and channels for this bot are added with");
-            println!("  hub_admin (IRC Admin Commands), not here. This wizard assumes");
+            println!("  the hub console (admin/mask/chan), not here. This wizard assumes");
             println!("  the hub network runs with opt 'h' (hub-only mutations), which");
             println!("  is the default — it cannot verify that until the first sync.");
             println!("  If your hub does not set opt 'h', you can also add them later");
@@ -596,6 +596,44 @@ fn lock_pid_file() -> Option<fs::File> {
     Some(f)
 }
 
+/// Instance directory: .ircbot.cnf/.pass/.pid/.log/.upgrade all live beside the binary, so the bot behaves the same
+/// whatever the caller's cwd -- cron starts jobs in $HOME.  One binary per bot.  Our own
+/// path comes from /proc/self/exe (`current_exe`; argv[0] has no directory when launched
+/// through PATH); returns it after chdir()ing to its directory.  That directory holds the
+/// binary an upgrade replaces, its .prev and the upgrade script, so refuse one another user
+/// owns or group/other can write -- they could swap any of them.  Mirrors
+/// `instance_dir_enter()` in ircbot/main.c.
+fn instance_dir_enter() -> Option<String> {
+    let Ok(exe) = std::env::current_exe() else {
+        eprintln!("Cannot resolve my own path (/proc/self/exe)");
+        return None;
+    };
+    let Some(dir) = exe.parent() else {
+        eprintln!("Cannot resolve my own directory from {}", exe.display());
+        return None;
+    };
+    let md = match fs::metadata(dir) {
+        Ok(md) if md.is_dir() => md,
+        _ => {
+            eprintln!("Cannot stat my own directory {}", dir.display());
+            return None;
+        }
+    };
+    if md.uid() != nix::unistd::geteuid().as_raw() || md.mode() & 0o022 != 0 {
+        eprintln!(
+            "Refusing to run from {}: it must be owned by this user and not writable by group \
+             or others (chmod go-w)",
+            dir.display()
+        );
+        return None;
+    }
+    if std::env::set_current_dir(dir).is_err() {
+        eprintln!("Cannot change to my own directory {}", dir.display());
+        return None;
+    }
+    Some(exe.to_string_lossy().into_owned())
+}
+
 fn main() {
     harden_process();
     logging::install_panic_hook();
@@ -612,6 +650,11 @@ fn main() {
     if args.iter().skip(1).any(|a| a == "-selftest") {
         std::process::exit(selftest());
     }
+    // -selftest (above) stays in the caller's directory: the updater runs a
+    // staged build from a scratch subdirectory, against this bot's config.
+    let Some(self_exe) = instance_dir_enter() else {
+        std::process::exit(1)
+    };
     let do_setup = args.iter().skip(1).any(|a| a == "-setup");
     let do_passfile = args.iter().skip(1).any(|a| a == "-p");
 
@@ -672,7 +715,7 @@ fn main() {
     let Some(pid_file) = lock_pid_file() else {
         std::process::exit(1)
     };
-    let code = run(password, pid_file);
+    let code = run(password, pid_file, self_exe);
     std::process::exit(code);
 }
 
@@ -710,7 +753,7 @@ fn selftest() -> i32 {
 }
 
 /// Load the config and run the poll loop until `die` or a signal.
-fn run(password: Zeroizing<String>, pid_file: fs::File) -> i32 {
+fn run(password: Zeroizing<String>, pid_file: fs::File, self_exe: String) -> i32 {
     let mut poll = match Poll::new() {
         Ok(p) => p,
         Err(e) => {
@@ -732,13 +775,7 @@ fn run(password: Zeroizing<String>, pid_file: fs::File) -> i32 {
     if !state.hub_key_raw.is_locked() {
         eprintln!("Warning: mlock failed - secrets may reach swap.");
     }
-    state.executable_path = match std::env::current_exe() {
-        Ok(p) => p.to_string_lossy().into_owned(),
-        Err(_) => {
-            let _ = fs::remove_file(PID_FILE);
-            return 1;
-        }
-    };
+    state.executable_path = self_exe;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {

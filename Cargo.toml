@@ -7,6 +7,20 @@ description = "IRC bot with an encrypted hub mesh (safe-Rust port of ircbot.c)"
 license = "MIT"
 publish = false
 
+[[bin]]
+name = "ircbot"
+path = "src/main.rs"
+
+# The client tools in utils/ (utils/README.txt): self-contained, each the
+# Rust port of the C tool of the same name in ircbot/utils.
+[[bin]]
+name = "keygen"
+path = "utils/keygen.rs"
+
+[[bin]]
+name = "bot-auth"
+path = "utils/bot_auth.rs"
+
 [dependencies]
 # Cryptography (RustCrypto + dalek): AES-256-GCM, HKDF/PBKDF2-SHA256,
 # Ed25519 signatures and X25519 key agreement.
@@ -19,6 +33,13 @@ sha2 = "0.11"
 getrandom = "0.4"
 zeroize = "1.9"
 base64 = "0.23"
+# keygen only: passphrase-protected keys (irchub/docs/console.md §9) --
+# scrypt for the irckey-v2 IRC key, bcrypt_pbkdf + AES-256-CTR for the
+# OpenSSH key.  All pure Rust.
+scrypt = { version = "0.12", default-features = false }
+bcrypt-pbkdf = "0.11"
+aes = "0.9"
+ctr = "0.10"
 
 # Networking: poll loop, sockets (VHOST bind), TLS, HTTPS for the updater.
 # rustls runs on the graviola provider: pure Rust with Rust-level asm, no C
@@ -31,7 +52,7 @@ rustls-graviola = "0.4"
 ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots", "gzip"] }
 
 # OS integration through safe wrappers.
-nix = { version = "0.31", features = ["user", "fs", "process", "term", "resource", "feature"] }
+nix = { version = "0.31", features = ["user", "fs", "process", "term", "resource", "feature", "socket"] }
 region = "4"
 signal-hook = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
@@ -56,3 +77,10 @@ panic = "unwind"
 strip = "debuginfo"
 # A wraparound on hostile input becomes a controlled [FATAL], not a bad index.
 overflow-checks = true
+
+# bot-auth.exe's key holder on Windows (utils/bot_auth.rs): named pipes with
+# a user-only DACL, and the passphrase prompt with echo off.
+[target.'cfg(windows)'.dependencies]
+interprocess = "2.4"
+rpassword = "7"
+widestring = "1"

@@ -38,6 +38,20 @@ Usage:
     /botcmd   <bot_nick> <command> [args...]   - auto-authenticates, then sends
     /botauth  <bot_nick>                       - drop the cached key, re-auth now
     /botforget <bot_nick>                      - drop the cached key (and pin)
+    /botunlock                                 - enter the key's passphrase now
+    /botlock                                   - forget the unlocked key now
+
+Passphrase-protected keys (keygen asks for one; irchub/docs/console.md §9):
+the first /botcmd that needs the key asks for the passphrase and waits.  The
+next line you type is taken as the passphrase: it is masked in the input bar,
+kept out of the input history, and never sent or shown (an empty line
+cancels).  The key then stays unlocked for passwd_expire from the unlock,
+then the script asks again:
+    /set plugins.var.python.ircbot_weechat_auth.passwd_expire 6h
+         (default 1h; 0 = ask for every command; 30m, 2d, a number of
+          seconds, or never = until /botlock or the script is unloaded)
+Three wrong passphrases in a row lock the prompt for 30 s.  Changing keyfile
+or passwd_expire locks the key.
 
 Sealed replies (on by default): commands go out as "~A2S <b64>", which asks
 the bot to seal its answers too ("~A2R <b64>", only this command's sender can
@@ -60,13 +74,14 @@ answers there.  Plain text typed into the chat buffer is sealed the same way
 before it is sent (never sent as typed).
 
 Compare a bot's key fingerprint (printed here on every successful auth)
-against that bot's own 'status' output or hub_admin's bot list before
+against that bot's own 'status' output or the hub console's 'bot list' before
 trusting it for the first time.
 """
 
 import base64
 import hashlib
 import os
+import re
 import time
 from collections import namedtuple
 
@@ -92,15 +107,34 @@ CRYPTO_HINT = ("bot_auth: the 'cryptography' module is not installed — this "
 
 SCRIPT_NAME = "ircbot_weechat_auth"
 SCRIPT_AUTHOR = "rclemens"
-SCRIPT_VERSION = "6.1.0"
+SCRIPT_VERSION = "6.2.0"
 SCRIPT_LICENSE = "Public Domain"
 SCRIPT_DESC = "Sends ~A2 admin commands to ircbot (Curve25519 + AES-256-GCM, passwordless)"
 
 AUTH_TIMEOUT = 60     # seconds a pending ~A2A stays valid
 MAX_QUEUE = 5         # queued commands per bot while authenticating
 
+PASSWD_EXPIRE_DEFAULT = 3600
+PASS_MAX = 1024       # passphrase bytes, as keygen
+PROMPT_TIMEOUT = 120  # seconds the passphrase prompt waits
+FAIL_LIMIT = 3        # wrong passphrases before the prompt pauses
+FAIL_PAUSE = 30       # seconds of that pause
+
 ClientKey = namedtuple("ClientKey",
-                        ["ed_priv", "x_priv", "ed_pub", "x_pub", "pub64", "warning"])
+                        ["ed_priv", "x_priv", "ed_pub", "x_pub", "pub64", "warning",
+                         "plain"])
+
+# irckey-v2 (a passphrase-protected .private.b64, irchub/docs/console.md §9):
+# "irckey-v2 scrypt <log2N> <r> <p> <salt> <nonce> <ct>".  Reader bounds as
+# in keygen: a hostile file costs at most 128 * r * N = 256 MB.
+IRCKEY_TAG = "irckey-v2"
+IRCKEY_LOG2N = (14, 18)
+IRCKEY_R = (1, 8)
+IRCKEY_P = (1, 4)
+
+
+class KeyLocked(Exception):
+    """The keyfile is passphrase-protected and no passphrase was given."""
 
 # =============================================================================
 # Pure protocol functions — no `weechat` calls anywhere below this line down
@@ -126,21 +160,71 @@ def _lc(s):
     return s.translate(_LC_TABLE)
 
 
-def load_key(path):
-    """Load the combined Ed25519+X25519 private key from `path` (first line,
-    standard base64 with padding, decoding to exactly 64 bytes: ed_priv(32)
-    || x_priv(32)).  Returns a ClientKey.  Raises ValueError/OSError on any
-    failure.  `.warning` is a mode-permission message, or None.
+def _b64_exact(text, n):
+    raw = base64.b64decode(text, validate=True)
+    if len(raw) != n or len(text) != 4 * ((n + 2) // 3):
+        raise ValueError("bad field")
+    return raw
+
+
+def irckey_open(line, passphrase):
+    """The 64-byte private key inside an irckey-v2 line.  The scrypt settings
+    are bounds-checked before any work; ValueError on a malformed line, a
+    wrong passphrase or any edit to the line."""
+    if len(line) >= 512 or "  " in line or line.endswith(" "):
+        raise ValueError("malformed irckey-v2 line")
+    f = line.split(" ")
+    if len(f) != 8 or f[0] != IRCKEY_TAG or f[1] != "scrypt":
+        raise ValueError("malformed irckey-v2 line")
+    nums = []
+    for v, (lo, hi) in zip(f[2:5], (IRCKEY_LOG2N, IRCKEY_R, IRCKEY_P)):
+        if not v.isdigit() or len(v) > 3 or not lo <= int(v) <= hi:
+            raise ValueError("irckey-v2 scrypt settings out of range")
+        nums.append(int(v))
+    log2n, r, p = nums
+    try:
+        salt, nonce, ct = _b64_exact(f[5], 16), _b64_exact(f[6], 12), _b64_exact(f[7], 80)
+    except Exception as exc:
+        raise ValueError("malformed irckey-v2 line") from exc
+    key = hashlib.scrypt(passphrase, salt=salt, n=1 << log2n, r=r, p=p,
+                         maxmem=128 * r * (1 << log2n) + (2 << 20), dklen=32)
+    try:
+        return AESGCM(key).decrypt(nonce, ct, line[:line.rindex(" ")].encode("ascii"))
+    except Exception as exc:
+        raise ValueError("wrong passphrase (or a damaged key file)") from exc
+
+
+def key_is_protected(path):
+    """True if the keyfile at path is an irckey-v2 (passphrase) key."""
+    with open(path, "r", encoding="utf-8") as fh:
+        return fh.readline().startswith(IRCKEY_TAG + " ")
+
+
+def load_key(path, passphrase=None):
+    """Load the combined Ed25519+X25519 private key from `path`: either the
+    plain first line (standard base64 with padding, decoding to exactly 64
+    bytes: ed_priv(32) || x_priv(32)) or an irckey-v2 line, which needs
+    `passphrase` (bytes) and raises KeyLocked without it.  Returns a
+    ClientKey.  Raises ValueError/OSError on any failure.  `.warning` is a
+    mode-permission message, or None; `.plain` is True for a key without a
+    passphrase.
     """
     with open(path, "r", encoding="utf-8") as fh:
         raw_line = fh.readline()
-    raw_b64 = raw_line.strip()
-    if not raw_b64:
-        raise ValueError("keyfile '%s' is empty" % path)
-    try:
-        raw = base64.b64decode(raw_b64, validate=True)
-    except Exception as exc:
-        raise ValueError("keyfile '%s': invalid base64 (%s)" % (path, exc)) from exc
+    line = raw_line.rstrip("\r\n")
+    if line.startswith(IRCKEY_TAG + " "):
+        if passphrase is None:
+            raise KeyLocked(path)
+        raw, plain = irckey_open(line, passphrase), False
+    else:
+        raw_b64 = raw_line.strip()
+        if not raw_b64:
+            raise ValueError("keyfile '%s' is empty" % path)
+        try:
+            raw = base64.b64decode(raw_b64, validate=True)
+        except Exception as exc:
+            raise ValueError("keyfile '%s': invalid base64 (%s)" % (path, exc)) from exc
+        plain = True
     if len(raw) != 64:
         raise ValueError("keyfile '%s': decoded key must be 64 bytes, got %d"
                           % (path, len(raw)))
@@ -162,7 +246,20 @@ def load_key(path):
         pass
 
     return ClientKey(ed_priv=ed_priv, x_priv=x_priv, ed_pub=ed_pub, x_pub=x_pub,
-                     pub64=pub64, warning=warning)
+                     pub64=pub64, warning=warning, plain=plain)
+
+
+def parse_expire(text):
+    """passwd_expire: "1h", "30m", "90s", "2d", "3600" -> seconds; "never"
+    -> -1; None if unreadable.  0 = ask for every command."""
+    text = (text or "").strip().lower()
+    if text == "never":
+        return -1
+    m = re.fullmatch(r"(\d{1,12})([smhd]?)", text)
+    if not m:
+        return None
+    secs = int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+    return secs if secs <= 366 * 86400 else None
 
 
 def fingerprint(pub64):
@@ -416,15 +513,126 @@ def _reply_for(ck, nick, text):
     return _marked(line) if st == "show" else None
 
 
+# The unlocked passphrase-protected key: {"key", "path", "until" (None =
+# never), "once" (passwd_expire 0: lock after this command)}.  Python cannot
+# wipe the key's bytes (see the note at the top); locking drops every
+# reference.
+_UNLOCKED = {}
+# The passphrase prompt while it waits: {"path", "t", "pending": [...]}.
+_CAPTURE = {}
+_FAILS = {"n": 0, "until": 0.0}
+_WARNED = set()   # keyfiles already warned about having no passphrase
+LOCKED = "locked"  # _load_key_pref() error: ask for the passphrase
+
+
+def _expire_secs():
+    secs = parse_expire(weechat.config_get_plugin("passwd_expire"))
+    if secs is None:
+        weechat.prnt("", "bot_auth: passwd_expire '%s' is not e.g. 30m, 1h, 6h, 1d, "
+                         "0 or never; using 1h"
+                     % weechat.config_get_plugin("passwd_expire"))
+        return PASSWD_EXPIRE_DEFAULT
+    return secs
+
+
+def _lock(why=None):
+    had = bool(_UNLOCKED)
+    _UNLOCKED.clear()
+    if had and why:
+        weechat.prnt("", "bot_auth: %s" % why)
+
+
 def _load_key_pref():
     path = weechat.config_get_plugin("keyfile")
     if not path:
         return None, ("no keyfile set — /set plugins.var.python.%s.keyfile <path>"
                       % SCRIPT_NAME)
     try:
-        return load_key(path), None
+        if key_is_protected(path):
+            u = _UNLOCKED
+            if u and u["path"] == path and (u["until"] is None or time.time() < u["until"]):
+                return u["key"], None
+            _lock("key locked again (passwd_expire)" if u else None)
+            return None, LOCKED
+        key = load_key(path)
     except Exception as exc:                      # noqa: BLE001 - report to user
         return None, "keyfile error: %s" % exc
+    if path not in _WARNED:
+        _WARNED.add(path)
+        weechat.prnt("", "bot_auth: keyfile '%s' has no passphrase — add one with: "
+                         "keygen --passwd %s" % (path, path))
+    return key, None
+
+
+def _used_once():
+    """passwd_expire 0: lock once nothing more is waiting for the key."""
+    if _UNLOCKED.get("once") and not _PENDING and not _CAPTURE:
+        _lock()
+
+
+def _ask_passphrase(pending=None):
+    """Arm the passphrase prompt; `pending` (a /botcmd's arguments) runs
+    after a successful unlock."""
+    path = weechat.config_get_plugin("keyfile")
+    now = time.time()
+    if now < _FAILS["until"]:
+        weechat.prnt("", "bot_auth: too many wrong passphrases; try again in %d s."
+                     % (_FAILS["until"] - now + 1))
+        return
+    if _CAPTURE:
+        if pending and len(_CAPTURE["pending"]) < MAX_QUEUE:
+            _CAPTURE["pending"].append(pending)
+        weechat.prnt("", "bot_auth: still waiting for the passphrase (an empty line cancels).")
+        return
+    _CAPTURE.update(path=path, t=now, pending=[pending] if pending else [])
+    weechat.prnt("", "bot_auth: passphrase for %s: type it and press Enter — it is "
+                     "masked, never sent and kept out of the history (an empty line "
+                     "cancels)." % path)
+
+
+def _cancel_capture(why):
+    if _CAPTURE:
+        n = len(_CAPTURE["pending"])
+        _CAPTURE.clear()
+        weechat.prnt("", "bot_auth: %s%s" % (why, "; dropped %d command(s)" % n if n else ""))
+
+
+def _try_unlock(passphrase):
+    cap = dict(_CAPTURE)
+    _CAPTURE.clear()
+    if not passphrase:
+        _CAPTURE.update(cap)
+        _cancel_capture("passphrase prompt cancelled")
+        return
+    pw = passphrase.encode("utf-8")
+    if len(pw) > PASS_MAX:
+        weechat.prnt("", "bot_auth: passphrase too long.")
+        return
+    try:
+        key = load_key(cap["path"], pw)
+    except Exception as exc:                      # noqa: BLE001 - report to user
+        _FAILS["n"] += 1
+        if _FAILS["n"] >= FAIL_LIMIT:
+            _FAILS.update(n=0, until=time.time() + FAIL_PAUSE)
+        weechat.prnt("", "bot_auth: %s%s" % (exc, "; dropped %d command(s)" % len(cap["pending"])
+                                             if cap["pending"] else ""))
+        return
+    _FAILS.update(n=0, until=0.0)
+    secs = _expire_secs()
+    now = time.time()
+    _UNLOCKED.clear()
+    _UNLOCKED.update(key=key, path=cap["path"], once=secs == 0,
+                     until=None if secs < 0 else now + max(secs, AUTH_TIMEOUT if secs == 0 else 0))
+    if secs < 0:
+        weechat.prnt("", "bot_auth: key unlocked until /botlock.")
+    elif secs == 0:
+        weechat.prnt("", "bot_auth: key unlocked for this command.")
+    else:
+        weechat.prnt("", "bot_auth: key unlocked until %s (passwd_expire)."
+                     % time.strftime("%H:%M:%S", time.localtime(now + secs)))
+    for p in cap["pending"]:
+        _handle_botcmd(*p)
+    _used_once()
 
 
 def _expire_pending(ck):
@@ -517,6 +725,9 @@ def _send_command(buffer, server, mynick, key, bot_nick, bot_pub64, command_line
 
 def _handle_botcmd(buffer, server, mynick, bot_nick, command_line):
     key, err = _load_key_pref()
+    if err == LOCKED:
+        _ask_passphrase((buffer, server, mynick, bot_nick, command_line))
+        return
     if err:
         weechat.prnt("", "bot_auth: %s" % err)
         return
@@ -529,6 +740,7 @@ def _handle_botcmd(buffer, server, mynick, bot_nick, command_line):
     bot_pub64 = _KEY_CACHE.get(ck)
     if bot_pub64:
         _send_command(buffer, server, mynick, key, bot_nick, bot_pub64, command_line)
+        _used_once()
         return
 
     q = _QUEUE.setdefault(ck, [])
@@ -580,6 +792,10 @@ def cb_botauth(data, buffer, args):
         return weechat.WEECHAT_RC_OK
 
     key, err = _load_key_pref()
+    if err == LOCKED:
+        _ask_passphrase()
+        weechat.prnt("", "bot_auth: run /botauth %s again once the key is unlocked." % bot_nick)
+        return weechat.WEECHAT_RC_OK
     if err:
         weechat.prnt("", "bot_auth: %s" % err)
         return weechat.WEECHAT_RC_OK
@@ -609,6 +825,51 @@ def cb_botforget(data, buffer, args):
         pin_remove(pinfile, _lc(bot_nick))
 
     weechat.prnt("", "bot_auth: forgot %s%s." % (bot_nick, "" if had else " (was not cached)"))
+    return weechat.WEECHAT_RC_OK
+
+
+def cb_botunlock(data, buffer, args):
+    if not CRYPTO_OK:
+        weechat.prnt("", CRYPTO_HINT)
+        return weechat.WEECHAT_RC_OK
+    key, err = _load_key_pref()
+    if err == LOCKED:
+        _ask_passphrase()
+    elif err:
+        weechat.prnt("", "bot_auth: %s" % err)
+    elif key.plain:
+        weechat.prnt("", "bot_auth: the keyfile has no passphrase; nothing to unlock.")
+    else:
+        u = _UNLOCKED
+        weechat.prnt("", "bot_auth: already unlocked%s." % (
+            " until /botlock" if u["until"] is None else
+            " for %d more s" % max(0, u["until"] - time.time())))
+    return weechat.WEECHAT_RC_OK
+
+
+def cb_botlock(data, buffer, args):
+    _cancel_capture("passphrase prompt cancelled")
+    had = bool(_UNLOCKED)
+    _lock()
+    weechat.prnt("", "bot_auth: key locked." if had else "bot_auth: key was not unlocked.")
+    return weechat.WEECHAT_RC_OK
+
+
+def cb_history_add(data, modifier, modifier_data, string):
+    """While the passphrase prompt waits, the line typed is not history."""
+    return "" if _CAPTURE else string
+
+
+def cb_input_display(data, modifier, modifier_data, string):
+    """While the passphrase prompt waits, the input bar shows stars."""
+    if not _CAPTURE:
+        return string
+    return "*" * len(weechat.string_remove_color(string, ""))
+
+
+def cb_config(data, option, value):
+    _cancel_capture("keyfile/passwd_expire changed: passphrase prompt cancelled")
+    _lock("keyfile/passwd_expire changed: key locked.")
     return weechat.WEECHAT_RC_OK
 
 
@@ -672,7 +933,9 @@ def cb_notice(data, modifier, modifier_data, string):
 
     key, err = _load_key_pref()
     if err:
-        weechat.prnt("", "bot_auth: %s" % err)
+        weechat.prnt("", "bot_auth: %s" % ("the key locked before %s answered; /botunlock "
+                                           "and try again" % nick if err == LOCKED else err))
+        _QUEUE.pop(ck, None)
         return ""
 
     b64 = text[5:]
@@ -707,6 +970,7 @@ def cb_notice(data, modifier, modifier_data, string):
     q = _QUEUE.pop(ck, [])
     for cmd in q:
         _send_command("", server, mynick, key, nick, bot_pub64, cmd)
+    _used_once()
     return ""
 
 
@@ -757,6 +1021,10 @@ def cb_input_text(data, modifier, modifier_data, string):
     the text is sealed like /botcmd -- and shown as typed (cb_print).  If it
     cannot be sealed it is not sent.  Commands, frames and chats with anyone
     else pass untouched."""
+    if _CAPTURE:
+        # The passphrase prompt takes this line whole: never sent or shown.
+        _try_unlock(string)
+        return ""
     text = weechat.string_input_for_buffer(string)
     if not text or text.startswith(("~A2 ", "~A2S ")):
         return string
@@ -772,11 +1040,15 @@ def cb_input_text(data, modifier, modifier_data, string):
         return ""
     key, err = _load_key_pref()
     bot_pub64 = _KEY_CACHE.get(ck)
+    if err == LOCKED:
+        weechat.prnt("", "bot_auth: the key is locked -- not sent; /botunlock first")
+        return ""
     if err or not bot_pub64:
         weechat.prnt("", "bot_auth: %s -- not sent"
                      % (err or "no key for %s this session (/botauth %s)" % (bot_nick, bot_nick)))
         return ""
     line = _seal_for(ck, bot_nick, _DCC_NICK[ck], key, bot_pub64, text)
+    _used_once()
     if not line:
         return ""
     if len(_OWN_ECHO) > 32:
@@ -788,6 +1060,11 @@ def cb_input_text(data, modifier, modifier_data, string):
 def cb_timer(data, remaining_calls):
     for ck in list(_PENDING.keys()):
         _expire_pending(ck)
+    now = time.time()
+    if _UNLOCKED and _UNLOCKED["until"] is not None and now >= _UNLOCKED["until"]:
+        _lock("key locked again (passwd_expire); the next /botcmd asks for the passphrase.")
+    if _CAPTURE and now - _CAPTURE["t"] > PROMPT_TIMEOUT:
+        _cancel_capture("passphrase prompt timed out")
     return weechat.WEECHAT_RC_OK
 
 
@@ -801,6 +1078,8 @@ if weechat.register(SCRIPT_NAME, SCRIPT_AUTHOR, SCRIPT_VERSION, SCRIPT_LICENSE,
         weechat.config_set_plugin("sealed_replies", "on")
     if not weechat.config_is_set_plugin("sealed_marker"):
         weechat.config_set_plugin("sealed_marker", DEFAULT_MARKER)
+    if not weechat.config_is_set_plugin("passwd_expire"):
+        weechat.config_set_plugin("passwd_expire", "1h")
 
     weechat.hook_command(
         "botcmd",
@@ -821,11 +1100,25 @@ if weechat.register(SCRIPT_NAME, SCRIPT_AUTHOR, SCRIPT_VERSION, SCRIPT_LICENSE,
         "botforget",
         "Drop the cached key (and pin) for a bot",
         "<bot_nick>", "", "", "cb_botforget", "")
+    weechat.hook_command(
+        "botunlock",
+        "Enter the passphrase of a passphrase-protected keyfile (next line, masked)",
+        "", "The key stays unlocked for plugins.var.python.%s.passwd_expire "
+        "(default 1h; 0, 30m, 6h, 1d or never)." % SCRIPT_NAME, "", "cb_botunlock", "")
+    weechat.hook_command(
+        "botlock",
+        "Forget the unlocked key (and cancel a waiting passphrase prompt)",
+        "", "", "", "cb_botlock", "")
 
     weechat.hook_modifier("irc_in2_notice", "cb_notice", "")
     weechat.hook_modifier("irc_in2_privmsg", "cb_privmsg", "")
     weechat.hook_modifier("weechat_print", "cb_print", "")
     weechat.hook_modifier("input_text_for_buffer", "cb_input_text", "")
+    weechat.hook_modifier("history_add", "cb_history_add", "")
+    weechat.hook_modifier("input_text_display", "cb_input_display", "")
+    weechat.hook_modifier("input_text_display_with_cursor", "cb_input_display", "")
+    weechat.hook_config("plugins.var.python.%s.keyfile" % SCRIPT_NAME, "cb_config", "")
+    weechat.hook_config("plugins.var.python.%s.passwd_expire" % SCRIPT_NAME, "cb_config", "")
     weechat.hook_timer(5000, 0, 0, "cb_timer", "")
 
     if not CRYPTO_OK:

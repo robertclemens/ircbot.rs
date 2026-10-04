@@ -515,7 +515,7 @@ fi
 echo "[UPGRADE] Entering $UPGRADE_DIR and compiling..."
 cd "$UPGRADE_DIR"
 if [ -f Cargo.toml ]; then
-  cargo build --release 2>&1 | tee build.log
+  cargo build --release --bin ircbot 2>&1 | tee build.log
   NEW_BIN=target/release/ircbot
 else
   make clean >/dev/null 2>&1
@@ -859,7 +859,7 @@ chmod 700 "$NEW_BIN" 2>/dev/null
     } else {
         r#"cd "$UPGRADE_DIR" || rollback "build directory vanished"
 if [ -f Cargo.toml ]; then
-  cargo build --release >build.log 2>&1
+  cargo build --release --bin ircbot >build.log 2>&1
   BUILT=target/release/ircbot
 else
   make clean >/dev/null 2>&1
@@ -907,9 +907,10 @@ rm -rf "$UPGRADE_DIR" "{archive}" 2>/dev/null
 sleep {watch}
 P=$(cat "{PID_FILE}" 2>/dev/null | tr -dc 0-9)
 if [ -z "$P" ] || ! kill -0 "$P" 2>/dev/null; then
+  [ -f "{prev}" ] || exit 1
   echo "[UPGRADE] new build did not stay up — restoring previous build"
   mv -f "{exe}" "{exe}.failed" 2>/dev/null
-  mv -f "{prev}" "{exe}" || exit 1
+  mv -f "{prev}" "{exe}" || {{ mv -f "{exe}.failed" "{exe}"; exit 1; }}
   [ -f "{cfg_prev}" ] && cp -f "{cfg_prev}" "{CONFIG_FILE}"
   rm -f "{PID_FILE}" ./upgrade.sh
   exec "{exe}"
@@ -1543,7 +1544,11 @@ mod tests {
         assert!(src.contains(r#""$NEW_BIN" -selftest"#));
         assert!(sc.contains(r#"[ "$OLD_PID" = "$$" ] && break"#));
         assert!(sc.contains(&format!("sleep {UPGRADE_WATCH_SECS}")));
-        assert!(sc.contains(r#"mv -f "/x/ircbot.prev" "/x/ircbot" || exit 1"#));
+        // Nothing retained: the binary in place is never moved aside.
+        assert!(sc.contains(r#"[ -f "/x/ircbot.prev" ] || exit 1"#));
+        assert!(sc.contains(
+            r#"mv -f "/x/ircbot.prev" "/x/ircbot" || { mv -f "/x/ircbot.failed" "/x/ircbot"; exit 1; }"#
+        ));
         let rollback = sc.split("rollback() {").nth(1).unwrap();
         let rollback = rollback.split('}').next().unwrap();
         assert!(!rollback.contains(UPGRADE_MARKER_FILE));
