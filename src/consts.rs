@@ -12,7 +12,7 @@ pub const BOT_NAME: &str = "ircbot.rs by trojanman";
 /// made against.
 pub const BOT_VERSION: &str = match option_env!("IRCBOT_VERSION") {
     Some(v) => v,
-    None => "2.4.6",
+    None => "2.4.7",
 };
 pub const PASS_FILE: &str = ".ircbot.pass"; // machine-bound password file
 pub const PBKDF2_ITERATIONS: u32 = 100_000;
@@ -211,6 +211,22 @@ pub const CMD_BOT_TREE: u8 = 0x58;
 pub const CMD_CHAN_REQUEST: u8 = 0x59;
 pub const CMD_CHAN_ACTION: u8 = 0x5A;
 pub const CMD_CHAN_REPLY: u8 = 0x5B;
+// Channel-request election (irchub docs/plans/2026-10-07_chan_election_plan.md).
+// The hub asks whether we could do a channel request right now (PROBE; we
+// answer at once from our own state), then hands it to ONE bot that said yes
+// (DO), which reports back (DONE).  A hub that predates this never sends
+// PROBE and keeps using CMD_OP_GRANT / CMD_CHAN_ACTION.  Mirrors ircbot/bot.h.
+//   PROBE      hub->bot  eid|kind|channel
+//   PROBE_ACK  bot->hub  eid|1| or eid|0|reason
+//   DO         hub->bot  eid|kind|channel|requester|nick|hostmask
+//   DONE       bot->hub  eid|ok|detail or eid|fail|detail
+// kind = op / invite / unban / key.
+pub const CMD_CHAN_PROBE: u8 = 0x6D;
+pub const CMD_CHAN_PROBE_ACK: u8 = 0x6E;
+pub const CMD_CHAN_DO: u8 = 0x6F;
+pub const CMD_CHAN_DONE: u8 = 0x70;
+/// A nick the hub hands us, any network.
+pub const CHAN_DO_NICK_MAX: usize = 30;
 // Network-wide upgrade coordination (mirrors irchub/hub.h + ircbot/bot.h).
 pub const CMD_UPGRADE_PREPARE: u8 = 0x5E;
 pub const CMD_UPGRADE_READY: u8 = 0x5F;

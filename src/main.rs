@@ -43,6 +43,9 @@ use state::{
 /// attach.  RLIMIT_CORE 0 also survives the updater's exec.  Neither
 /// defends against root.
 fn harden_process() {
+    // Private by default whatever the shell's umask (Ubuntu's is 002): the setup wizard,
+    // pid, log and upgrade staging all inherit it.
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
     let _ = nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_CORE, 0, 0);
     let _ = nix::sys::prctl::set_dumpable(false);
 }
@@ -559,14 +562,14 @@ fn run_config_wizard() -> io::Result<()> {
 
 // ---- Daemon ------------------------------------------------------------------------------------
 
-/// Detach: new session, stdio to /dev/null, umask 027.  The working
+/// Detach: new session, stdio to /dev/null, umask 077.  The working
 /// directory stays (config and log paths are relative).
 fn daemonize() {
     if let Err(e) = nix::unistd::daemon(true, false) {
         eprintln!("daemon: {e}");
         std::process::exit(1);
     }
-    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o027));
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
 }
 
 /// The pid file, flock'd: the lock is what marks this bot as running.
@@ -601,7 +604,7 @@ fn lock_pid_file() -> Option<fs::File> {
 /// path comes from /proc/self/exe (`current_exe`; argv[0] has no directory when launched
 /// through PATH); returns it after chdir()ing to its directory.  That directory holds the
 /// binary an upgrade replaces, its .prev and the upgrade script, so refuse one another user
-/// owns or group/other can write -- they could swap any of them.  Mirrors
+/// owns and chmod go-w one group/other can write -- they could swap any of them.  Mirrors
 /// `instance_dir_enter()` in ircbot/main.c.
 fn instance_dir_enter() -> Option<String> {
     let Ok(exe) = std::env::current_exe() else {
@@ -619,13 +622,30 @@ fn instance_dir_enter() -> Option<String> {
             return None;
         }
     };
-    if md.uid() != nix::unistd::geteuid().as_raw() || md.mode() & 0o022 != 0 {
+    if md.uid() != nix::unistd::geteuid().as_raw() {
         eprintln!(
-            "Refusing to run from {}: it must be owned by this user and not writable by group \
-             or others (chmod go-w)",
+            "Refusing to run from {}: it must be owned by this user",
             dir.display()
         );
         return None;
+    }
+    // Group/other write (a 002 umask makes 0775 directories): we own it, so close the hole
+    // rather than refuse -- refusing turned every upgrade on such a host into a watchdog
+    // rollback and a fresh install into a dead start.  Nothing is weakened: the directory
+    // was open before we ran.
+    if md.mode() & 0o022 != 0 {
+        let m = md.mode() & 0o7777 & !0o022;
+        if let Err(e) = fs::set_permissions(dir, fs::Permissions::from_mode(m)) {
+            eprintln!(
+                "Refusing to run from {}: group/other can write it and chmod go-w failed ({e})",
+                dir.display()
+            );
+            return None;
+        }
+        eprintln!(
+            "Removed group/other write from {} (now {m:04o})",
+            dir.display()
+        );
     }
     if std::env::set_current_dir(dir).is_err() {
         eprintln!("Cannot change to my own directory {}", dir.display());
@@ -729,6 +749,11 @@ fn selftest() -> i32 {
     };
     if let Some(why) = updater::tls_unusable_reason() {
         return fail(&why);
+    }
+    // The swap happens in this directory: one another user owns is refused at start (a
+    // group/other-writable one we own is tightened there).
+    if !fs::metadata(".").is_ok_and(|m| m.uid() == nix::unistd::geteuid().as_raw()) {
+        return fail("this directory is not owned by this user");
     }
     if fs::metadata(CONFIG_FILE).is_err() {
         return fail(&format!("no {CONFIG_FILE}"));

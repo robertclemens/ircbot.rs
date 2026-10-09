@@ -1601,6 +1601,109 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
     }
 }
 
+// ---- Channel-request election (CMD_CHAN_PROBE / CMD_CHAN_DO) -----------
+
+/// None when we could do `kind` in `channel` right now, else why not.  Only
+/// our own state: in the channel and opped (op/invite/unban), or in it and
+/// holding its key (key).
+fn chan_elect_cannot(state: &BotState, kind: &str, channel: &str) -> Option<&'static str> {
+    let ci = match channel::find(state, channel) {
+        Some(ci) if state.chans[ci].status == ChanStatus::In => ci,
+        _ => return Some("not in channel"),
+    };
+    let c = &state.chans[ci];
+    match kind {
+        "key" => (c.key.is_empty()).then_some("no key"),
+        "op" | "invite" | "unban" => (!c.i_am_opped).then_some("not opped"),
+        _ => Some("unknown request"),
+    }
+}
+
+/// RFC 2812 nick characters, any length a network allows up to
+/// CHAN_DO_NICK_MAX: the nick goes straight into a MODE / INVITE line.
+fn chan_do_nick_ok(n: &str) -> bool {
+    let b = n.as_bytes();
+    if b.is_empty() || b.len() > CHAN_DO_NICK_MAX || b[0].is_ascii_digit() || b[0] == b'-' {
+        return false;
+    }
+    b.iter()
+        .all(|&ch| ch.is_ascii_alphanumeric() || b"[]\\`_^{}|-".contains(&ch))
+}
+
+fn chan_done_send(state: &mut BotState, id: &str, ok: bool, detail: &str) {
+    let out = format!("{id}|{}|{detail}", if ok { "ok" } else { "fail" });
+    if out.len() < 192 {
+        send_frame(state, CMD_CHAN_DONE, out.as_bytes());
+    }
+}
+
+/// We were picked: eid|kind|channel|requester|nick|hostmask.  Re-check (the
+/// channel may have changed since the probe), act once, report.
+fn chan_elect_do(state: &mut BotState, payload: &str) {
+    let r = sscanf(
+        payload,
+        &[
+            Fmt::Set(63, P),
+            Fmt::Lit("|"),
+            Fmt::Set(15, P),
+            Fmt::Lit("|"),
+            Fmt::Set(64, P),
+            Fmt::Lit("|"),
+            Fmt::Set(63, P),
+            Fmt::Lit("|"),
+            Fmt::Set(31, P),
+            Fmt::Lit("|"),
+            Fmt::Set(255, b"|\r\n"),
+        ],
+    );
+    if r.len() < 4 {
+        logm!(state, L_INFO, "[CHANREQ] Malformed CHAN_DO\n");
+        return;
+    }
+    let (id, kind, chan) = (r[0].s(), r[1].s(), r[2].s());
+    let nick = r.get(4).map_or("", |c| c.s());
+    let mask = r.get(5).map_or("", |c| c.s());
+    if let Some(why) = chan_elect_cannot(state, kind, chan) {
+        chan_done_send(state, id, false, why);
+        return;
+    }
+    if (kind == "op" || kind == "invite") && !chan_do_nick_ok(nick) {
+        chan_done_send(state, id, false, "not a valid nick");
+        return;
+    }
+    if kind == "op" {
+        logm!(
+            state,
+            L_INFO,
+            "[CHANREQ] Opping {} in {} (picked by the hub)\n",
+            nick,
+            chan
+        );
+        ircf!(state, "MODE {} +o {}\r\n", chan, nick);
+        chan_done_send(state, id, true, "MODE +o sent");
+        return;
+    }
+    let Some(k) = ChanReq::from_token(kind) else {
+        chan_done_send(state, id, false, "unknown request");
+        return;
+    };
+    if k == ChanReq::Unban && mask.is_empty() {
+        chan_done_send(state, id, false, "no hostmask to match");
+        return;
+    }
+    channel::access_service(state, id, k, chan, Some(nick), Some(mask), None);
+    chan_done_send(
+        state,
+        id,
+        true,
+        match k {
+            ChanReq::Invite => "INVITE sent",
+            ChanReq::Unban => "ban list check started",
+            ChanReq::Key => "key sent",
+        },
+    );
+}
+
 fn handle_response(state: &mut BotState, cmd: u8, payload: &str) {
     match cmd {
         CMD_PING => {
@@ -1698,6 +1801,36 @@ fn handle_response(state: &mut BotState, cmd: u8, payload: &str) {
                     );
                     ircf!(state, "INVITE {} {}\r\n", nick, chan);
                 }
+            }
+        }
+        CMD_CHAN_PROBE => {
+            // eid|kind|channel -- could we do this right now?  Answered at
+            // once from our own channel state; the hub hands the action to
+            // one bot that said yes, so a bot that cannot must say no rather
+            // than stay quiet.
+            let r = sscanf(
+                payload,
+                &[
+                    Fmt::Set(63, P),
+                    Fmt::Lit("|"),
+                    Fmt::Set(15, P),
+                    Fmt::Lit("|"),
+                    Fmt::Set(64, b"|\r\n"),
+                ],
+            );
+            if r.len() == 3 {
+                let (id, kind, chan) = (r[0].s(), r[1].s(), r[2].s());
+                let why = chan_elect_cannot(state, kind, chan);
+                let ack = format!("{id}|{}|{}", u8::from(why.is_none()), why.unwrap_or(""));
+                if ack.len() < 160 {
+                    send_frame(state, CMD_CHAN_PROBE_ACK, ack.as_bytes());
+                }
+            }
+        }
+        CMD_CHAN_DO => {
+            // eid|kind|channel|requester|nick|hostmask -- we were picked.
+            if !payload.is_empty() {
+                chan_elect_do(state, payload);
             }
         }
         CMD_CHAN_ACTION => {
