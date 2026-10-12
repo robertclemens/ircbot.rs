@@ -1,6 +1,7 @@
 //! Usermask matching and trusted-bot lookup (auth.c).
 
 use crate::consts::*;
+use crate::glob_overlap::glob_overlap;
 use crate::logm;
 use crate::state::BotState;
 
@@ -133,6 +134,62 @@ pub fn trusted_bot_by_nick(state: &BotState, nick: &str) -> Option<usize> {
 
 pub fn is_trusted_bot(state: &BotState, user_host: &str) -> bool {
     trusted_bot_by_host(state, user_host).is_some()
+}
+
+/// Index of the active user record (admin or oper) owning `uuid`; it need
+/// not hold a key.
+fn mask_has_active_user(state: &BotState, uuid: &str) -> Option<usize> {
+    state
+        .user_records
+        .iter()
+        .position(|u| u.is_active && u.uuid == uuid)
+}
+
+/// modes.md section 1: "authorised" = matches a trusted-bot mask, or an
+/// active usermask of an active admin/oper.  The user record need not hold a
+/// key: what matters is the operator's standing, not whether they can sign
+/// ~A2.
+pub fn is_authorised(state: &BotState, nuh: &str) -> bool {
+    if nuh.is_empty() {
+        return false;
+    }
+    if is_trusted_bot(state, nuh) {
+        return true;
+    }
+    state.mask_records.iter().any(|mr| {
+        mr.is_active
+            && !mr.mask.is_empty()
+            && wildcard_match(&mr.mask, nuh)
+            && mask_has_active_user(state, &mr.uuid).is_some()
+    })
+}
+
+/// Section 6.2 step 2: Some(label of the first conflict) when ban mask `mask`
+/// could also hit a bot or an operator who is not in the channel right now.
+/// Pattern-vs-pattern, so '*' on either side is taken at its widest.
+pub fn mask_overlaps_authorised(state: &BotState, mask: &str) -> Option<String> {
+    // matching drops a leading '~' of the ident (strip_ident_tilde), so the
+    // overlap test does too, on both sides
+    let nmask = strip_ident_tilde(mask);
+    if let Some(tb) = state
+        .trusted_bots
+        .iter()
+        .find(|tb| glob_overlap(&nmask, &strip_ident_tilde(&tb.mask)))
+    {
+        return Some(format!("bot {}", tb.mask));
+    }
+    for mr in &state.mask_records {
+        if !mr.is_active
+            || mr.mask.is_empty()
+            || !glob_overlap(&nmask, &strip_ident_tilde(&mr.mask))
+        {
+            continue;
+        }
+        if let Some(ui) = mask_has_active_user(state, &mr.uuid) {
+            return Some(format!("user {}", state.user_records[ui].name));
+        }
+    }
+    None
 }
 
 #[cfg(test)]

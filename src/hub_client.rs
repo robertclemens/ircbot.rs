@@ -23,7 +23,7 @@ use crate::state::{
     BotState, BotTreeRow, ChanReq, ChanStatus, HubAuthState, MaskRecord, S_AUTHED, S_CONNECTED,
     UserRecord, lww_accepts, opt_accepts,
 };
-use crate::{bot_comms, channel, config, ircf, logm, updater};
+use crate::{bot_comms, chancfg, chanlive, channel, config, ircf, logm, updater};
 
 /// Unsent bytes past which a hub that stopped reading is dropped.
 const HUB_WBUF_MAX: usize = 4 * 1024 * 1024;
@@ -763,29 +763,52 @@ fn chan_line(c: &crate::state::Chan) -> String {
     )
 }
 
-/// The bot's own config for the hub: c| (unless opt 'h'), v|, h|, n|.
-/// a|/o|/m| are hub-authoritative and go via push_admin_delta; s|, u|, g|,
-/// l|, i|, k| are local-only.
+/// The bot's own config for the hub: c| (unless opt 'h'), pending bot-written
+/// B|, v|, h|, n|.  a|/o|/m| are hub-authoritative and go via
+/// push_admin_delta; s|, u|, g|, l|, i|, k| are local-only.  Under opt 'h'
+/// c| is omitted as well, except a channel with `enf_pending` (a key / mode
+/// this bot learned and has not yet got to a hub: enforcement is never gated,
+/// D43): the bot refuses join/part locally, so other c| records can only be
+/// the hub's own copy.
 pub fn generate_config_payload(state: &BotState) -> String {
     let max = MAX_BUFFER - 64;
     let mut out = String::new();
-    if !state.is_opt_set(OPT_HUB_ONLY_MUTATIONS) {
-        for c in &state.chans {
-            logm!(
-                state,
-                L_DEBUG,
-                "[HUB-PUSH] Channel {}: is_managed={} op={} ts={}\n",
-                c.name,
-                c.is_managed as i32,
-                if c.is_managed { "add" } else { "del" },
-                c.timestamp
-            );
-            let l = chan_line(c);
-            if out.len() + l.len() >= max {
-                break;
-            }
-            out.push_str(&l);
+    let hub_only = state.is_opt_set(OPT_HUB_ONLY_MUTATIONS);
+    for c in &state.chans {
+        if hub_only && !c.enf_pending {
+            continue;
         }
+        if c.timestamp == 0 && !c.is_managed {
+            continue; // known only from its C| line: no c| of its own yet
+        }
+        logm!(
+            state,
+            L_DEBUG,
+            "[HUB-PUSH] Channel {}: is_managed={} op={} ts={}\n",
+            c.name,
+            c.is_managed as i32,
+            if c.is_managed { "add" } else { "del" },
+            c.timestamp
+        );
+        let l = chan_line(c);
+        if out.len() + l.len() >= max {
+            break;
+        }
+        out.push_str(&l);
+    }
+    // Bot-written bans (automatic bans) the hub has not got yet -- written
+    // while the link was down.  Always pushed, whatever opt 'h' says (D43).
+    for b in &state.cfg_bans {
+        if !b.push_pending || state.bot_uuid.is_empty() || b.setter != state.bot_uuid {
+            continue;
+        }
+        let Some(l) = chancfg::format_b_line(b) else {
+            break;
+        };
+        if out.len() + l.len() >= max {
+            break;
+        }
+        out.push_str(&l);
     }
     let mut add = |s: String| {
         if out.len() + s.len() < max {
@@ -811,6 +834,24 @@ pub fn generate_config_payload(state: &BotState) -> String {
 }
 
 /// Ask a bot for ops through the hub; false means fall back to PRIVMSG.
+/// Our own +o landed: grant the OP_GRANTs held while we had none, for nicks
+/// still in the channel and not opped.  Older than OP_GRANT_HOLD_SECS: dropped.
+pub fn grant_held_ops(state: &mut BotState, ci: usize) {
+    let t = now();
+    let held = std::mem::take(&mut state.chans[ci].op_grant_held);
+    for (nick, at) in held {
+        if t - at > OP_GRANT_HOLD_SECS {
+            continue;
+        }
+        let c = &state.chans[ci];
+        if c.roster.iter().find(|r| eq_ic(&r.nick, &nick)).is_some_and(|r| !r.is_op) {
+            let name = c.name.clone();
+            logm!(state, L_INFO, "[HUB] Granting ops to {} in {} (held hub request)\n", nick, name);
+            ircf!(state, "MODE {} +o {}\r\n", name, nick);
+        }
+    }
+}
+
 pub fn request_op(state: &mut BotState, target_uuid: &str, channel: &str) -> bool {
     if !state.hub_connected
         || !state.hub_authenticated
@@ -998,6 +1039,9 @@ pub fn push_config(state: &mut BotState) {
         payload.len()
     );
     if send_frame(state, CMD_CONFIG_PUSH, payload.as_bytes()) {
+        for b in &mut state.cfg_bans {
+            b.push_pending = false;
+        }
         logm!(state, L_INFO, "[HUB] Config pushed to hub\n");
     } else {
         logm!(state, L_INFO, "[HUB] Failed to push config\n");
@@ -1015,6 +1059,7 @@ pub fn push_channel(state: &mut BotState, ci: usize) {
         return;
     }
     if send_frame(state, CMD_CONFIG_PUSH, payload.as_bytes()) {
+        state.chans[ci].enf_pending = false;
         logm!(
             state,
             L_INFO,
@@ -1025,6 +1070,139 @@ pub fn push_channel(state: &mut BotState, ci: usize) {
     } else {
         logm!(state, L_INFO, "[HUB] Failed to push channel {}\n", name);
     }
+}
+
+/// Send complete record lines ("B|...\n", "c|...\n") to the hub as one
+/// CMD_CONFIG_PUSH, whatever opt 'h' says (D43).  False when no hub link.
+pub fn push_lines(state: &mut BotState, lines: &str) -> bool {
+    if !link_ready(state) || lines.is_empty() {
+        return false;
+    }
+    send_frame(state, CMD_CONFIG_PUSH, lines.as_bytes())
+}
+
+// ---- CMD_CHAN_EVENT emitter (D42) -------------------------------------------------
+// One frame per enforcement action: "#chan|action|target|detail".  Limits,
+// all bot-side so a flood of events cannot become a flood to the hub:
+//   - the same (chan, action, target) at most once per CHAN_EVENT_DEDUPE_SECS;
+//   - at most CHAN_EVENT_WINDOW_MAX events per CHAN_EVENT_WINDOW_SECS;
+// excess is counted, and the count goes out once as "N events suppressed"
+// (target "*") as soon as an event is allowed again.
+const CHAN_EVENT_ACTIONS: [&str; 9] = [
+    "deop",
+    "reop",
+    "kick",
+    "ban",
+    "unban",
+    "moderevert",
+    "limit",
+    "floodtrip",
+    "ignore",
+];
+
+/// Copy of `src` cut at `cap` - 1 bytes (on a character boundary) with
+/// control bytes and the record delimiter flattened to spaces.
+fn event_clean(cap: usize, src: &str) -> String {
+    let mut out = String::new();
+    for ch in src.chars() {
+        if out.len() + ch.len_utf8() + 1 > cap {
+            break;
+        }
+        out.push(if (ch as u32) < 0x20 || ch == '\x7f' || ch == '|' {
+            ' '
+        } else {
+            ch
+        });
+    }
+    out
+}
+
+/// CMD_CHAN_EVENT (D42): one enforcement action, bot-side rate limited
+/// (CHAN_EVENT_*).  action: deop reop kick ban unban moderevert limit
+/// floodtrip ignore.  True when a frame was sent.
+pub fn chan_event(
+    state: &mut BotState,
+    chan: &str,
+    action: &str,
+    target: &str,
+    detail: &str,
+) -> bool {
+    if !chan.starts_with(['#', '&']) {
+        return false;
+    }
+    if !CHAN_EVENT_ACTIONS.contains(&action) || chan.len() >= MAX_CHAN {
+        return false;
+    }
+    if state.hubs.is_empty() || state.hub.is_none() || !state.hub_authenticated {
+        return false;
+    }
+
+    let t = now();
+    let tgt = event_clean(CHAN_EVENT_TARGET_MAX + 1, target);
+    let det = event_clean(CHAN_EVENT_DETAIL_MAX + 1, detail);
+    if tgt.is_empty() {
+        return false;
+    }
+
+    // Dedupe key: lower-cased "chan|action|target" (buffer MAX_CHAN + 16 +
+    // CHAN_EVENT_TARGET_MAX + 4).
+    let key = format!("{chan}|{action}|{tgt}").to_ascii_lowercase();
+    if key.len() >= MAX_CHAN + 16 + CHAN_EVENT_TARGET_MAX + 4 {
+        return false;
+    }
+    let lim = &mut state.chan_event;
+    let mut slot: Option<usize> = None;
+    let mut oldest = 0usize;
+    for (i, e) in lim.seen.iter().enumerate() {
+        if e.when != 0 && e.key == key {
+            slot = Some(i);
+            break;
+        }
+        if e.when < lim.seen[oldest].when {
+            oldest = i;
+        }
+    }
+    let mut limited = slot.is_some_and(|i| t - lim.seen[i].when < CHAN_EVENT_DEDUPE_SECS);
+    if !limited {
+        let first = lim.window[lim.widx]; // the oldest of the last N sends
+        limited = first != 0 && t - first < CHAN_EVENT_WINDOW_SECS;
+    }
+    if limited {
+        lim.suppressed += 1;
+        lim.sup_chan = trunc_string(chan, MAX_CHAN);
+        lim.sup_action = trunc_string(action, 16);
+        return false;
+    }
+    let slot = slot.unwrap_or(oldest);
+    lim.seen[slot].key = key;
+    lim.seen[slot].when = t;
+
+    let out = format!("{chan}|{action}|{tgt}|{det}");
+    if out.len() >= MAX_CHAN + 16 + CHAN_EVENT_TARGET_MAX + CHAN_EVENT_DETAIL_MAX + 8 {
+        return false;
+    }
+    lim.window[lim.widx] = t;
+    lim.widx = (lim.widx + 1) % CHAN_EVENT_WINDOW_MAX;
+    let sent = send_frame(state, CMD_CHAN_EVENT, out.as_bytes());
+
+    // The summary of what the limiter held back, once, in its own slot of the
+    // window (so a summary can never itself start a flood).
+    let lim = &mut state.chan_event;
+    if sent && lim.suppressed > 0 {
+        let first = lim.window[lim.widx];
+        if first == 0 || t - first >= CHAN_EVENT_WINDOW_SECS {
+            let sd = format!("{} events suppressed", lim.suppressed);
+            let out = format!("{}|{}|*|{}", lim.sup_chan, lim.sup_action, sd);
+            if out.len() < MAX_CHAN + 16 + CHAN_EVENT_TARGET_MAX + CHAN_EVENT_DETAIL_MAX + 8 {
+                lim.window[lim.widx] = t;
+                lim.widx = (lim.widx + 1) % CHAN_EVENT_WINDOW_MAX;
+                if send_frame(state, CMD_CHAN_EVENT, out.as_bytes()) {
+                    state.chan_event.suppressed = 0;
+                }
+            }
+        }
+    }
+    sent
 }
 
 /// PURGE|<cutoff>: drop tombstones stamped before cutoff (0: all).
@@ -1048,7 +1226,9 @@ fn apply_purge(state: &mut BotState, arg: &str) -> usize {
     state
         .mask_records
         .retain(|m| m.is_active || !old(m.timestamp));
-    let purged = before - (state.chans.len() + state.user_records.len() + state.mask_records.len());
+    let mut purged =
+        before - (state.chans.len() + state.user_records.len() + state.mask_records.len());
+    purged += chancfg::purge_bans(state, cutoff);
     if purged > 0 {
         logm!(
             state,
@@ -1502,6 +1682,30 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
         let applied = match b[0] {
             b'c' => sync_channel_line(state, data),
             b'm' => sync_mask_line(state, data),
+            // modes.md records.  Each is bounded and validated in chancfg.rs;
+            // a line that does not parse is dropped, one this build cannot
+            // use is kept.
+            b'C' => {
+                let ok = chancfg::apply_c_line(state, data);
+                if ok {
+                    logm!(state, L_DEBUG, "[HUB-SYNC] Channel settings updated\n");
+                }
+                ok
+            }
+            b'D' => {
+                let ok = chancfg::apply_d_line(state, data);
+                if ok {
+                    logm!(state, L_DEBUG, "[HUB-SYNC] Network defaults updated\n");
+                }
+                ok
+            }
+            b'B' => {
+                let ok = chancfg::apply_b_line(state, data);
+                if ok {
+                    logm!(state, L_DEBUG, "[HUB-SYNC] Ban record updated\n");
+                }
+                ok
+            }
             b'a' | b'o' => sync_user_line(state, b[0] as char, data),
             b'O' => match config::parse_opt_line(data) {
                 Some((flags, ts))
@@ -1614,7 +1818,7 @@ fn chan_elect_cannot(state: &BotState, kind: &str, channel: &str) -> Option<&'st
     let c = &state.chans[ci];
     match kind {
         "key" => (c.key.is_empty()).then_some("no key"),
-        "op" | "invite" | "unban" => (!c.i_am_opped).then_some("not opped"),
+        "op" | "invite" | "unban" | "mode" => (!c.i_am_opped).then_some("not opped"),
         _ => Some("unknown request"),
     }
 }
@@ -1656,7 +1860,8 @@ fn chan_elect_do(state: &mut BotState, payload: &str) {
             Fmt::Set(255, b"|\r\n"),
         ],
     );
-    if r.len() < 4 {
+    // A `mode` job carries no requester / nick: eid|mode|channel is enough.
+    if r.len() < 3 || (r.len() < 4 && r.get(1).map(|k| k.s()) != Some("mode")) {
         logm!(state, L_INFO, "[CHANREQ] Malformed CHAN_DO\n");
         return;
     }
@@ -1671,7 +1876,55 @@ fn chan_elect_do(state: &mut BotState, payload: &str) {
         chan_done_send(state, id, false, "not a valid nick");
         return;
     }
+    if kind == "mode" {
+        // `channel mode`: move the live modes to the stored C| modes + c|
+        // key, once.  The MODE lines go through the send queue (packed,
+        // paced).
+        let mc = channel::find(state, chan);
+        let (n, note) = match mc {
+            Some(mc) => chanlive::apply_stored(state, mc),
+            None => (-1, "not in channel".to_string()),
+        };
+        if n < 0 {
+            chan_done_send(state, id, false, &note);
+            return;
+        }
+        logm!(
+            state,
+            L_INFO,
+            "[CHANREQ] Applied stored modes in {}: {}\n",
+            chan,
+            note
+        );
+        let me = state.current_nick.clone();
+        chan_done_send(state, id, true, &me);
+        return;
+    }
     if kind == "op" {
+        // +bitch (D12): only an authorised member may hold ops.  The hub
+        // knows the users but not the nick's hostmask -- this bot does.  A
+        // nick we cannot find is not vouched for either (fail closed).
+        if let Some(bc) = channel::find(state, chan)
+            && chanlive::bitch(state, bc)
+        {
+            let (found, authorised) = chanlive::member_authorised(state, bc, nick);
+            if !found || !authorised {
+                logm!(
+                    state,
+                    L_INFO,
+                    "[CHANREQ] Not opping {} in {}: +bitch and {}\n",
+                    nick,
+                    chan,
+                    if found {
+                        "not authorised"
+                    } else {
+                        "not in my roster"
+                    }
+                );
+                chan_done_send(state, id, false, "bitch");
+                return;
+            }
+        }
         logm!(
             state,
             L_INFO,
@@ -1755,13 +2008,28 @@ fn handle_response(state: &mut BotState, cmd: u8, payload: &str) {
                         );
                         ircf!(state, "MODE {} +o {}\r\n", chan, nick);
                     } else {
-                        logm!(
-                            state,
-                            L_INFO,
-                            "[HUB] Cannot grant ops to {} in {} - I'm not opped\n",
-                            nick,
-                            chan
-                        );
+                        // Asked before our own +o arrived: hold it for that +o.
+                        let t = now();
+                        let held = &mut state.chans[ci].op_grant_held;
+                        held.retain(|(n, at)| t - *at <= OP_GRANT_HOLD_SECS && !eq_ic(n, &nick));
+                        if held.len() < OP_GRANT_HOLD_MAX {
+                            held.push((nick.clone(), t));
+                            logm!(
+                                state,
+                                L_INFO,
+                                "[HUB] Not opped in {} yet; holding the op for {} until I am\n",
+                                chan,
+                                nick
+                            );
+                        } else {
+                            logm!(
+                                state,
+                                L_INFO,
+                                "[HUB] Cannot grant ops to {} in {} - I'm not opped\n",
+                                nick,
+                                chan
+                            );
+                        }
                     }
                 }
                 _ => logm!(

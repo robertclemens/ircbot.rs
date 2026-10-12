@@ -16,8 +16,10 @@ use crate::crypto;
 use crate::cstr::{
     Scan, atoll, has_uuid_dashes, is_uuid, now, split_fields, strtoll, trunc, trunc_string,
 };
-use crate::state::{BotState, ChanStatus, HubEntry, MaskRecord, TrustedBot, UserLine, UserRecord};
-use crate::{channel, hub_client, logm};
+use crate::state::{
+    BotState, ChanStatus, HubEntry, MaskRecord, TrustedBot, UserLine, UserRecord, lww_accepts,
+};
+use crate::{chancfg, channel, hub_client, logm};
 
 /// A key-shaped field: Some(b64) only if it is exactly a valid key.
 fn field_pubkey(f: &str) -> Option<String> {
@@ -323,19 +325,46 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
                 }
             }
             b'c' => {
-                if let Some((chan, key, op, ts)) = parse_cfg_chan(data)
-                    && let Some(ci) = channel::add(state, &chan)
-                {
-                    let c = &mut state.chans[ci];
-                    if !key.is_empty() {
-                        c.key = trunc_string(&key, MAX_KEY);
-                    }
-                    c.is_managed = op != "del";
-                    c.timestamp = if ts > 0 { ts } else { now() };
-                    if !c.is_managed {
-                        c.status = ChanStatus::Out;
+                if let Some((chan, key, op, ts)) = parse_cfg_chan(data) {
+                    // Channel names match regardless of ASCII case (D39): a
+                    // file that holds both "#Chan" and "#chan" merges into
+                    // one entry, the newest stamp winning (the first
+                    // writer's spelling is kept).
+                    let is_add = op != "del";
+                    let eff_ts = if ts > 0 { ts } else { now() };
+                    if let Some(ci) = channel::find(state, &chan) {
+                        let c = &mut state.chans[ci];
+                        // timestamp 0 = a C| line got here first (held
+                        // unmanaged)
+                        if c.timestamp == 0
+                            || lww_accepts(eff_ts, is_add, c.timestamp, c.is_managed)
+                        {
+                            c.key = trunc_string(&key, MAX_KEY);
+                            c.is_managed = is_add;
+                            c.timestamp = eff_ts;
+                            if !c.is_managed {
+                                c.status = ChanStatus::Out;
+                            }
+                        }
+                    } else if let Some(ci) = channel::add(state, &chan) {
+                        let c = &mut state.chans[ci];
+                        if !key.is_empty() {
+                            c.key = trunc_string(&key, MAX_KEY);
+                        }
+                        c.is_managed = is_add;
+                        c.timestamp = eff_ts;
+                        // Don't join deleted channels
+                        if !c.is_managed {
+                            c.status = ChanStatus::Out;
+                        }
                     }
                 }
+            }
+            b'C' => {
+                chancfg::apply_c_line(state, data);
+            }
+            b'B' => {
+                chancfg::apply_b_line(state, data);
             }
             b'm' => load_mask_line(state, data),
             b'a' | b'o' => {
@@ -445,7 +474,17 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
                 ),
             },
             b'i' => state.bot_uuid = trunc_string(data, 64),
-            b'D' => state.admin_delta_pending = data == "1",
+            // D|1: user/mask changes made while the hub was unreachable are
+            // still to be pushed (admin_delta_pending).  A D| line with
+            // fields (D|<modes>|<settings>|<ts>) is the network defaults
+            // record; the two never share a shape.
+            b'D' => {
+                if !data.contains('|') {
+                    state.admin_delta_pending = data == "1";
+                } else {
+                    chancfg::apply_d_line(state, data);
+                }
+            }
             b'O' => {
                 if let Some((flags, ts)) = parse_opt_line(data) {
                     state.opt_flags = flags;
@@ -750,6 +789,11 @@ fn serialize(state: &BotState) -> Option<Zeroizing<String>> {
         push(&format!("s|{s}\n"));
     }
     for c in &state.chans {
+        // A channel known only from its C| line (no c| yet) has no record of
+        // its own to write.
+        if c.timestamp == 0 && !c.is_managed {
+            continue;
+        }
         push(&format!(
             "c|{}|{}|{}|{}\n",
             c.name,
@@ -757,6 +801,15 @@ fn serialize(state: &BotState) -> Option<Zeroizing<String>> {
             if c.is_managed { "add" } else { "del" },
             c.timestamp
         ));
+    }
+    // modes.md records: per-channel settings, network defaults, bans.  Raw
+    // settings text goes back out unchanged, unknown names included.
+    for c in &state.chans {
+        push(&chancfg::format_c_line(c)?);
+    }
+    push(&chancfg::format_d_line(state)?);
+    for b in &state.cfg_bans {
+        push(&chancfg::format_b_line(b)?);
     }
     for u in &state.user_records {
         let l = format_user_line(u);

@@ -102,6 +102,11 @@ pub const MAX_USER_MASKS: usize = 200;
 pub const MAX_CHAN: usize = 65; // buffer size incl. NUL: names up to 64 bytes
 pub const MAX_BUFFER: usize = 16384;
 pub const MAX_NICK: usize = 10; // 9 chars + NUL
+pub const OP_GRANT_HOLD_MAX: usize = 8; // OP_GRANTs held per channel until our own +o
+pub const OP_GRANT_HOLD_SECS: i64 = 15; // ...and for at most this long
+/// Other people's nicks (roster, flood tracking): the server's NICKLEN, which
+/// is 30 and more on today's networks, not this bot's own 9-character limit.
+pub const MAX_MEMBER_NICK: usize = 32;
 pub const MAX_PASS: usize = 128;
 pub const MAX_KEY: usize = 31; // channel key: up to 30 bytes
 pub const MAX_MASK_LEN: usize = 256;
@@ -117,7 +122,27 @@ pub const CFG_BLINE_MAX: usize = 448;
 pub const CFG_MAX_GLOBALS: usize = 64;
 pub const CFG_BOT_SYNC_FIELDS: usize = 8;
 pub const CFG_PAYLOAD_SLACK: usize = 8192;
+// modes.md section 2: C| (per channel), D| (one) and B| (bans) lines.  The
+// ceiling stays derived from these macros, so the C| / D| / B| ingest caps
+// below are what make it a hard bound.
+pub const C_MODES_MAX: usize = 64; // modes field of C| / D|
+pub const C_SETTINGS_MAX: usize = 512; // settings field of C|
+pub const D_SETTINGS_MAX: usize = 512; // settings field of D|
+pub const BAN_REASON_MAX: usize = 120;
+pub const BAN_MASK_MAX: usize = 120;
+pub const BAN_SETTER_MAX: usize = 63; // admin name or bot uuid
+pub const MAX_BANS_PER_CHAN: usize = 100;
+pub const MAX_GLOBAL_BANS: usize = 100; // bans with channel "*"
+pub const CFG_MAX_CHANNELS: usize = CFG_MAX_GLOBALS;
+pub const C_LINE_MAX: usize = 2 + MAX_CHAN + 1 + C_MODES_MAX + 1 + C_SETTINGS_MAX + 24;
+pub const D_LINE_MAX: usize = 2 + C_MODES_MAX + 1 + D_SETTINGS_MAX + 24;
+pub const B_LINE_MAX: usize =
+    2 + MAX_CHAN + 1 + BAN_MASK_MAX + 1 + 24 + 8 + BAN_SETTER_MAX + 1 + BAN_REASON_MAX + 40;
+pub const CFG_MAX_BANS: usize = MAX_GLOBAL_BANS + CFG_MAX_CHANNELS * MAX_BANS_PER_CHAN;
 pub const MAX_CONFIG_PAYLOAD: usize = CFG_MAX_GLOBALS * CFG_GLOBAL_LINE_MAX
+    + CFG_MAX_CHANNELS * C_LINE_MAX
+    + D_LINE_MAX
+    + CFG_MAX_BANS * B_LINE_MAX
     + MAX_USER_RECORDS * CFG_USER_LINE_MAX
     + MAX_USER_MASKS * CFG_MASK_LINE_MAX
     + CFG_BOT_SYNC_FIELDS * CFG_BOT_FIELD_LINE
@@ -125,7 +150,7 @@ pub const MAX_CONFIG_PAYLOAD: usize = CFG_MAX_GLOBALS * CFG_GLOBAL_LINE_MAX
     + CFG_PAYLOAD_SLACK;
 /// Largest inbound hub frame = envelope(5) + payload + GCM tag, plus margin.
 pub const MAX_HUB_FRAME: usize = MAX_CONFIG_PAYLOAD + 64;
-pub const MAX_ROSTER_SIZE: usize = 50;
+pub const MAX_ROSTER_SIZE: usize = 500;
 pub const MAX_SEEN_HASHES: usize = 4096;
 pub const NONCE_CACHE_SIZE: usize = 4096;
 pub const NONCE_TTL_SECONDS: i64 = 60;
@@ -227,6 +252,83 @@ pub const CMD_CHAN_DO: u8 = 0x6F;
 pub const CMD_CHAN_DONE: u8 = 0x70;
 /// A nick the hub hands us, any network.
 pub const CHAN_DO_NICK_MAX: usize = 30;
+// ---- Channel modes / settings / bans / floods (irchub docs/modes.md) -----------
+// The 0x76-0x7A ops are console->hub only; a bot never sends or handles them
+// and they are declared so the numbers stay reserved on both sides.
+// CMD_CHAN_EVENT is the one bot-originated frame: one enforcement action
+// (D42), `#chan|<action>|<target>|<detail>`, rate-limited by the bot
+// (hub_client::chan_event) and logged by the hub.  Mirrors irchub/hub.h.
+#[allow(dead_code)]
+pub const CMD_ADMIN_CHAN_MODE: u8 = 0x76; // console -> hub: channel mode
+#[allow(dead_code)]
+pub const CMD_ADMIN_CHAN_SET: u8 = 0x77; // console -> hub: channel set
+#[allow(dead_code)]
+pub const CMD_ADMIN_BAN: u8 = 0x78; // console -> hub: ban list / add / del
+#[allow(dead_code)]
+pub const CMD_ADMIN_NET_SET: u8 = 0x79; // console -> hub: network set
+#[allow(dead_code)]
+pub const CMD_ADMIN_SET_SSH: u8 = 0x7A; // console -> hub: hub set ssh / conn
+pub const CMD_CHAN_EVENT: u8 = 0x7B; // bot -> hub: #chan|action|target|detail
+pub const CHAN_EVENT_TARGET_MAX: usize = 120;
+pub const CHAN_EVENT_DETAIL_MAX: usize = 160;
+pub const CHAN_EVENT_DEDUPE_SECS: i64 = 10; // per (chan, action, target)
+pub const CHAN_EVENT_WINDOW_SECS: i64 = 60; // total-rate window
+pub const CHAN_EVENT_WINDOW_MAX: usize = 20; // events per window
+pub const CHAN_EVENT_TRACK: usize = 32; // dedupe slots (oldest replaced)
+
+// 005 (RPL_ISUPPORT) values this bot uses; reset on every disconnect.
+pub const ISUPPORT_MODES_DEFAULT: i32 = 3;
+pub const ISUPPORT_MODES_MAX: i32 = 12;
+pub const NICKLEN_DEFAULT: i32 = 30;
+pub const MAXLIST_DEFAULT: i32 = 100;
+pub const BAN_LIST_CAP: i32 = 200; // our own ceiling on a stored list
+
+// In-channel elections and set-option enforcement (chanenf.rs, modes.md
+// sections 4, 6, 7).  The five jobs, in deal order:
+pub const JOB_KICK: usize = 0;
+pub const JOB_BAN: usize = 1;
+pub const JOB_OP: usize = 2;
+pub const JOB_MODE: usize = 3;
+pub const JOB_LIMIT: usize = 4;
+pub const JOB_COUNT: usize = 5;
+pub const JOB_STEP_MS: i64 = 1500; // backup delay = backup index x this
+pub const MAX_PENDING_JOBS: usize = 32;
+pub const JOB_MIN_VERSION: &str = "2.4.7"; // older bots are left out of the deal
+pub const JOB_MAX_AGE_MS: i64 = 30000; // a pending job older than this is dropped
+pub const ENF_SWEEP_SECS: i64 = 5; // per-channel state sweep when nothing happened
+/// Idle clocks (ban_track, grown on demand): one per channel x listed ban, so a
+/// network ban on "*" costs one per channel.  The ceiling covers every
+/// channel's own bans plus every global ban in every channel; the table is
+/// pruned by minute_sweep and only the oldest-matched clock goes if it is
+/// ever full.
+pub const MAX_BAN_TRACK: usize = CFG_MAX_BANS + MAX_GLOBAL_BANS * CFG_MAX_CHANNELS;
+pub const ENF_RESWEEP_MS: i64 = 2000; // a dirty channel is swept at most this often
+pub const ENF_KICKS_PER_SWEEP: usize = 4; // kicks queued per channel per ban sweep
+pub const MAX_OFFENCES: usize = 64;
+pub const ENF_RECENT: usize = 32;
+pub const ENF_CYCLE_MIN_SECS: i64 = 600; // +cycle: at most one part/rejoin per this
+
+// Flood counters (chanflood.rs, botflood.rs; modes.md sections 8, 9.1).
+pub const MAX_FLOOD_TRACK: usize = 64; // sources tracked per channel, oldest replaced
+pub const MAX_IGNORES: usize = 64; // bot ignore table (runtime only)
+pub const MAX_HOST_TRACK: usize = 64; // hosts tracked for the bot msg / ctcp floods
+pub const FLOOD_HOST_MAX: usize = 128; // a tracked host (cut, lower-cased), buffer size
+pub const QUIET_FILL_MS: i64 = 60000; // a table full within this -> quiet mode
+
+// Output send queue (sendq.rs): three lanes, drained by pacing.
+pub const MAX_SENDQ: usize = 256; // lines held, all lanes together
+pub const SENDQ_LANES: usize = 3;
+pub const SENDQ_LANE_PROTO: usize = 0; // PONG, registration
+pub const SENDQ_LANE_PROT: usize = 1; // MODE / KICK
+pub const SENDQ_LANE_REST: usize = 2; // everything else (dropped first)
+pub const SENDQ_DEF_BURST: i64 = 10; // lines sent back to back (D| sendq B)
+pub const SENDQ_DEF_INTERVAL_MS: i64 = 100; // then one line per this (D| sendq I)
+pub const SENDQ_MIN_BURST: i64 = 1;
+pub const SENDQ_MAX_BURST: i64 = 100;
+pub const SENDQ_MIN_INTERVAL_MS: i64 = 0; // 0 = unpaced
+pub const SENDQ_MAX_INTERVAL_MS: i64 = 10000;
+pub const SENDQ_LINE_MAX: usize = 510; // IRC line body; CR LF is added after
+
 // Network-wide upgrade coordination (mirrors irchub/hub.h + ircbot/bot.h).
 pub const CMD_UPGRADE_PREPARE: u8 = 0x5E;
 pub const CMD_UPGRADE_READY: u8 = 0x5F;

@@ -80,9 +80,12 @@ On IRC, `help +admin` and `help auth` explain the keypair and the handshake. Old
 
 See `utils/README.txt` for the other transports and for why these scripts must not be reimplemented on top of the `openssl` CLI.
 
+8) Channel modes, settings and bans from IRC (admins; for networks without a hub, refused under opt `h`): `chanmode <#c> [<modes> [args]|-]` (modes `i m n p s t k l`; `+k` and `+l` take their argument left to right; `chkey <#c> <key>` is `chanmode <#c> +k <key>`), `chanset <#c|default> [+opt -opt] [<name> <value|default>] [flood <type> <N:S|off|default>]` (no arguments lists the values and where each comes from), `+ban <#c|*> <nick!user@host> [<minutes>|perm] [sticky] [reason]`, `-ban <#c|*> <mask>` and `bans [#c]`. A ban that would hit a bot or an authorised user is refused. `help <command>` has the syntax.
+
 ### Changelog
 
 * Unreleased (passwordless branch)
+    * Enhancement: Flood protection. Channel floods (`chan ctcp join nick deop kick ban`, per source host, trip at N+1, kick/ban ladder, bots that are not opped only log) and bot floods (`cmd` per user, `msg` and `ctcp` per host, ignore table of 64, quiet mode). New admin commands `chanmode`, `chanset`, `+ban`, `-ban`, `bans` write the bot's own `C|`/`D|`/`B|` records. NOTICEs are now counted by the flood checks; the 329/367 timestamp parse accepts up to 20 digits; a case-only nick change keeps the roster entry
     * Change: `encrypt_config` / `decrypt_config` (and `utils/config_tool.rs`) are gone from the tree; general use does not need them. They live on as test helpers in ircbot-testnet (`tools/`)
     * Enhancement: The utils/ tools (`keygen`, `bot-auth`) are ported 1:1 to Rust and built by `cargo build --release`; the tree no longer contains C. Same files, output and exit codes as the C tools. Upgrade scripts build `--bin ircbot` only
     * Enhancement: Sealed replies. A command sent as `~A2S` (the irssi, HexChat and WeeChat scripts' default) is answered with `~A2R` frames only its sender can open; the scripts show them decrypted, marked with a lock. `~A2` is still answered in plaintext. In a DCC chat the scripts also seal text typed straight into the chat window. `bot-auth cmd --sealed` / `bot-auth reply` for the command line

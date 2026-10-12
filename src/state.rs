@@ -1,6 +1,9 @@
 //! The bot's state (bot_state_t and the records it holds) and the small
 //! inline rules from bot.h (LWW acceptance, nick validation).
 
+use std::cell::Cell;
+use std::collections::VecDeque;
+
 use mio::Registry;
 use zeroize::Zeroizing;
 
@@ -131,6 +134,333 @@ pub struct RosterEntry {
     pub nick: String,
     pub hostmask: String,
     pub is_op: bool,
+    /// PREFIX 'h' (D41); false on a server without it.
+    pub is_halfop: bool,
+    pub is_voice: bool,
+    /// chanenf.rs: cached "authorised" verdict for `hostmask`, valid while
+    /// `auth_gen` equals the state's (0 = never computed).  Cells, as the
+    /// cache is filled through a shared borrow (C casts the const away).
+    pub authorised: Cell<bool>,
+    pub auth_gen: Cell<u32>,
+}
+
+/// Settings that live in a C| / D| `settings` field as name=value.  The
+/// first ten are flags (0/1), the rest numbers with the ranges in chancfg.rs.
+/// `Ignoretime` is network-only (D|).  Discriminants index `ChanSettings`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CsetId {
+    EnforceModes = 0,
+    Bitch,
+    ProtectOps,
+    Revenge,
+    StopNetHack,
+    EnforceBans,
+    DynamicBans,
+    DontKickOps,
+    Cycle,
+    DynamicLimit,
+    BanTime,
+    BanType,
+    BanIdle,
+    LimitGap,
+    LimitDelay,
+    IgnoreTime,
+}
+
+pub const CS_COUNT: usize = 16;
+
+impl CsetId {
+    /// Every setting, in discriminant order (the `chanset` listing walks it).
+    pub const ALL: [CsetId; CS_COUNT] = [
+        CsetId::EnforceModes,
+        CsetId::Bitch,
+        CsetId::ProtectOps,
+        CsetId::Revenge,
+        CsetId::StopNetHack,
+        CsetId::EnforceBans,
+        CsetId::DynamicBans,
+        CsetId::DontKickOps,
+        CsetId::Cycle,
+        CsetId::DynamicLimit,
+        CsetId::BanTime,
+        CsetId::BanType,
+        CsetId::BanIdle,
+        CsetId::LimitGap,
+        CsetId::LimitDelay,
+        CsetId::IgnoreTime,
+    ];
+}
+
+/// Flood settings: the seven channel types (`flood <type>`), then the three
+/// bot floods (`bflood cmd|msg|ctcp`, D| only).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FloodKind {
+    Chan = 0,
+    Ctcp,
+    Join,
+    Nick,
+    Deop,
+    Kick,
+    Ban,
+    BotCmd,
+    BotMsg,
+    BotCtcp,
+    /// `sendq` B:I (D| only; n = burst 1..100, s = interval ms 0..10000, never `off`).
+    Sendq,
+}
+
+pub const FL_COUNT: usize = 11;
+
+impl FloodKind {
+    /// Every flood, in discriminant order.
+    pub const ALL: [FloodKind; FL_COUNT] = [
+        FloodKind::Chan,
+        FloodKind::Ctcp,
+        FloodKind::Join,
+        FloodKind::Nick,
+        FloodKind::Deop,
+        FloodKind::Kick,
+        FloodKind::Ban,
+        FloodKind::BotCmd,
+        FloodKind::BotMsg,
+        FloodKind::BotCtcp,
+        FloodKind::Sendq,
+    ];
+}
+/// FL_CHAN..FL_BAN are per-channel.
+pub const FL_CHAN_COUNT: usize = 7;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FloodSpec {
+    /// An override is set.
+    pub present: bool,
+    /// `off`.
+    pub off: bool,
+    /// More than n events in s seconds trips it.
+    pub n: i32,
+    pub s: i32,
+}
+
+/// A parsed settings field: only the overrides it names.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ChanSettings {
+    /// Bit per `CsetId`.
+    pub present: u32,
+    pub val: [i64; CS_COUNT],
+    pub fl: [FloodSpec; FL_COUNT],
+    /// A sendq=... token was present but invalid.
+    pub bad_sendq: bool,
+}
+
+/// One counting window: the first event opens it, more than n events before
+/// s seconds have passed from its start trip it.  Checked on arrival only.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FloodWindow {
+    /// Monotonic ms; only meaningful while `count` > 0.
+    pub start_ms: i64,
+    pub count: i32,
+}
+
+/// One source host in one channel: a window per channel flood type.  An
+/// empty `host` is a free slot.
+#[derive(Clone, Debug, Default)]
+pub struct FloodSrc {
+    /// Lower-cased, cut to FLOOD_HOST_MAX.
+    pub host: String,
+    /// Last counted event (the oldest is replaced when the tracker is full).
+    pub last_ms: i64,
+    pub w: [FloodWindow; FL_CHAN_COUNT],
+    /// Bit per kind: a victim was authorised (+revenge).
+    pub victim_auth: u8,
+}
+
+/// One ignore-table entry (botflood.rs); an empty `key` is a free slot.  The
+/// key is a lower-cased host, or "u:<uuid>" for a user over the cmd limit.
+#[derive(Clone, Debug, Default)]
+pub struct IgnoreEnt {
+    pub key: String,
+    pub since_ms: i64,
+    pub until_ms: i64,
+}
+
+/// One host tracked for the bot msg / ctcp floods; empty `host` = free slot.
+#[derive(Clone, Debug, Default)]
+pub struct HostFlood {
+    pub host: String,
+    pub last_ms: i64,
+    pub msg: FloodWindow,
+    pub ctcp: FloodWindow,
+}
+
+/// One user record tracked for the cmd flood; empty `uuid` = free slot.
+#[derive(Clone, Debug, Default)]
+pub struct CmdFlood {
+    pub uuid: String,
+    pub last_ms: i64,
+    pub w: FloodWindow,
+    /// The "slow down" notice went out in this window.
+    pub notified: bool,
+}
+
+/// Runtime flood state of the bot itself (botflood.rs): never persisted or
+/// shared.  Every table is a fixed number of slots, as in C.
+#[derive(Clone, Debug)]
+pub struct BotFlood {
+    pub ignores: Vec<IgnoreEnt>,
+    /// 0 / past = not quiet.
+    pub quiet_until_ms: i64,
+    /// The episode's one log line went out.
+    pub quiet_logged: bool,
+    pub host_flood: Vec<HostFlood>,
+    pub cmd_flood: Vec<CmdFlood>,
+}
+
+impl Default for BotFlood {
+    fn default() -> Self {
+        BotFlood {
+            ignores: vec![IgnoreEnt::default(); MAX_IGNORES],
+            quiet_until_ms: 0,
+            quiet_logged: false,
+            host_flood: vec![HostFlood::default(); MAX_HOST_TRACK],
+            cmd_flood: vec![CmdFlood::default(); MAX_USER_RECORDS],
+        }
+    }
+}
+
+/// One server-side ban in a channel's ban list (367 + MODE +b/-b).
+#[derive(Clone, Debug, Default)]
+pub struct LiveBan {
+    pub mask: String,
+    /// Setter as the server printed it, cut.
+    #[allow(dead_code)] // read by the enforcement code of a later phase
+    pub setter: String,
+    /// Server's ts, 0 if unknown.
+    #[allow(dead_code)]
+    pub when: i64,
+}
+
+/// One B| record (a network ban).  chan "*" = every managed channel.
+#[derive(Clone, Debug, Default)]
+pub struct CfgBan {
+    pub chan: String,
+    pub mask: String,
+    /// "s" sticky, "" none.
+    pub flags: String,
+    pub setter: String,
+    pub reason: String,
+    /// Absolute unix time, 0 = permanent.
+    pub expires: i64,
+    pub ts: i64,
+    /// False = tombstone (op "del").
+    pub active: bool,
+    /// Bot-written, not yet pushed to a hub.
+    pub push_pending: bool,
+}
+
+/// 005 (RPL_ISUPPORT) values this bot uses; reset on every disconnect.
+#[derive(Clone, Debug)]
+pub struct Isupport {
+    /// MODES=: changes per MODE line.
+    pub modes: i32,
+    /// MAXLIST for 'b' (or MAXBANS), 0 = unknown.
+    pub maxlist_b: i32,
+    /// PREFIX=(ohv)@%+ -> "ohv"
+    pub prefix_modes: String,
+    /// ... -> "@%+"
+    pub prefix_syms: String,
+    /// CHANMODES=A,B,C,D
+    pub cm_a: String,
+    pub cm_b: String,
+    pub cm_c: String,
+    pub cm_d: String,
+    /// NICKLEN=, default 30.
+    pub nicklen: i32,
+}
+
+impl Default for Isupport {
+    /// isupport_reset(): what a server that says nothing is assumed to have.
+    fn default() -> Self {
+        Isupport {
+            modes: ISUPPORT_MODES_DEFAULT,
+            maxlist_b: 0,
+            prefix_modes: "ov".into(),
+            prefix_syms: "@+".into(),
+            cm_a: "beI".into(),
+            cm_b: "k".into(),
+            cm_c: "l".into(),
+            cm_d: "imnpst".into(),
+            nicklen: NICKLEN_DEFAULT,
+        }
+    }
+}
+
+/// Output send queue (sendq.rs): three lanes, drained by pacing.  Lines are
+/// bytes, as in C: a line cut at SENDQ_LINE_MAX may end inside a character.
+#[derive(Debug)]
+pub struct SendQ {
+    /// One ring per lane; each line holds its CRLF.
+    pub q: [VecDeque<Vec<u8>>; SENDQ_LANES],
+    pub total: usize,
+    /// Live D| sendq burst (lines).
+    pub burst: i64,
+    /// Live D| sendq interval in ms; 0 = unpaced.
+    pub interval_ms: i64,
+    /// Send credit, capped at burst * interval.
+    pub credit_ms: i64,
+    /// Monotonic ms of the last refill.
+    pub last_ms: i64,
+    /// Lines dropped because the queue was full.
+    #[allow(dead_code)] // counted like C's sendq_t.dropped, shown by a later phase
+    pub dropped: u64,
+}
+
+impl Default for SendQ {
+    /// sendq_clear(): empty, with a full burst of credit.
+    fn default() -> Self {
+        SendQ {
+            q: Default::default(),
+            total: 0,
+            burst: SENDQ_DEF_BURST,
+            interval_ms: SENDQ_DEF_INTERVAL_MS,
+            credit_ms: SENDQ_DEF_BURST * SENDQ_DEF_INTERVAL_MS,
+            last_ms: crate::sendq::mono_ms(),
+            dropped: 0,
+        }
+    }
+}
+
+/// One dedupe slot of the CMD_CHAN_EVENT limiter.
+#[derive(Clone, Debug, Default)]
+pub struct ChanEventSeen {
+    pub key: String,
+    pub when: i64,
+}
+
+/// Rate-limit memory for CMD_CHAN_EVENT (hub_client::chan_event).
+#[derive(Clone, Debug)]
+pub struct ChanEventLim {
+    pub seen: Vec<ChanEventSeen>,
+    /// Send times, ring.
+    pub window: [i64; CHAN_EVENT_WINDOW_MAX],
+    pub widx: usize,
+    /// Dropped since the last summary.
+    pub suppressed: u32,
+    /// Channel of the latest suppressed event.
+    pub sup_chan: String,
+    pub sup_action: String,
+}
+
+impl Default for ChanEventLim {
+    fn default() -> Self {
+        ChanEventLim {
+            seen: vec![ChanEventSeen::default(); CHAN_EVENT_TRACK],
+            window: [0; CHAN_EVENT_WINDOW_MAX],
+            widx: 0,
+            suppressed: 0,
+            sup_chan: String::new(),
+            sup_action: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -150,8 +480,119 @@ pub struct Chan {
     pub op_request_pending: bool,
     pub last_op_request_time: i64,
     pub op_request_retry_count: i32,
+    /// OP_GRANTs (nick, when) that came in before our own +o (a channel just
+    /// created, every bot joining at once): granted when the +o lands,
+    /// dropped after OP_GRANT_HOLD_SECS.  Without it the asker waits out its
+    /// 60 s timeout.  At most OP_GRANT_HOLD_MAX.
+    pub op_grant_held: Vec<(String, i64)>,
     pub last_access_request: [i64; CHAN_REQ_KIND_COUNT],
     pub access_retry_count: [i32; CHAN_REQ_KIND_COUNT],
+    /// C| record (modes.md section 2): the stored modes string, the raw
+    /// settings field (unknown names kept verbatim) and its parse.  Written
+    /// only by the console; cfg_ts 0 = never seen.
+    pub cfg_modes: String,
+    pub cfg_settings: String,
+    pub cfg_set: ChanSettings,
+    pub cfg_ts: i64,
+    pub cfg_active: bool,
+    /// chanenf.rs runtime: sweep at the next tick.
+    pub enf_dirty: bool,
+    /// Gained ops / settings changed: +bitch sweep.
+    pub enf_ops_check: bool,
+    /// -dynamicbans overflow warning logged.
+    pub ban_cap_warned: bool,
+    /// Monotonic ms of the last sweep.
+    pub enf_last_sweep_ms: i64,
+    pub enf_last_limit: i64,
+    pub enf_last_cycle: i64,
+    /// Live state (never persisted): modes from 324 + MODE, the ban list
+    /// from 367 + MODE.  `live_flags` has a bit per mode letter
+    /// (chanlive::live_bit).
+    pub live_flags: u64,
+    pub live_key: String,
+    /// 0 = none.
+    pub live_limit: i64,
+    /// A 324 (or our own MODE echo) was seen.
+    pub live_known: bool,
+    /// 329.
+    pub live_created: i64,
+    pub bans: Vec<LiveBan>,
+    /// Between the first 367 and the 368.
+    pub ban_list_open: bool,
+    /// A full list was received.
+    pub ban_list_known: bool,
+    pub ban_overflow_logged: bool,
+    /// The channel WHO finished (315) this stay.
+    pub who_done: bool,
+    /// A key / mode this bot learned and has not yet got to a hub: pushed in
+    /// a full config push even under opt 'h' (D43).
+    pub enf_pending: bool,
+    /// chanflood.rs: per-source flood windows, MAX_FLOOD_TRACK slots,
+    /// allocated on the first counted event (empty until then) and freed by
+    /// `chanlive::live_reset`.
+    pub flood: Vec<FloodSrc>,
+}
+
+/// What a pending job does when it falls due (each is re-checked first).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum JobAct {
+    #[default]
+    Deop,
+    Dehalf,
+    Reop,
+    Kick,
+    BanNuh,
+    BanMask,
+    Unban,
+    Mode,
+    Limit,
+}
+
+/// A queued piece of in-channel work (chanenf.rs); `used` slots are scanned
+/// in index order, as in C.
+#[derive(Clone, Debug, Default)]
+pub struct PendingJob {
+    pub used: bool,
+    pub act: JobAct,
+    pub chan: String,
+    /// Nick, nick!user@host or ban mask.
+    pub target: String,
+    pub reason: String,
+    /// Monotonic.
+    pub created_ms: i64,
+}
+
+/// Idle clock of a listed ban on a channel (+dynamicbans / banidle); an
+/// empty `chan` is a free slot.
+#[derive(Clone, Debug, Default)]
+pub struct BanTrack {
+    pub chan: String,
+    pub mask: String,
+    /// Last time an unauthorised member matched.
+    pub last_match: i64,
+    /// When this bot last sent +b for it.
+    pub set_at: i64,
+    /// Last section 6.2 overlap check (cached 60 s).
+    pub checked_at: i64,
+    /// Its result.
+    pub overlap_ok: bool,
+}
+
+/// Repeat-offence memory for +revenge and the flood ladder (runtime only);
+/// an empty `key` is a free slot.
+#[derive(Clone, Debug, Default)]
+pub struct Offence {
+    /// lower(chan) '|' lower(host)
+    pub key: String,
+    pub when: i64,
+    pub count: u32,
+}
+
+/// One "same action again" memory slot (chanenf.rs recent_seen).
+#[derive(Clone, Debug, Default)]
+pub struct EnfRecent {
+    pub key: String,
+    pub when_ms: i64,
 }
 
 /// An unban being serviced for another bot (367 walk, closed by 368).
@@ -405,6 +846,43 @@ pub struct BotState {
     /// channel it held ops in before the restart, opped, or UPGRADE_OPS_WAIT
     /// has passed (hub_client::upgrade_ready_tick).  Volatile.
     pub upgrade_report: Option<UpgradeReport>,
+
+    // ---- modes.md ----
+    /// Output queue (sendq.rs).
+    pub sendq: SendQ,
+    /// This server's 005 (chanlive.rs).
+    pub isup: Isupport,
+    /// D| network defaults: stored modes, raw settings, parse.
+    pub net_modes: String,
+    pub net_settings: String,
+    pub net_set: ChanSettings,
+    pub net_ts: i64,
+    /// B| records, grown on demand up to CFG_MAX_BANS.
+    pub cfg_bans: Vec<CfgBan>,
+    pub chan_event: ChanEventLim,
+    /// chanenf.rs: bumped when a C| / D| / B| record changes.
+    pub cfg_gen: u32,
+    pub enf_seen_gen: u32,
+    /// Pending in-channel jobs (MAX_PENDING_JOBS slots).
+    pub jobs: Vec<PendingJob>,
+    /// Ban idle clocks, grown on demand up to MAX_BAN_TRACK (an emptied slot
+    /// has an empty `chan`).
+    pub ban_track: Vec<BanTrack>,
+    /// chanenf.rs: bumped when cfg_gen or the auth records change; retires
+    /// every roster entry's cached verdict.  Cells like RosterEntry's cache.
+    pub auth_gen: Cell<u32>,
+    pub auth_seen_cfg_gen: Cell<u32>,
+    /// Fingerprint of trusted bots / users / masks, and when it was taken.
+    pub auth_fp: Cell<u64>,
+    pub auth_fp_ms: Cell<i64>,
+    /// Offence memory (MAX_OFFENCES slots).
+    pub offences: Vec<Offence>,
+    /// Recent-action ring (ENF_RECENT slots) and its write index.
+    pub enf_recent: Vec<EnfRecent>,
+    pub enf_recent_idx: usize,
+    pub enf_last_minute: i64,
+    /// botflood.rs: ignore table, quiet mode, host and per-user windows.
+    pub flood: BotFlood,
 }
 
 /// A held upgrade "ok" (see BotState::upgrade_report).
@@ -509,7 +987,42 @@ impl BotState {
             upgrade_prepared: 0,
             upgrade_installed_id: String::new(),
             upgrade_report: None,
+            sendq: SendQ::default(),
+            isup: Isupport::default(),
+            net_modes: String::new(),
+            net_settings: String::new(),
+            net_set: ChanSettings::default(),
+            net_ts: 0,
+            cfg_bans: Vec::new(),
+            chan_event: ChanEventLim::default(),
+            cfg_gen: 0,
+            enf_seen_gen: 0,
+            jobs: vec![PendingJob::default(); MAX_PENDING_JOBS],
+            ban_track: Vec::new(),
+            auth_gen: Cell::new(0),
+            auth_seen_cfg_gen: Cell::new(0),
+            auth_fp: Cell::new(0),
+            auth_fp_ms: Cell::new(0),
+            offences: vec![Offence::default(); MAX_OFFENCES],
+            enf_recent: vec![EnfRecent::default(); ENF_RECENT],
+            enf_recent_idx: 0,
+            enf_last_minute: 0,
+            flood: BotFlood::default(),
         }
+    }
+
+    /// A connected-looking state for unit tests: no sockets, and the send
+    /// queue holds its lines (no credit, so nothing is written).
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        let poll = mio::Poll::new().expect("poll");
+        let mut s = BotState::new(poll.registry().try_clone().expect("registry"));
+        s.status |= S_CONNECTED;
+        s.sendq.credit_ms = 0;
+        s.sendq.last_ms = i64::MAX;
+        s.bot_uuid = "11111111-1111-4111-8111-111111111111".into();
+        s.current_nick = "me".into();
+        s
     }
 
     /// A fresh poll token for `slot` (see net::Slot).

@@ -1,9 +1,13 @@
 //! One line from the IRC server (irc_parser.c).
 
+use crate::botflood::{self, Bf};
 use crate::consts::*;
 use crate::cstr::{Tok, eq_ic, now, starts_with_ic, trunc, trunc_string};
 use crate::state::{BotState, ChanReq, ChanStatus, M_I, M_K, RosterEntry, S_AUTHED, lww_next_ts};
-use crate::{auth, bot_comms, channel, commands, crypto, dcc, hub_client, irc_client, ircf, logm};
+use crate::{
+    auth, bot_comms, chanenf, chanflood, chanlive, channel, commands, crypto, dcc, hub_client,
+    irc_client, ircf, logm,
+};
 
 /// Hub UUID for a roster entry whose nick may carry collision '_'s: exact
 /// hostmask, then "nick!" prefix, then base nick with trailing '_' stripped
@@ -39,6 +43,15 @@ fn handle_mode_change(state: &mut BotState, channel: &str, modes: &str, args: &s
     let Some(ci) = channel::find(state, channel) else {
         return;
     };
+    // Live modes, key, limit, ban list and halfop/voice flags (chanlive.rs).
+    // The C copy of the arguments exists because its tokeniser works in
+    // place; here a copy is not needed, but the same 1024-byte bound holds.
+    if args.len() < 1024 {
+        chanlive::apply(state, ci, modes, args, false);
+    }
+    // modes.md section 3.3: under +enforcemodes with a k in the stored modes
+    // the key is the bots', so a key someone sets or clears is not learned.
+    let key_managed = chanenf::key_managed(state, ci);
     let mut adding = true;
     let mut toks = Tok::new(args);
     let mut current_arg = toks.next(" ");
@@ -58,9 +71,12 @@ fn handle_mode_change(state: &mut BotState, channel: &str, modes: &str, args: &s
                             r.is_op = adding;
                         }
                         if adding {
+                            c.enf_dirty = true; // chanenf.rs sweep
+                            c.enf_ops_check = true;
                             c.op_request_pending = false;
                             c.op_request_retry_count = 0;
                             logm!(state, L_INFO, "[INFO] I am now OP in {}\n", channel);
+                            hub_client::grant_held_ops(state, ci);
                         } else {
                             // Deopped: re-read the channel before choosing a
                             // helper (the roster was not refreshed while we
@@ -100,7 +116,9 @@ fn handle_mode_change(state: &mut BotState, channel: &str, modes: &str, args: &s
             }
             'k' => {
                 let c = &mut state.chans[ci];
-                if adding {
+                if key_managed {
+                    // the mode job puts the stored key back; learn nothing
+                } else if adding {
                     if let Some(arg) = current_arg {
                         c.key = trunc_string(arg, MAX_KEY);
                         c.modes |= M_K;
@@ -220,7 +238,17 @@ pub fn handle_line(state: &mut BotState, line: &str) {
         "ERROR" => irc_client::note_refusal(state, irc_trailing(params), false),
         "474" => on_lockout(state, params, ChanReq::Unban),
         "475" => on_lockout(state, params, ChanReq::Key),
+        // RPL_ISUPPORT: MODES, MAXLIST, PREFIX, CHANMODES for the send queue
+        // and the mode parser.
+        "005" => {
+            if params.len() < 1024 {
+                chanlive::isupport_parse(state, params);
+            }
+        }
+        // RPL_CHANNELMODEIS / RPL_CREATIONTIME: live state only.
+        "324" | "329" => chanlive::numeric(state, command, params),
         "367" => {
+            chanlive::numeric(state, command, params); // our own ban list copy
             let mut t = Tok::new(params);
             t.next(" ");
             if let (Some(ch), Some(mask)) = (t.next(" "), t.next(" ")) {
@@ -228,6 +256,7 @@ pub fn handle_line(state: &mut BotState, line: &str) {
             }
         }
         "368" => {
+            chanlive::numeric(state, command, params);
             if let Some(ch) = second_tok(params) {
                 channel::unban_finish(state, ch);
             }
@@ -259,7 +288,7 @@ pub fn handle_line(state: &mut BotState, line: &str) {
                 channel::access_request(state, ci, ChanReq::Invite);
             }
         }
-        "MODE" => on_mode(state, params),
+        "MODE" => on_mode(state, prefix, params),
         "352" => on_who_reply(state, params),
         "396" => {
             if let Some(host) = second_tok(params) {
@@ -279,6 +308,11 @@ pub fn handle_line(state: &mut BotState, line: &str) {
                 on_privmsg(state, p, params);
             }
         }
+        "NOTICE" => {
+            if let Some(p) = prefix {
+                on_notice(state, p, params);
+            }
+        }
         "JOIN" => {
             if let Some(p) = prefix {
                 on_join(state, p, params);
@@ -287,6 +321,15 @@ pub fn handle_line(state: &mut BotState, line: &str) {
         "PART" => {
             if let Some(p) = prefix {
                 let nick = Tok::new(p).next("!");
+                if let Some(n) =
+                    nick.filter(|n| !eq_ic(n, &state.current_nick) && !eq_ic(n, &state.target_nick))
+                {
+                    let pc = params.strip_prefix(':').unwrap_or(params);
+                    let pc = pc.split(' ').next().unwrap_or("");
+                    if !pc.is_empty() && pc.len() < MAX_CHAN {
+                        chanenf::on_part(state, pc, n);
+                    }
+                }
                 if nick
                     .is_some_and(|n| eq_ic(n, &state.current_nick) || eq_ic(n, &state.target_nick))
                 {
@@ -297,6 +340,7 @@ pub fn handle_line(state: &mut BotState, line: &str) {
                         c.status = ChanStatus::Out;
                         c.roster.clear();
                         c.i_am_opped = false;
+                        chanlive::live_reset(c);
                         logm!(state, L_DEBUG, "[IRC] Parted channel {}\n", chan_name);
                     }
                 }
@@ -304,12 +348,22 @@ pub fn handle_line(state: &mut BotState, line: &str) {
         }
         "KICK" => {
             let mut t = Tok::new(params);
-            if let (Some(ch), Some(kicked)) = (t.next(" "), t.next(" "))
+            let (ch, kicked) = (t.next(" "), t.next(" "));
+            if let (Some(ch), Some(kicked)) = (ch, kicked) {
+                chanenf::on_kick(state, ch, prefix, kicked);
+            }
+            if let (Some(ch), Some(kicked)) = (ch, kicked)
                 && eq_ic(kicked, &state.current_nick)
                 && let Some(ci) = channel::find(state, ch)
             {
                 state.chans[ci].status = ChanStatus::Out;
                 state.chans[ci].i_am_opped = false;
+                chanlive::live_reset(&mut state.chans[ci]);
+            }
+        }
+        "QUIT" => {
+            if let Some(qnick) = prefix.and_then(|p| Tok::new(p).next("!")) {
+                chanenf::on_quit(state, qnick);
             }
         }
         "NICK" => {
@@ -415,7 +469,7 @@ fn on_lockout(state: &mut BotState, params: &str, kind: ChanReq) {
     }
 }
 
-fn on_mode(state: &mut BotState, params: &str) {
+fn on_mode(state: &mut BotState, prefix: Option<&str>, params: &str) {
     let mut t = Tok::new(params);
     let target = t.next(" ");
     let modes = t.next(" ");
@@ -427,12 +481,20 @@ fn on_mode(state: &mut BotState, params: &str) {
         return;
     }
     handle_mode_change(state, target, modes, args);
+    // The enforcement pass sees the same arguments; an oversized set is
+    // skipped (fail closed).
+    if args.len() < 1024 {
+        chanenf::on_mode(state, target, prefix, modes, args);
+    }
     // Key / invite-only changes go to the hub, and to our own config: with no
     // hub to echo them back, a key we learned and saved must not outlive a -k.
     if (modes.contains('k') || modes.contains('i'))
-        && let Some(ci) = channel::find(state, target).filter(|&ci| state.chans[ci].is_managed)
+        && let Some(ci) = channel::find(state, target).filter(|&ci| {
+            state.chans[ci].is_managed && (modes.contains('i') || !chanenf::key_managed(state, ci))
+        })
     {
         state.chans[ci].timestamp = lww_next_ts(state.chans[ci].timestamp);
+        state.chans[ci].enf_pending = true; // cleared once a hub has it (D43)
         hub_client::push_channel(state, ci);
         crate::config::write_with_state_pass(state);
     }
@@ -453,6 +515,15 @@ fn on_who_reply(state: &mut BotState, params: &str) {
         return;
     };
     let is_op = modes.contains('@');
+    // PREFIX (005) names the halfop / voice symbols this server uses.
+    let prefix_sym = |letter: char| {
+        let is = &state.isup;
+        is.prefix_modes
+            .find(letter)
+            .and_then(|i| is.prefix_syms.as_bytes().get(i).copied())
+            .is_some_and(|sym| modes.as_bytes().contains(&sym))
+    };
+    let (is_halfop, is_voice) = (prefix_sym('h'), prefix_sym('v'));
     let is_me = eq_ic(nick, &state.current_nick);
 
     // Self-mask capture first: the reply to `WHO <nick>` has "*" as channel.
@@ -468,12 +539,11 @@ fn on_who_reply(state: &mut BotState, params: &str) {
     if is_me {
         c.i_am_opped = is_op;
     }
-    if c.roster.len() < MAX_ROSTER_SIZE {
-        c.roster.push(RosterEntry {
-            nick: trunc_string(nick, MAX_NICK),
-            hostmask: trunc_string(&format!("{nick}!{ident}@{host}"), MAX_MASK_LEN),
-            is_op,
-        });
+    // add, or replace the entry a JOIN already made (chanenf.rs keeps the
+    // roster current between WHOs)
+    let who = format!("{nick}!{ident}@{host}");
+    if who.len() < MAX_MASK_LEN {
+        chanenf::roster_set(c, nick, &who, is_op, is_halfop, is_voice);
     }
 }
 
@@ -492,6 +562,9 @@ fn on_end_of_who(state: &mut BotState, params: &str) {
         name,
         roster_len
     );
+    state.chans[ci].enf_dirty = true; // chanenf.rs sweep
+    state.chans[ci].enf_ops_check = true;
+    state.chans[ci].who_done = true; // the member list is complete
 
     if state.chans[ci].i_am_opped {
         state.chans[ci].op_request_pending = false;
@@ -653,17 +726,31 @@ fn on_privmsg(state: &mut BotState, prefix: &str, params: &str) {
         return;
     };
 
+    if dest.starts_with(['#', '&']) {
+        // text to a channel: only the flood counters look at it
+        if let (Some(u), Some(h)) = (user, host) {
+            chanflood::on_text(state, dest, nick, u, h, message);
+        }
+        return;
+    }
+    let src_nuh = match (user, host) {
+        (Some(u), Some(h)) => Some(format!("{nick}!{u}@{h}")).filter(|n| n.len() < MAX_MASK_LEN),
+        _ => None,
+    };
     let mb = message.as_bytes();
     if mb.len() >= 2 && mb[0] == 0x01 && mb[mb.len() - 1] == 0x01 {
         logm!(state, L_CTCP, "[CTCP] ({}) {}\n", nick, message);
+        // ctcp flood (section 9.1): an ignored host, or quiet mode, gets no answer
+        if let Some(n) = &src_nuh
+            && botflood::ctcp(state, n) != Bf::Ok
+        {
+            return;
+        }
         let ctcp = &message[1..message.len() - 1];
         if starts_with_ic(ctcp, "DCC ") {
             // Only ever the reply to this bot's own passive offer.
-            if let (Some(u), Some(h)) = (user, host)
-                && eq_ic(dest, &state.current_nick)
-            {
-                let user_host = trunc_string(&format!("{nick}!{u}@{h}"), 256);
-                dcc::handle_ctcp(state, &user_host, ctcp);
+            if user.is_some() && host.is_some() && eq_ic(dest, &state.current_nick) {
+                dcc::handle_ctcp(state, src_nuh.as_deref().unwrap_or(""), ctcp);
             }
         } else if eq_ic(ctcp, "VERSION") {
             ircf!(
@@ -687,6 +774,37 @@ fn on_privmsg(state: &mut BotState, prefix: &str, params: &str) {
     }
 }
 
+/// NOTICEs were never read; now they only feed the flood counters.
+fn on_notice(state: &mut BotState, prefix: &str, params: &str) {
+    if !prefix.contains('!') {
+        return;
+    }
+    let mut pt = Tok::new(prefix);
+    let nick = pt.next("!");
+    let user = pt.next("@");
+    let host = pt.rest();
+    let mut t = Tok::new(params);
+    let dest = t.next(" ");
+    let message = t.rest().map(|m| m.strip_prefix(':').unwrap_or(m));
+    let (Some(nick), Some(user), Some(host), Some(dest), Some(message)) =
+        (nick, user, host, dest, message)
+    else {
+        return;
+    };
+    if dest.starts_with(['#', '&']) {
+        chanflood::on_text(state, dest, nick, user, host, message);
+    } else if eq_ic(dest, &state.current_nick) && !message.starts_with('\x01') {
+        // services (NickServ, ChanServ, ...) answer every command with a
+        // NOTICE: that is not a flood from a host (servers carry no '!')
+        let nb = nick.as_bytes();
+        let services = nb.len() >= 4 && nb[nb.len() - 4..].eq_ignore_ascii_case(b"Serv");
+        let src_nuh = format!("{nick}!{user}@{host}");
+        if !services && src_nuh.len() < MAX_MASK_LEN {
+            botflood::msg(state, &src_nuh);
+        }
+    }
+}
+
 fn on_join(state: &mut BotState, prefix: &str, params: &str) {
     // Our own JOIN echo's prefix is the mask the channel was shown -- the
     // earliest exact value.  A prefix that does not fit is not stored.
@@ -701,6 +819,14 @@ fn on_join(state: &mut BotState, prefix: &str, params: &str) {
         update_own_hostmask(state, prefix);
     }
     if !(eq_ic(nick, &state.current_nick) || eq_ic(nick, &state.target_nick)) {
+        // someone else joined: keep the roster (and the enforcement) current
+        if join_mask_ok {
+            let jc = params.strip_prefix(':').unwrap_or(params);
+            let jc = jc.split(' ').next().unwrap_or("");
+            if !jc.is_empty() && jc.len() < MAX_CHAN {
+                chanenf::on_join(state, jc, prefix);
+            }
+        }
         return;
     }
     let chan_name = params.strip_prefix(':').unwrap_or(params);
@@ -725,9 +851,11 @@ fn on_join(state: &mut BotState, prefix: &str, params: &str) {
         c.status = ChanStatus::In;
         c.roster.clear();
         c.i_am_opped = false;
+        chanlive::live_reset(c);
         c.last_who_request = now();
         let name = c.name.clone();
         ircf!(state, "WHO {}\r\n", name);
+        chanlive::request(state, ci); // 324 modes and the 367 ban list
     }
 }
 
@@ -735,6 +863,7 @@ fn on_nick(state: &mut BotState, prefix: &str, params: &str) {
     let old = Tok::new(prefix).next("!");
     let new_nick = params.strip_prefix(':').unwrap_or(params);
     let Some(old) = old else { return };
+    chanenf::on_nick(state, old, new_nick);
     if !eq_ic(old, &state.current_nick) {
         return;
     }
@@ -749,5 +878,31 @@ fn on_nick(state: &mut BotState, prefix: &str, params: &str) {
     state.nick_change_pending = false;
     if eq_ic(&state.current_nick, &state.target_nick) {
         state.nick_generation_attempt = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::TrustedBot;
+
+    #[test]
+    fn helper_uuid_matches_a_long_nick() {
+        let mut st = BotState::for_test();
+        let long = "h".repeat(30);
+        st.trusted_bots.push(TrustedBot {
+            mask: format!("{long}!u@other.host"),
+            uuid: "44444444-4444-4444-8444-444444444444".into(),
+            ..TrustedBot::default()
+        });
+        let helper = RosterEntry {
+            nick: long.clone(),
+            hostmask: format!("{long}!v@new.host"),
+            ..RosterEntry::default()
+        };
+        assert_eq!(
+            find_uuid_for_helper(&st, &helper).as_deref(),
+            Some("44444444-4444-4444-8444-444444444444")
+        );
     }
 }

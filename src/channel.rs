@@ -41,6 +41,7 @@ pub fn reset_status(state: &mut BotState) {
         c.last_join_attempt = 0;
         c.join_disabled = false;
         c.i_am_opped = false;
+        crate::chanlive::live_reset(c);
         c.op_request_pending = false;
         c.op_request_retry_count = 0;
         c.last_access_request = [0; 3];

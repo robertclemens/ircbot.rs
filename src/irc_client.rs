@@ -29,7 +29,7 @@ use crate::consts::*;
 use crate::cstr::{eq_ic, now, trunc, trunc_string};
 use crate::net::{self, ReadOutcome};
 use crate::state::{BotState, S_AUTHED, S_CONNECTED, ServerBlock, ServerBlockKind, is_rfc_nick};
-use crate::{channel, crypto, dcc, hub_client, irc_parser, logm};
+use crate::{chanlive, channel, crypto, dcc, hub_client, irc_parser, logm, sendq};
 
 /// Unsent bytes past which a server that stopped reading is dropped.
 const IRC_WBUF_MAX: usize = 1024 * 1024;
@@ -635,6 +635,15 @@ fn pick_server(state: &mut BotState, now: i64) -> Option<usize> {
 // ---- Link lifecycle ------------------------------------------------------------
 
 pub fn disconnect(state: &mut BotState) {
+    // Last chance for queued lines (a parting PRIVMSG, a restart notice) to
+    // go out on whatever credit is left; a write error here already
+    // disconnected.
+    if state.status & S_CONNECTED != 0 && state.irc.is_some() {
+        sendq::drain(state);
+        if state.status & S_CONNECTED == 0 && state.irc.is_none() {
+            return;
+        }
+    }
     apply_refusal(state);
     if let Some(mut conn) = state.irc.take() {
         // QUIT first so the server drops the nick now rather than at
@@ -650,6 +659,8 @@ pub fn disconnect(state: &mut BotState) {
         let _ = conn.sock.shutdown(std::net::Shutdown::Both);
     }
     state.status = 0;
+    sendq::clear(state);
+    chanlive::isupport_reset(state);
     channel::reset_status(state);
 }
 
@@ -787,7 +798,8 @@ pub fn line_is_keepalive(line: &str) -> bool {
 }
 
 /// One finished line to the server -- or down a DCC chat for a reply to a
-/// command that came from one, even while the IRC link is down.
+/// command that came from one, even while the IRC link is down.  Lines for
+/// the server go through the paced send queue (sendq.rs).
 fn send_line(state: &mut BotState, line: &str) -> i32 {
     if dcc::divert_reply(state, line) {
         return line.len() as i32;
@@ -795,11 +807,20 @@ fn send_line(state: &mut BotState, line: &str) -> i32 {
     if state.status & S_CONNECTED == 0 {
         return -1;
     }
-    if !HIDEPINGPONG || !line_is_keepalive(line) {
-        logm!(state, L_RAW, "[RAW_SEND] {}", line);
+    sendq::enqueue(state, line.as_bytes())
+}
+
+/// The write itself, for a line the send queue has decided may go now.  A
+/// write error drops the link (which also empties the queue).
+pub fn write_raw(state: &mut BotState, line: &[u8]) -> i32 {
+    if state.status & S_CONNECTED == 0 {
+        return -1;
+    }
+    if !HIDEPINGPONG || !line_is_keepalive(&String::from_utf8_lossy(line)) {
+        logm!(state, L_RAW, "[RAW_SEND] {}", String::from_utf8_lossy(line));
     }
     let res = match state.irc.as_mut() {
-        Some(c) => c.queue(line.as_bytes()).map(|_| c.is_tls()),
+        Some(c) => c.queue(line).map(|_| c.is_tls()),
         None => return -1,
     };
     match res {
@@ -812,6 +833,9 @@ fn send_line(state: &mut BotState, line: &str) -> i32 {
                 "[INFO] Lost connection to server ({}write error).\n",
                 if tls { "SSL " } else { "" }
             );
+            // Nothing queued can be written to a dead link: empty the queue
+            // first so disconnect()'s last-chance drain does not retry.
+            sendq::clear(state);
             disconnect(state);
             -1
         }
@@ -943,6 +967,8 @@ pub fn connect(state: &mut BotState) {
                     rbuf: Vec::new(),
                     wbuf: Vec::new(),
                 });
+                sendq::clear(state); // new link: empty queue, full burst
+                chanlive::isupport_reset(state);
                 let t = now();
                 state.status = S_CONNECTED;
                 state.last_pong_time = t;

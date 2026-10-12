@@ -6,6 +6,12 @@
 
 mod auth;
 mod bot_comms;
+mod botflood;
+mod chancfg;
+mod chancmd;
+mod chanenf;
+mod chanflood;
+mod chanlive;
 mod channel;
 mod commands;
 mod config;
@@ -13,12 +19,14 @@ mod consts;
 mod crypto;
 mod cstr;
 mod dcc;
+mod glob_overlap;
 mod hub_client;
 mod irc_client;
 mod irc_parser;
 mod logging;
 mod net;
 mod secret;
+mod sendq;
 mod state;
 mod updater;
 
@@ -819,6 +827,7 @@ fn run(password: Zeroizing<String>, pid_file: fs::File, self_exe: String) -> i32
         irc_client::check_status(&mut state);
         channel::check_joins(&mut state);
         commands::activity_tick(&mut state, now());
+        chanenf::tick(&mut state);
 
         // Debounced flush of last_seen / last_used (set on every successful
         // admin auth): at most once per CONFIG_WRITE_DEBOUNCE_S, local only.
@@ -838,7 +847,16 @@ fn run(password: Zeroizing<String>, pid_file: fs::File, self_exe: String) -> i32
             hub_client::upgrade_ready_tick(&mut state);
         }
 
-        match poll.poll(&mut events, Some(Duration::from_secs(1))) {
+        // Lines wait in the send queue and pacing will allow one: wake as soon
+        // as it may go.  Otherwise the 1 s timeout is the tick.
+        let mut timeout = Duration::from_secs(1);
+        if state.irc.is_some() {
+            let wait_ms = sendq::next_ms(&mut state);
+            if (0..1000).contains(&wait_ms) {
+                timeout = Duration::from_millis(wait_ms as u64);
+            }
+        }
+        match poll.poll(&mut events, Some(timeout)) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => {
@@ -856,6 +874,12 @@ fn run(password: Zeroizing<String>, pid_file: fs::File, self_exe: String) -> i32
                 net::SLOT_HUB => hub_client::handle_event(&mut state, token, readable, writable),
                 s => dcc::handle_event(&mut state, s - net::SLOT_DCC0, token, readable, writable),
             }
+        }
+
+        // Paced output: whatever the queue may send now.  The poll timeout
+        // above is sized to the next credit, so lines leave on time.
+        if state.irc.is_some() {
+            sendq::drain(&mut state);
         }
     }
 

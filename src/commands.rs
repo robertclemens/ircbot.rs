@@ -12,10 +12,9 @@
 //! Every context string is LABEL "\0" lc(botnick) "\0" lc(user nick) ...,
 //! so a frame is only valid for one bot and one sender nick.
 
-use std::time::Duration;
-
 use zeroize::Zeroizing;
 
+use crate::botflood::{self, Bf};
 use crate::consts::*;
 use crate::crypto::{self, Key32};
 use crate::cstr::{Tok, atoi, display_width, eq_ic, now, pad_right, trunc, trunc_string};
@@ -23,18 +22,14 @@ use crate::state::{
     A2rCtx, ActivityQuery, ActqKind, BotState, ChanStatus, MaskRecord, S_CONNECTED, S_DIE,
     TrustedBot, UserRecord, has_control_bytes, is_rfc_nick, is_valid_bot_nick, lww_next_ts,
 };
-use crate::{auth, bot_comms, channel, config, dcc, hub_client, irc_client, ircf, logm, updater};
+use crate::{
+    auth, bot_comms, chancmd, channel, config, dcc, hub_client, irc_client, ircf, logm, updater,
+};
 
 // ---- Reply helpers ---------------------------------------------------------------
 
-/// Anti-flood pause between reply lines on IRC (a DCC chat is not paced).
-fn reply_pace(state: &BotState, ms: u64) {
-    if state.dcc_reply.is_none() {
-        std::thread::sleep(Duration::from_millis(ms));
-    }
-}
-
-/// Rows a list reply may print: capped on IRC, everything over DCC.
+/// Rows a list reply may print: capped on IRC (every row goes through the
+/// paced send queue), everything over DCC.
 fn reply_row_cap(state: &BotState) -> usize {
     if state.dcc_reply.is_some() {
         usize::MAX
@@ -348,6 +343,11 @@ const LOGGABLE_CMDS: &[(&str, u32)] = &[
     ("dcc", 0),
     ("servers", 0),
     ("bots", 0),
+    ("chanmode", 0),
+    ("chanset", 0),
+    ("+ban", 0),
+    ("-ban", 0),
+    ("bans", 0),
 ];
 const REDACT_MASK: &str = "********";
 
@@ -701,6 +701,16 @@ fn a2_open_command(
 
 /// Split, screen and dispatch one opened command line.
 fn run_user_command(state: &mut BotState, nick: &str, user_host: &str, who: usize, cmd_line: &str) {
+    // The commands that take a free-form tail get the whole argument line,
+    // copied before the verb and the first three arguments are cut off.
+    let argline: Option<Zeroizing<String>> = {
+        const TAILED: [&str; 5] = ["chanmode", "chanset", "+ban", "-ban", "bans"];
+        let cl = cmd_line.trim_start_matches(' ');
+        let vl = cl.find(' ').unwrap_or(cl.len());
+        let a = cl[vl..].trim_start_matches(' ');
+        (TAILED.iter().any(|t| eq_ic(&cl[..vl], t)) && a.len() < SEAL_MAX_PLAINTEXT + 1)
+            .then(|| Zeroizing::new(a.to_string()))
+    };
     let mut t = Tok::new(cmd_line);
     let command = t.next(" ");
     let args = [t.next(" "), t.next(" "), t.next(" ")];
@@ -710,11 +720,24 @@ fn run_user_command(state: &mut BotState, nick: &str, user_host: &str, who: usiz
         return;
     };
     let is_admin = typ == 'a';
+    // flood cmd (section 9.1): per user record, PRIVMSG and DCC together
+    if botflood::cmd(state, who, nick) != Bf::Ok {
+        let name = state.user_records[who].name.clone();
+        logm!(
+            state,
+            L_CMD,
+            "[CMD] Command from {} ({}) dropped: flood limit\n",
+            name,
+            user_host
+        );
+        return;
+    }
     // Every stored value lands in a '|'-delimited record, where a '|' would
     // shift the fields after it.
     if std::iter::once(Some(command))
         .chain(args)
         .flatten()
+        .chain(argline.as_ref().map(|l| l.as_str()))
         .any(|s| s.contains('|'))
     {
         let name = state.user_records[who].name.clone();
@@ -740,6 +763,7 @@ fn run_user_command(state: &mut BotState, nick: &str, user_host: &str, who: usiz
         a1: args[0],
         a2: args[1],
         a3: args[2],
+        line: argline.as_ref().map(|l| l.as_str()),
     };
     if is_admin {
         admin_command(state, nick, user_host, who, command, a);
@@ -803,7 +827,17 @@ pub fn handle_private_message(
     }
     // Admin/oper: ~A2A auth, ~A2 / ~A2S commands.  Anything else --
     // including the retired ~A1 / ~A1c password frames -- is dropped.
+    // Section 9.1: a host the msg / ctcp flood ignores (or quiet mode) gets
+    // nothing from here on -- no auth reply, no command.  Authorised hosts
+    // never are.
+    if botflood::host_ignored(state, &user_host) {
+        return;
+    }
     if let Some(arg) = message.strip_prefix("~A2A ") {
+        // not a command: counts against the host's msg flood
+        if botflood::msg(state, &user_host) != Bf::Ok {
+            return;
+        }
         a2_handle_auth(state, nick, &user_host, dest, arg);
         return;
     }
@@ -825,7 +859,12 @@ pub fn handle_private_message(
     // Nothing past this point may run for an unauthenticated sender.
     match opened {
         Some(o) => a2_dispatch(state, nick, &user_host, dest, o.who, &o.cmd, o.rk),
-        None => logm!(state, L_CMD, "[CMD_DEBUG] Auth failed for {}.\n", user_host),
+        None => {
+            // plain text, a retired frame, or a ~A2 / ~A2S that did not
+            // open: all count against the host's msg flood
+            botflood::msg(state, &user_host);
+            logm!(state, L_CMD, "[CMD_DEBUG] Auth failed for {}.\n", user_host);
+        }
     }
 }
 
@@ -937,7 +976,6 @@ fn help_keypair(state: &mut BotState, nick: &str) {
     ];
     for l in LINES {
         say(state, nick, l);
-        reply_pace(state, 100);
     }
 }
 
@@ -949,7 +987,6 @@ fn help_auth(state: &mut BotState, nick: &str) {
     ];
     for l in LINES {
         say(state, nick, l);
-        reply_pace(state, 100);
     }
 }
 
@@ -960,6 +997,9 @@ struct Args<'a> {
     a1: Option<&'a str>,
     a2: Option<&'a str>,
     a3: Option<&'a str>,
+    /// The whole argument line, for the commands with a free-form tail
+    /// (chanmode, chanset, +ban, -ban, bans).
+    line: Option<&'a str>,
 }
 
 /// Commands refused locally under opt 'h' (hub-only mutations).  +hub/-hub
@@ -976,6 +1016,10 @@ const HUB_ONLY_CMDS: &[&str] = &[
     "join",
     "part",
     "chkey",
+    "chanmode",
+    "chanset",
+    "+ban",
+    "-ban", // modes.md 5.2
 ];
 
 fn chan_arg(arg: &str, amp_ok: bool) -> String {
@@ -1201,6 +1245,28 @@ In-place 'update' is only available on standalone (hub-less) bots.",
         "+hub" => cmd_add_hub(state, nick, a),
         "-hub" => cmd_del_hub(state, nick, a),
         "rekey" => cmd_rekey(state, nick),
+        "chanmode" => chancmd::chanmode(state, nick, a.line),
+        "chanset" => chancmd::chanset(state, nick, a.line),
+        "+ban" => chancmd::ban_add(state, nick, who, a.line),
+        "-ban" => chancmd::ban_del(state, nick, who, a.line),
+        "bans" => chancmd::bans(state, nick, a.line),
+        "chkey" if a.a1.is_some_and(|x| x.starts_with('#')) => {
+            // chkey #chan <key>: kept as chanmode #chan +k <key> (modes.md 5.2)
+            let kargs =
+                a.a1.zip(a.a2)
+                    .map(|(c, k)| Zeroizing::new(format!("{c} +k {k}")))
+                    .filter(|k| k.len() < MAX_CHAN + MAX_KEY + 8);
+            match kargs {
+                Some(k) => chancmd::chanmode(state, nick, Some(k.as_str())),
+                None => {
+                    ircf!(
+                        state,
+                        "PRIVMSG {} :Syntax: chkey <#channel> <key>\r\n",
+                        nick
+                    );
+                }
+            }
+        }
         "chkey" => {
             let (Some(arg1), Some(arg2)) = (a.a1, a.a2) else {
                 say(state, nick, "Syntax: chkey <name> <pubkey>");
@@ -1634,7 +1700,6 @@ fn cmd_status(state: &mut BotState, nick: &str) {
         conn,
         if tls { "YES" } else { "NO" }
     );
-    reply_pace(state, 80);
 
     if state.server_list.len() > 1 {
         say(
@@ -1666,7 +1731,6 @@ fn cmd_status(state: &mut BotState, nick: &str) {
             nick,
             String::from_utf8_lossy(&line)
         );
-        reply_pace(state, 80);
     }
 
     say(
@@ -1727,7 +1791,6 @@ fn cmd_status(state: &mut BotState, nick: &str) {
             String::from_utf8_lossy(&out_buf)
         );
     }
-    reply_pace(state, 80);
 
     say(
         state,
@@ -1741,7 +1804,6 @@ fn cmd_status(state: &mut BotState, nick: &str) {
         admins,
         opers
     );
-    reply_pace(state, 80);
 
     if !state.hubs.is_empty() {
         say(
@@ -1987,7 +2049,6 @@ fn cmd_getlog(state: &mut BotState, nick: &str, a: Args<'_>) {
     );
     for line in matches[start..].iter().rev() {
         ircf!(state, "PRIVMSG {} :{}\r\n", nick, line);
-        reply_pace(state, 250);
     }
     ircf!(
         state,
@@ -2202,7 +2263,6 @@ fn cmd_list_users(state: &mut BotState, nick: &str, typ: char) {
         }
         say(state, nick, &r);
         shown += 1;
-        reply_pace(state, 100);
     }
     if shown == 0 {
         ircf!(state, "PRIVMSG {} :| (no {})\r\n", nick, what);
@@ -2249,7 +2309,6 @@ fn cmd_match(state: &mut BotState, nick: &str, arg1: &str) {
             user_key_fp(&u),
             last_seen_str(u.last_seen)
         );
-        reply_pace(state, 100);
         shown += 1;
         for m in masks {
             if shown >= cap {
@@ -2263,7 +2322,6 @@ fn cmd_match(state: &mut BotState, nick: &str, arg1: &str) {
                 m.mask,
                 last_seen_str(m.last_used)
             );
-            reply_pace(state, 100);
             shown += 1;
         }
     }
@@ -2283,7 +2341,6 @@ fn cmd_match(state: &mut BotState, nick: &str, arg1: &str) {
             pad_right(tb.nick(), 20),
             last_seen_str(tb.ts)
         );
-        reply_pace(state, 100);
         if !tb.mask.is_empty() {
             ircf!(state, "PRIVMSG {} :|   mask: {}\r\n", nick, tb.mask);
         }
@@ -2307,7 +2364,6 @@ fn cmd_match(state: &mut BotState, nick: &str, arg1: &str) {
         };
         ircf!(state, "PRIVMSG {} :|   hub : {}\r\n", nick, hub);
         shown += 1;
-        reply_pace(state, 100);
     }
     if shown == 0 && !all {
         ircf!(state, "PRIVMSG {} :| unknown user: {}\r\n", nick, arg1);
@@ -2589,7 +2645,6 @@ fn cmd_bots(state: &mut BotState, nick: &str, a: Args<'_>) {
                     bots_widen(&row, &mut cols);
                 } else {
                     bots_emit(state, nick, &row, cols);
-                    reply_pace(state, 100);
                 }
             }
             continue;
@@ -2613,7 +2668,6 @@ fn cmd_bots(state: &mut BotState, nick: &str, a: Args<'_>) {
                 bots_widen(&row, &mut cols);
             } else {
                 bots_emit(state, nick, &row, cols);
-                reply_pace(state, 100);
             }
             shown += 1;
         }
@@ -2740,7 +2794,6 @@ fn cmd_servers(state: &mut BotState, nick: &str) {
             note
         );
         shown += 1;
-        reply_pace(state, 100);
     }
     if shown == 0 {
         say(state, nick, "| (no servers configured)");
@@ -2941,7 +2994,7 @@ fn admin_help(state: &mut BotState, nick: &str, topic: Option<&str>) {
             say(
                 state,
                 nick,
-                " |   +hub, -hub, rekey, saveconf, setlog, getlog, update, help",
+                " |   +hub, -hub, rekey, saveconf, setlog, getlog, update, help, bans",
             );
             say(
                 state,
@@ -2965,6 +3018,7 @@ fn admin_help(state: &mut BotState, nick: &str, topic: Option<&str>) {
                 " |   +admin, -admin, +oper, -oper, +usermask, -usermask, chkey",
             );
             say(state, nick, " |   +bot, -bot, +hub, -hub, rekey");
+            say(state, nick, " |   chanmode, chanset, +ban, -ban, bans");
             say(state, nick, " |   saveconf, setlog, getlog, update, help");
         }
         say(
@@ -3040,6 +3094,24 @@ fn admin_help(state: &mut BotState, nick: &str, topic: Option<&str>) {
             );
             help_keypair(state, nick);
             return;
+        }
+        "chanmode" => {
+            "Syntax: chanmode <#channel> [<modes> [args]|-] - Show, set or reset the channel's stored modes (i m n p s t k l). +k takes a key and +l a limit (1..99999) as arguments, left to right; '-' goes back to the network default. The modes are applied once if this bot is opped; with +enforcemodes the bots keep them. chkey <#channel> <key> is chanmode <#channel> +k <key>."
+        }
+        "chanset" => {
+            say(
+                state,
+                nick,
+                "Syntax: chanset <#channel|default> [+opt -opt ...] [<name> <value|default>] [flood <type> <N:S|off|default>] - Show or change channel settings.",
+            );
+            "  Options: enforcemodes bitch protectops revenge stopnethack enforcebans dynamicbans dontkickops cycle dynamiclimit. Values: bantime bantype banidle limitgap limitdelay. Floods: chan ctcp join nick deop kick ban. 'default' also takes 'flood cmd|msg|ctcp' (bot floods), 'ignoretime <min>' and 'sendq B:I' (burst 1..100, interval 0..10000 ms)."
+        }
+        "+ban" => {
+            "Syntax: +ban <#channel|*> <nick!user@host> [<minutes>|perm] [sticky] [reason] - Add a network ban (permanent unless a time is given; '*' = every channel). Refused if the mask would hit a bot or an authorised user."
+        }
+        "-ban" => "Syntax: -ban <#channel|*> <nick!user@host> - Remove a network ban.",
+        "bans" => {
+            "Syntax: bans [#channel|*] - List the network bans (all, or one channel's plus the '*' ones)."
         }
         "invite" => {
             "Syntax: invite <#channel> - Invite yourself to a channel (asks the hub or a trusted bot if this bot is not opped there)."
