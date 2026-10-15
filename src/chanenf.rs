@@ -33,7 +33,7 @@ use crate::cstr::{Tok, eq_ic, now, trunc, trunc_string};
 use crate::sendq::mono_ms;
 use crate::state::FloodKind;
 use crate::state::{BotState, Chan, ChanStatus, CsetId, JobAct, RosterEntry, S_CONNECTED};
-use crate::{auth, chancfg, chanflood, chanlive, channel, hub_client, ircf, logm, updater};
+use crate::{auth, chancfg, chanflood, chanlive, channel, hub_client, ircf, logm, sendq, updater};
 
 // same kick / deop / reop again: pending until its MODE / KICK echo
 // (recent_ack) or this long
@@ -858,7 +858,11 @@ fn limit_due(state: &BotState, ci: usize) -> i64 {
 fn exec_limit(state: &mut BotState, ci: usize) {
     let want = limit_due(state, ci);
     let name = state.chans[ci].name.clone();
-    if want == 0 || recent_key(state, &name, "limit", "", RECENT_MODE_MS) {
+    // a queued backup runs here too: it obeys limitdelay like the sweep
+    if want == 0
+        || now() - state.chans[ci].enf_last_limit < cset(state, ci, CsetId::LimitDelay)
+        || recent_key(state, &name, "limit", "", RECENT_MODE_MS)
+    {
         return;
     }
     ircf!(state, "MODE {} +l {}\r\n", name, want);
@@ -1157,7 +1161,16 @@ fn ban_hits_authorised(state: &BotState, ci: usize, mask: &str) -> bool {
 
 /// A MODE line on a channel, after the live state was updated.  `prefix` is
 /// the message source; `args` the mode parameters.
+///
+/// What one MODE line sends (deops, re-ops, bans, a revert) is held and
+/// leaves packed: several changes per MODE line.
 pub fn on_mode(state: &mut BotState, chan: &str, prefix: Option<&str>, modes: &str, args: &str) {
+    sendq::hold(state);
+    on_mode_inner(state, chan, prefix, modes, args);
+    sendq::release(state);
+}
+
+fn on_mode_inner(state: &mut BotState, chan: &str, prefix: Option<&str>, modes: &str, args: &str) {
     let Some(ci) = in_chan(state, chan) else {
         return;
     };
@@ -1281,6 +1294,9 @@ pub fn on_mode(state: &mut BotState, chan: &str, prefix: Option<&str>, modes: &s
             mode_changed = true;
             if ch == b'l' && adding && (server_src || !src_unauth) {
                 state.chans[ci].enf_last_limit = now(); // limitdelay counts from here
+                // someone set it: a backup's queued limit job is stale, and fired
+                // after the next joins it would race the holder for the same value
+                jobs_drop(state, ci, JobAct::Limit);
             }
         }
     }
@@ -1575,8 +1591,15 @@ fn minute_sweep(state: &mut BotState, t: i64) {
     }
 }
 
-/// Main-loop tick (<= 1 s): sweeps, pending jobs, 60 s ban expiry.
+/// Main-loop tick (<= 1 s): sweeps, pending jobs, 60 s ban expiry.  Held
+/// like [`on_mode`], so what one tick sends leaves packed.
 pub fn tick(state: &mut BotState) {
+    sendq::hold(state);
+    tick_inner(state);
+    sendq::release(state);
+}
+
+fn tick_inner(state: &mut BotState) {
     if state.status & S_CONNECTED == 0 {
         return;
     }

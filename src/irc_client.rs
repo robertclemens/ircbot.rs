@@ -1093,6 +1093,20 @@ pub fn check_status(state: &mut BotState) {
         return;
     }
 
+    // Registration watchdog.  Any received byte refreshes last_pong_time, and
+    // a server answers an unregistered client's PING (451 or PONG), so without
+    // this a link that never reaches 001 is held open forever, off IRC.
+    if state.status & S_AUTHED == 0 && now - state.connection_time > IRC_REGISTER_TIMEOUT {
+        logm!(
+            state,
+            L_INFO,
+            "[INFO] No registration (001) after {} seconds. Disconnecting.\n",
+            IRC_REGISTER_TIMEOUT
+        );
+        disconnect(state);
+        return;
+    }
+
     if now - state.last_pong_time > DEAD_SERVER_TIMEOUT {
         logm!(state, L_INFO, "[INFO] Server timed out. Disconnecting.\n");
         disconnect(state);

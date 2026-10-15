@@ -21,6 +21,11 @@
 //! itself).  A protection line identical to one already queued is not queued
 //! twice.
 //!
+//! A caller about to send several changes at once (a mode revert, one
+//! enforcement pass) wraps them in [`hold`] / [`release`]: while held nothing
+//! drains, so the MODE lines all wait in lane 1 and leave packed instead of
+//! one change per line through the burst credit.
+//!
 //! No timer or thread of its own: [`drain`] runs from `enqueue` (credit is
 //! usually there), from the main loop after every poll round, and the poll
 //! timeout is shortened to the moment the next line may go ([`next_ms`]).
@@ -204,8 +209,26 @@ pub fn enqueue(state: &mut BotState, line: &[u8]) -> i32 {
     copy.extend_from_slice(b"\r\n");
     state.sendq.q[lane].push_back(copy);
     state.sendq.total += 1;
-    drain(state);
+    if state.sendq.hold == 0 {
+        drain(state);
+    }
     len as i32
+}
+
+/// sendq_hold(): queue only until the matching [`release`], so MODEs pack.
+pub fn hold(state: &mut BotState) {
+    state.sendq.hold += 1;
+}
+
+/// sendq_release(): the outermost release drains what the hold kept back.
+/// It can write to the server and so drop the link, like any irc_printf.
+pub fn release(state: &mut BotState) {
+    if state.sendq.hold > 0 {
+        state.sendq.hold -= 1;
+        if state.sendq.hold == 0 {
+            drain(state);
+        }
+    }
 }
 
 // ---- MODE packing -------------------------------------------------------------
@@ -423,6 +446,31 @@ mod tests {
         // a line for lane 2 is the one dropped when lane 2 is empty
         assert_eq!(enqueue(&mut st, b"PRIVMSG #c :late\r\n"), -1);
         assert_eq!(st.sendq.q[SENDQ_LANE_REST].len(), 0);
+    }
+
+    #[test]
+    fn held_mode_changes_leave_packed() {
+        let mut st = BotState::for_test();
+        st.isup.modes = 4;
+        hold(&mut st);
+        for l in [
+            "MODE #c +i\r\n",
+            "MODE #c +n\r\n",
+            "MODE #c -k old\r\n",
+            "MODE #c +k new\r\n",
+        ] {
+            enqueue(&mut st, l.as_bytes());
+        }
+        assert_eq!(st.sendq.hold, 1);
+        assert_eq!(st.sendq.total, 4);
+        assert_eq!(
+            take_protection(&mut st).unwrap(),
+            b"MODE #c +in-k+k old new\r\n"
+        );
+        assert_eq!(st.sendq.total, 0);
+        release(&mut st);
+        release(&mut st); // an extra release never goes below 0
+        assert_eq!(st.sendq.hold, 0);
     }
 
     fn queue_privmsgs(st: &mut BotState, n: usize) {

@@ -12,7 +12,7 @@ pub const BOT_NAME: &str = "ircbot.rs by trojanman";
 /// made against.
 pub const BOT_VERSION: &str = match option_env!("IRCBOT_VERSION") {
     Some(v) => v,
-    None => "2.4.7",
+    None => "2.4.8",
 };
 pub const PASS_FILE: &str = ".ircbot.pass"; // machine-bound password file
 pub const PBKDF2_ITERATIONS: u32 = 100_000;
@@ -83,6 +83,8 @@ pub const NICK_TAKE_TIME: i64 = 20;
 pub const NICK_RETRY_TIME: i64 = 10;
 pub const DEAD_SERVER_TIMEOUT: i64 = 120;
 pub const CHECK_LAG_TIMEOUT: i64 = 60;
+/// Connected but no 001 by then: drop, try the next server.
+pub const IRC_REGISTER_TIMEOUT: i64 = 90;
 pub const ROSTER_REFRESH_INTERVAL: i64 = 120;
 pub const HUB_RECONNECT_DELAY: i64 = 30;
 pub const IRC_RECONNECT_MIN_INTERVAL: i64 = 10;

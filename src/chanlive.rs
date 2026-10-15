@@ -8,7 +8,7 @@
 use crate::consts::*;
 use crate::cstr::{Tok, eq_ic, now, trunc, trunc_string};
 use crate::state::{BotState, Chan, CsetId, Isupport, LiveBan};
-use crate::{auth, chancfg, channel, ircf, logm};
+use crate::{auth, chancfg, channel, ircf, logm, sendq};
 
 // ---- 005 (RPL_ISUPPORT) -------------------------------------------------------
 
@@ -453,6 +453,23 @@ pub fn apply_stored(state: &mut BotState, ci: usize) -> (i32, String) {
 /// received (the enforcement path -- the one-shot apply sends everything when
 /// unknown).
 pub fn sync(
+    state: &mut BotState,
+    ci: usize,
+    skip_limit: bool,
+    dry: bool,
+    require_known: bool,
+) -> (i32, String) {
+    if dry {
+        return mode_sync(state, ci, skip_limit, dry, require_known);
+    }
+    // The changes are held and leave packed, several per MODE line.
+    sendq::hold(state);
+    let r = mode_sync(state, ci, skip_limit, dry, require_known);
+    sendq::release(state);
+    r
+}
+
+fn mode_sync(
     state: &mut BotState,
     ci: usize,
     skip_limit: bool,

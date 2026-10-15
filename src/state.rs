@@ -412,6 +412,8 @@ pub struct SendQ {
     /// Lines dropped because the queue was full.
     #[allow(dead_code)] // counted like C's sendq_t.dropped, shown by a later phase
     pub dropped: u64,
+    /// sendq::hold depth: >0 queues without draining.
+    pub hold: u32,
 }
 
 impl Default for SendQ {
@@ -425,6 +427,7 @@ impl Default for SendQ {
             credit_ms: SENDQ_DEF_BURST * SENDQ_DEF_INTERVAL_MS,
             last_ms: crate::sendq::mono_ms(),
             dropped: 0,
+            hold: 0,
         }
     }
 }

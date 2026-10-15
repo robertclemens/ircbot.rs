@@ -819,6 +819,57 @@ pub fn item_name(idx: usize, net: bool) -> Option<&'static str> {
     (k < FL_COUNT && (net || k < FL_CHAN_COUNT)).then_some(FL_NAME[k])
 }
 
+/// What item idx does, in the same index space as [`item_name`] (the hub
+/// console's help channel set / network set say the same).
+const ITEM_WHAT: [&str; CS_COUNT + FL_COUNT] = [
+    "put back any change away from the stored modes",
+    "only authorised users and bots may hold ops",
+    "re-op an authorised member someone deopped; lift bans on one",
+    "deop whoever deops, kicks or bans an authorised member; again: kick + ban",
+    "take back ops a netsplit rejoin gave to unauthorised members",
+    "kick the unauthorised members a new ban matches",
+    "set a listed ban only while someone it matches is in the channel",
+    "ops are never acted on for chan, ctcp, join and nick floods",
+    "a bot alone in a channel with no ops parts and rejoins for ops",
+    "keep +l at the member count plus limitgap",
+    "minutes an automatic ban (flood, revenge) lasts; 0 = permanent",
+    "ban mask shape 0-9: 2 = *!*@host, 4 = *!*@*.host, 7 = nick!*@host",
+    "dynamicbans: minutes with no match before a listed ban is lifted",
+    "dynamiclimit: free places above the member count",
+    "dynamiclimit: seconds between limit changes",
+    "minutes a flooding host or user stays ignored",
+    "messages to the channel per host: kick, again: ban",
+    "CTCPs to the channel per host: kick, again: ban",
+    "joins per host (join/part cycling): ban + kick",
+    "nick changes per host: kick, again: ban",
+    "deops by an unauthorised op: deop them, re-op the victims",
+    "kicks by an unauthorised op: deop them, again: kick + ban",
+    "bans by an unauthorised op: deop them, lift bans on authorised",
+    "commands per user: extras dropped; 3x the rate ignores the user",
+    "other messages to a bot per host: the host is ignored",
+    "CTCPs to a bot per host: the host is ignored",
+    "a bot's IRC output: B lines at once, then one every I ms",
+];
+
+/// chancfg_item_help(): item idx's built-in value as typed (on/off, a
+/// number, N:S) and what it does; None past the end.
+pub fn item_help(idx: usize) -> Option<(String, &'static str)> {
+    let def = if idx < CS_COUNT {
+        let d = &CSET[idx];
+        if d.hi == 1 {
+            (if d.builtin != 0 { "on" } else { "off" }).to_string()
+        } else {
+            d.builtin.to_string()
+        }
+    } else if idx - CS_COUNT < FL_COUNT {
+        let (n, s) = FL_BUILTIN[idx - CS_COUNT];
+        format!("{n}:{s}")
+    } else {
+        return None;
+    };
+    Some((def, ITEM_WHAT[idx]))
+}
+
 /// Where an item's effective value comes from: 2 = channel override,
 /// 1 = network default, 0 = built-in.
 pub fn item_source(state: &BotState, c: Option<&Chan>, idx: usize) -> u8 {

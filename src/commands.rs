@@ -23,7 +23,8 @@ use crate::state::{
     TrustedBot, UserRecord, has_control_bytes, is_rfc_nick, is_valid_bot_nick, lww_next_ts,
 };
 use crate::{
-    auth, bot_comms, chancmd, channel, config, dcc, hub_client, irc_client, ircf, logm, updater,
+    auth, bot_comms, chancfg, chancmd, channel, config, dcc, hub_client, irc_client, ircf, logm,
+    updater,
 };
 
 // ---- Reply helpers ---------------------------------------------------------------
@@ -3096,7 +3097,7 @@ fn admin_help(state: &mut BotState, nick: &str, topic: Option<&str>) {
             return;
         }
         "chanmode" => {
-            "Syntax: chanmode <#channel> [<modes> [args]|-] - Show, set or reset the channel's stored modes (i m n p s t k l). +k takes a key and +l a limit (1..99999) as arguments, left to right; '-' goes back to the network default. The modes are applied once if this bot is opped; with +enforcemodes the bots keep them. chkey <#channel> <key> is chanmode <#channel> +k <key>."
+            "Syntax: chanmode <#channel> [<modes> [args]|-] - Show, set or reset the channel's stored modes (i m n p s t k l). +k takes a key and +l a limit (1..99999) as arguments, left to right; '-' goes back to the network default (built-in +nt). The modes are applied once if this bot is opped; with +enforcemodes the bots keep them. chkey <#channel> <key> is chanmode <#channel> +k <key>."
         }
         "chanset" => {
             say(
@@ -3104,7 +3105,21 @@ fn admin_help(state: &mut BotState, nick: &str, topic: Option<&str>) {
                 nick,
                 "Syntax: chanset <#channel|default> [+opt -opt ...] [<name> <value|default>] [flood <type> <N:S|off|default>] - Show or change channel settings.",
             );
-            "  Options: enforcemodes bitch protectops revenge stopnethack enforcebans dynamicbans dontkickops cycle dynamiclimit. Values: bantime bantype banidle limitgap limitdelay. Floods: chan ctcp join nick deop kick ban. 'default' also takes 'flood cmd|msg|ctcp' (bot floods), 'ignoretime <min>' and 'sendq B:I' (burst 1..100, interval 0..10000 ms)."
+            say(
+                state,
+                nick,
+                "  On/off options take +name or -name; the others take a value or 'default' (inherit again); a flood takes N:S (more than N in S seconds), off or default. Only unauthorised members are acted on, by an opped bot. Setting (built-in default): what it does --",
+            );
+            let mut i = 0;
+            while let Some((def, what)) = chancfg::item_help(i) {
+                if let Some(name) = chancfg::item_name(i, true) {
+                    let net_only = chancfg::item_name(i, false).is_none();
+                    let tag = if net_only { " [default only]" } else { "" };
+                    say(state, nick, &format!("  {name} ({def}){tag}: {what}"));
+                }
+                i += 1;
+            }
+            return;
         }
         "+ban" => {
             "Syntax: +ban <#channel|*> <nick!user@host> [<minutes>|perm] [sticky] [reason] - Add a network ban (permanent unless a time is given; '*' = every channel). Refused if the mask would hit a bot or an authorised user."
