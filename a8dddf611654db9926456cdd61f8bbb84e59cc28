@@ -1,0 +1,1 @@
+Correction: this commit does NOT contain the config-push stack overflow or short-frame over-read fixes listed in the message. Those were hub-only fixes (irchub/irchub.rs 2.4.6). This commit's changes are: full warning-flag cleanup (C), MODE batching (sendq_hold), setting help, dynlimit backup race fix, cargo update (rs), version bump to 2.4.8.
