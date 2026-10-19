@@ -111,11 +111,16 @@ fn auth_epoch(state: &BotState) -> u32 {
     for u in &state.user_records {
         h = fp_str(h, &u.uuid).wrapping_add(u64::from(u.is_active));
     }
+    // an oper's standing is per channel (user_flags plan §6)
+    for r in &state.uchan_records {
+        h = fp_str(fp_str(h, &r.uuid), &r.chan).wrapping_add(u64::from(r.is_active));
+    }
     h = h
         .wrapping_mul(1099511628211)
         .wrapping_add(state.trusted_bots.len() as u64 * 3)
         .wrapping_add(state.mask_records.len() as u64 * 5)
-        .wrapping_add(state.user_records.len() as u64);
+        .wrapping_add(state.user_records.len() as u64)
+        .wrapping_add(state.uchan_records.len() as u64 * 7);
     if state.auth_gen.get() == 0
         || h != state.auth_fp.get()
         || state.auth_seen_cfg_gen.get() != state.cfg_gen
@@ -132,13 +137,14 @@ fn auth_epoch(state: &BotState) -> u32 {
 /// The verdict is cached in the entry (only its cache cells change), so every
 /// wildcard match against the bots / masks is paid once per entry per
 /// auth_gen instead of once per ban x entry.
-fn entry_authorised(state: &BotState, e: &RosterEntry) -> bool {
+fn entry_authorised(state: &BotState, chan: &str, e: &RosterEntry) -> bool {
     if is_me(state, &e.nick) {
         return true;
     }
     let gen_now = auth_epoch(state);
     if e.auth_gen.get() != gen_now {
-        e.authorised.set(auth::is_authorised(state, &e.hostmask));
+        e.authorised
+            .set(auth::is_authorised(state, &e.hostmask, Some(chan)));
         e.auth_gen.set(gen_now);
     }
     e.authorised.get()
@@ -157,9 +163,9 @@ pub fn chan_nuh_authorised(state: &BotState, ci: usize, nuh: &str) -> bool {
         && let Some(i) = rfind(c, nick)
         && eq_ic(&c.roster[i].hostmask, nuh)
     {
-        return entry_authorised(state, &c.roster[i]);
+        return entry_authorised(state, &c.name, &c.roster[i]);
     }
-    auth::is_authorised(state, nuh)
+    auth::is_authorised(state, nuh, state.chans.get(ci).map(|c| c.name.as_str()))
 }
 
 /// Add or replace a roster entry (WHO reply, JOIN); false when full.
@@ -441,7 +447,10 @@ fn allowed_members(state: &BotState, ci: usize, mask: &str) -> Option<String> {
     let c = state.chans.get(ci)?;
     c.roster
         .iter()
-        .find(|e| entry_authorised(state, e) && auth::wildcard_match(mask, &e.hostmask))
+        .find(|e| {
+            entry_authorised(state, &state.chans[ci].name, e)
+                && auth::wildcard_match(mask, &e.hostmask)
+        })
         .map(|e| format!("member {}", e.nick))
 }
 
@@ -458,7 +467,7 @@ pub fn ban_allowed_why(state: &BotState, ci: Option<usize>, mask: &str) -> Resul
     {
         return Err(who);
     }
-    match auth::mask_overlaps_authorised(state, mask) {
+    match auth::mask_overlaps_authorised(state, mask, ci.map(|i| state.chans[i].name.as_str())) {
         Some(who) => Err(who),
         None => Ok(()),
     }
@@ -636,7 +645,9 @@ fn act_deop(state: &mut BotState, ci: usize, nick: &str, why: &str, half: bool) 
     let Some(e) = rfind(c, nick).map(|i| &c.roster[i]) else {
         return;
     };
-    if !(if half { e.is_halfop } else { e.is_op }) || entry_authorised(state, e) {
+    if !(if half { e.is_halfop } else { e.is_op })
+        || entry_authorised(state, &state.chans[ci].name, e)
+    {
         return;
     }
     let (name, enick) = (c.name.clone(), e.nick.clone());
@@ -662,7 +673,7 @@ fn act_reop(state: &mut BotState, ci: usize, nick: &str, why: &str) {
     let Some(e) = rfind(c, nick).map(|i| &c.roster[i]) else {
         return;
     };
-    if e.is_op || is_me(state, &e.nick) || !entry_authorised(state, e) {
+    if e.is_op || is_me(state, &e.nick) || !entry_authorised(state, &state.chans[ci].name, e) {
         return;
     }
     let (name, enick) = (c.name.clone(), e.nick.clone());
@@ -681,7 +692,7 @@ fn act_kick(state: &mut BotState, ci: usize, nick: &str, reason: &str) {
     let Some(e) = rfind(c, nick).map(|i| &c.roster[i]) else {
         return;
     };
-    if entry_authorised(state, e) {
+    if entry_authorised(state, &state.chans[ci].name, e) {
         return;
     }
     let (name, enick) = (c.name.clone(), e.nick.clone());
@@ -723,7 +734,7 @@ fn act_ban(state: &mut BotState, ci: usize, mask: &str, why: &str) {
         return;
     }
     if t - state.ban_track[ti].checked_at >= 60 {
-        let ov = auth::mask_overlaps_authorised(state, mask);
+        let ov = auth::mask_overlaps_authorised(state, mask, Some(&state.chans[ci].name));
         state.ban_track[ti].overlap_ok = ov.is_none();
         state.ban_track[ti].checked_at = t;
         if let Some(who) = ov {
@@ -776,7 +787,7 @@ fn exec_ban_nuh(state: &mut BotState, ci: usize, nuh: &str, reason: &str) {
         return;
     }
     let c = &state.chans[ci];
-    if rfind(c, nick).is_some_and(|i| entry_authorised(state, &c.roster[i]))
+    if rfind(c, nick).is_some_and(|i| entry_authorised(state, &c.name, &c.roster[i]))
         || chan_nuh_authorised(state, ci, nuh)
     {
         return;
@@ -1086,7 +1097,8 @@ pub fn on_kick(state: &mut BotState, chan: &str, prefix: Option<&str>, victim: &
         return;
     }
     let c = &state.chans[ci];
-    let victim_auth = rfind(c, victim).is_some_and(|i| entry_authorised(state, &c.roster[i]));
+    let victim_auth =
+        rfind(c, victim).is_some_and(|i| entry_authorised(state, &c.name, &c.roster[i]));
     let name = c.name.clone();
     recent_ack(state, &name, "kick", victim);
     let c = &mut state.chans[ci];
@@ -1153,10 +1165,9 @@ pub fn on_nick(state: &mut BotState, old_nick: &str, new_nick: &str) {
 // ---- MODE events (who did what) ---------------------------------------------------
 
 fn ban_hits_authorised(state: &BotState, ci: usize, mask: &str) -> bool {
-    state.chans[ci]
-        .roster
-        .iter()
-        .any(|e| entry_authorised(state, e) && auth::wildcard_match(mask, &e.hostmask))
+    state.chans[ci].roster.iter().any(|e| {
+        entry_authorised(state, &state.chans[ci].name, e) && auth::wildcard_match(mask, &e.hostmask)
+    })
 }
 
 /// A MODE line on a channel, after the live state was updated.  `prefix` is
@@ -1228,7 +1239,7 @@ fn on_mode_inner(state: &mut BotState, chan: &str, prefix: Option<&str>, modes: 
             let c = &state.chans[ci];
             let victim_auth = rfind(c, va)
                 .map(|i| &c.roster[i])
-                .is_some_and(|ve| is_me(state, &ve.nick) || entry_authorised(state, ve));
+                .is_some_and(|ve| is_me(state, &ve.nick) || entry_authorised(state, chan, ve));
             let name = c.name.clone();
             chanflood::event(state, &name, pfx, FloodKind::Deop, victim_auth);
         } else if user_src
@@ -1249,7 +1260,7 @@ fn on_mode_inner(state: &mut BotState, chan: &str, prefix: Option<&str>, modes: 
             if is_me(state, &e.nick) {
                 continue;
             }
-            let (enick, auth) = (e.nick.clone(), entry_authorised(state, e));
+            let (enick, auth) = (e.nick.clone(), entry_authorised(state, chan, e));
             if adding && !auth {
                 if bitch {
                     job_submit(state, ci, JobAct::Deop, &enick, "bitch");
@@ -1271,7 +1282,7 @@ fn on_mode_inner(state: &mut BotState, chan: &str, prefix: Option<&str>, modes: 
             if bitch
                 && let Some(e) = rfind(c, a).map(|i| &c.roster[i])
                 && !is_me(state, &e.nick)
-                && !entry_authorised(state, e)
+                && !entry_authorised(state, chan, e)
             {
                 let enick = e.nick.clone();
                 job_submit(state, ci, JobAct::Dehalf, &enick, "bitch");
@@ -1302,8 +1313,8 @@ fn on_mode_inner(state: &mut BotState, chan: &str, prefix: Option<&str>, modes: 
     }
     if mode_changed {
         let skip_limit = cset(state, ci, CsetId::DynamicLimit) != 0;
-        let clean = state.chans[ci].live_known
-            && chanlive::sync(state, ci, skip_limit, true, true).0 <= 0;
+        let clean =
+            state.chans[ci].live_known && chanlive::sync(state, ci, skip_limit, true, true).0 <= 0;
         // a line that leaves the channel as stored (the holder's revert echoed)
         // ends a backup's wait: a revert job left pending would keep its first
         // timer and fire on the next operator change just as the holder answers
@@ -1335,7 +1346,7 @@ fn unauth_match(state: &BotState, ci: usize, mask: &str) -> (Vec<String>, bool) 
     let mut hits = Vec::new();
     let mut auth_hit = false;
     for e in &state.chans[ci].roster {
-        if entry_authorised(state, e) {
+        if entry_authorised(state, &state.chans[ci].name, e) {
             if !auth_hit && auth::wildcard_match(mask, &e.hostmask) {
                 auth_hit = true;
             }
@@ -1418,6 +1429,9 @@ fn ban_sweep(state: &mut BotState, ci: usize, t: i64) {
         let matched = !hits.is_empty();
         if matched {
             state.ban_track[ti].last_match = t;
+            if !sticky {
+                chancfg::ban_mark_used(state, &r.chan, &r.mask, t);
+            }
         }
         let mut keep = sticky || !dyn_bans;
         if keep && !live {
@@ -1532,7 +1546,7 @@ fn chan_sweep(state: &mut BotState, ci: usize, t: i64) {
             let todo: Vec<(String, bool, bool)> = state.chans[ci]
                 .roster
                 .iter()
-                .filter(|e| !entry_authorised(state, e))
+                .filter(|e| !entry_authorised(state, &state.chans[ci].name, e))
                 .map(|e| (e.nick.clone(), e.is_op, e.is_halfop))
                 .collect();
             for (nk, op, half) in todo {
@@ -1875,7 +1889,7 @@ mod tests {
     fn authorised_verdict_is_cached_until_the_records_change() {
         let mut st = chan_state(&members());
         let e = st.chans[0].roster[1].clone();
-        assert!(!entry_authorised(&st, &e));
+        assert!(!entry_authorised(&st, "#c", &e));
         assert_eq!(e.auth_gen.get(), st.auth_gen.get());
         // a new record is seen once the fingerprint is retaken (<= 200 ms)
         st.trusted_bots.push(TrustedBot {
@@ -1884,11 +1898,11 @@ mod tests {
             ..TrustedBot::default()
         });
         st.auth_fp_ms.set(st.auth_fp_ms.get() - 201);
-        assert!(entry_authorised(&st, &e));
+        assert!(entry_authorised(&st, "#c", &e));
         // a config generation change retires the cache at once
         st.trusted_bots.clear();
         st.cfg_gen += 1;
-        assert!(!entry_authorised(&st, &e));
+        assert!(!entry_authorised(&st, "#c", &e));
         // a hostmask change (roster_set) forgets the verdict
         assert_eq!(st.chans[0].roster[0].auth_gen.get(), 0);
     }

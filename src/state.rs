@@ -118,6 +118,36 @@ impl TrustedBot {
     }
 }
 
+/// A person's channel request this bot sent the hub (CMD_USER_CHAN_REQUEST),
+/// waiting for its CMD_USER_CHAN_RESULT (C `user_chan_pending_t`).
+#[derive(Clone, Debug, Default)]
+pub struct UserChanPending {
+    pub rid: String,
+    pub kind: String,
+    pub chan: String,
+    pub nick: String,
+    pub mask: String,
+    pub sent: i64,
+}
+
+/// Admin flags, `uf|<user_uuid>|<flags>|<ts>` (C `uflag_record_t`).
+#[derive(Clone, Debug, Default)]
+pub struct UflagRecord {
+    pub uuid: String,
+    pub flags: String,
+    pub timestamp: i64,
+}
+
+/// Oper channel binding, `uc|<user_uuid>|<#chan|*>|add/del|<ts>` (C
+/// `uchan_record_t`).
+#[derive(Clone, Debug, Default)]
+pub struct UchanRecord {
+    pub uuid: String,
+    pub chan: String,
+    pub is_active: bool,
+    pub timestamp: i64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct MaskRecord {
     pub uuid: String,
@@ -355,6 +385,10 @@ pub struct CfgBan {
     pub active: bool,
     /// Bot-written, not yet pushed to a hub.
     pub push_pending: bool,
+    /// Runtime only: last unauthorised match.
+    pub last_used: i64,
+    /// Runtime only: CMD_ACTIVITY time not yet sent.
+    pub act_pending: i64,
 }
 
 /// 005 (RPL_ISUPPORT) values this bot uses; reset on every disconnect.
@@ -790,6 +824,11 @@ pub struct BotState {
 
     pub user_records: Vec<UserRecord>,
     pub mask_records: Vec<MaskRecord>,
+    /// Admin flags (uf|) and oper channel bindings (uc|), access.rs.
+    pub uflag_records: Vec<UflagRecord>,
+    pub uchan_records: Vec<UchanRecord>,
+    /// Person requests waiting for the hub (at most USER_CHAN_PENDING).
+    pub user_chan_pending: Vec<UserChanPending>,
     pub config_dirty: bool,
     pub last_config_write: i64,
 
@@ -814,12 +853,17 @@ pub struct BotState {
     pub hub_connecting: bool,
     pub hub_connected: bool,
     pub hub_authenticated: bool,
+    /// Deleted on the hub (CMD_BOT_RETIRE): the config files are wiped and
+    /// config::write_file never writes them again before the bot exits.
+    pub retired: bool,
     pub hub_session_key: Locked<32>,
     pub last_hub_connect_attempt: i64,
     pub last_hub_ping_time: i64,
     pub last_hub_activity: i64,
     pub last_hub_pong_sent: i64,
     pub last_op_request_sent: i64,
+    /// Next free retry slot for a channel the rate limit held back.
+    pub op_request_next_slot: i64,
     pub last_chan_request_sent: i64,
     pub chan_req_fallback_idx: usize,
     pub unban_jobs: Vec<UnbanJob>,
@@ -845,6 +889,11 @@ pub struct BotState {
     /// only for this run — `.prev` otherwise holds the build from before some
     /// earlier, completed run, and a bot that refused a COMMIT never moved.
     pub upgrade_installed_id: String,
+    /// UPGRADE_PASS_REWRITE_SECS: when the deferred pass rewrite is due (0 =
+    /// none), and whether this process saved PASS_PREV_FILE — hub_rollback()
+    /// restores it only then, never a stale copy.
+    pub pass_rewrite_due: i64,
+    pub pass_prev_saved: bool,
     /// An upgrade's "ok" not sent yet: held until this bot is back in every
     /// channel it held ops in before the restart, opped, or UPGRADE_OPS_WAIT
     /// has passed (hub_client::upgrade_ready_tick).  Volatile.
@@ -951,6 +1000,9 @@ impl BotState {
             admin_nonces: NonceCache::new(MAX_SEEN_HASHES),
             user_records: Vec::new(),
             mask_records: Vec::new(),
+            uflag_records: Vec::new(),
+            uchan_records: Vec::new(),
+            user_chan_pending: Vec::new(),
             config_dirty: false,
             last_config_write: 0,
             opt_flags: String::new(),
@@ -969,12 +1021,14 @@ impl BotState {
             hub_connecting: false,
             hub_connected: false,
             hub_authenticated: false,
+            retired: false,
             hub_session_key: Locked::new(),
             last_hub_connect_attempt: 0,
             last_hub_ping_time: 0,
             last_hub_activity: 0,
             last_hub_pong_sent: 0,
             last_op_request_sent: 0,
+            op_request_next_slot: 0,
             last_chan_request_sent: 0,
             chan_req_fallback_idx: 0,
             unban_jobs: vec![UnbanJob::default(); MAX_UNBAN_JOBS],
@@ -989,6 +1043,8 @@ impl BotState {
             upgrade_base: String::new(),
             upgrade_prepared: 0,
             upgrade_installed_id: String::new(),
+            pass_rewrite_due: 0,
+            pass_prev_saved: false,
             upgrade_report: None,
             sendq: SendQ::default(),
             isup: Isupport::default(),

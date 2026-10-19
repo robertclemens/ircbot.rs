@@ -12,10 +12,15 @@ pub const BOT_NAME: &str = "ircbot.rs by trojanman";
 /// made against.
 pub const BOT_VERSION: &str = match option_env!("IRCBOT_VERSION") {
     Some(v) => v,
-    None => "2.4.8",
+    None => "2.5.0",
 };
 pub const PASS_FILE: &str = ".ircbot.pass"; // machine-bound password file
-pub const PBKDF2_ITERATIONS: u32 = 100_000;
+/// PBKDF2-HMAC-SHA256 rounds for the .ircbot.cnf and .ircbot.pass keys.
+/// 2.5.0 raised them from 100k (PBKDF2_ITERATIONS_LEGACY); a file still under
+/// the legacy count is read and rewritten once (config::load, passfile_load).
+/// Releases after 2.5.0 carry min_from 2.5.0 so no node skips that rewrite.
+pub const PBKDF2_ITERATIONS: u32 = 600_000;
+pub const PBKDF2_ITERATIONS_LEGACY: u32 = 100_000;
 pub const VERSION_RESPONSE: &str = "A robot may not injure a human being";
 pub const CONFIG_FILE: &str = ".ircbot.cnf";
 pub const PID_FILE: &str = ".ircbot.pid";
@@ -39,6 +44,8 @@ pub const UPGRADE_MARKER_FILE: &str = ".ircbot.upgrade";
 /// Retained previous binary/config, kept (not deleted) after a hub-driven
 /// upgrade so CMD_UPGRADE_ABORT can put the node back.
 pub const UPGRADE_PREV_SUFFIX: &str = ".prev";
+/// The pre-2.5.0 pass file kept for a rollback (PASS_FILE + UPGRADE_PREV_SUFFIX).
+pub const PASS_PREV_FILE: &str = ".ircbot.pass.prev";
 /// How long a CMD_UPGRADE_PREPARE stays commitable.
 pub const UPGRADE_PREPARE_TTL: i64 = 900;
 /// Per-transfer budget (seconds) for the manifest read a PREPARE answer
@@ -50,6 +57,16 @@ pub const UPDATE_FETCH_TIMEOUT: u64 = 300;
 /// The upgrade script's startup watchdog: how long the new build's daemon
 /// has to be up before the script keeps it (bot.h UPGRADE_WATCH_SECS).
 pub const UPGRADE_WATCH_SECS: u32 = 20;
+/// A pre-2.5.0 PASS_FILE found on the start a hub-driven upgrade made is
+/// rewritten at PBKDF2_ITERATIONS this long after that start: past the old
+/// build's watchdog, which restores `<exe>.prev` and the config but not this
+/// file.  The old copy stays as PASS_PREV_FILE until the next ordinary start,
+/// for this process's own hub-ordered rollback to put back (bot.h).
+pub const UPGRADE_PASS_REWRITE_SECS: i64 = 120;
+const _: () = assert!(
+    UPGRADE_PASS_REWRITE_SECS > 3 * UPGRADE_WATCH_SECS as i64,
+    "the pass rewrite must wait out the old build's watchdog"
+);
 /// After an upgrade restart the bot holds its "ok" until it is back in every
 /// channel it held ops in before, opped — at most this long (seconds), then
 /// it reports "ok" anyway with what is missing (bot.h UPGRADE_OPS_WAIT).
@@ -101,6 +118,14 @@ pub const CONNECT_TIMEOUT_SECS: u64 = 10;
 pub const MAX_SERVERS: usize = 10;
 pub const MAX_USER_RECORDS: usize = 40;
 pub const MAX_USER_MASKS: usize = 200;
+/// Admin flags and oper channel bindings (irchub docs/plans/
+/// 2026-10-16_user_flags_plan.md §3.1), mirrored from irchub/hub.h: the
+/// letters in canonical order, one uf| per user, uc| live + tombstones, the
+/// migration stamp.
+pub const USER_FLAG_LETTERS: &str = "abchou";
+pub const MAX_USER_FLAGS: usize = MAX_USER_RECORDS;
+pub const MAX_CHAN_BINDS: usize = 400;
+pub const USER_ACCESS_MIGRATE_TS: i64 = 1;
 pub const MAX_CHAN: usize = 65; // buffer size incl. NUL: names up to 64 bytes
 pub const MAX_BUFFER: usize = 16384;
 pub const MAX_NICK: usize = 10; // 9 chars + NUL
@@ -120,8 +145,15 @@ pub const CFG_GLOBAL_LINE_MAX: usize = 1088;
 pub const CFG_BOT_FIELD_LINE: usize = 320;
 pub const CFG_USER_LINE_MAX: usize = 384;
 pub const CFG_MASK_LINE_MAX: usize = 352;
+pub const CFG_UF_LINE_MAX: usize = 96; // uf|<uuid>|<flags>|<ts>
+pub const CFG_UC_LINE_MAX: usize = 160; // uc|<uuid>|<chan>|add/del|<ts>
 pub const CFG_BLINE_MAX: usize = 448;
 pub const CFG_MAX_GLOBALS: usize = 64;
+/// hl|<addr>/<fp>,...: the hubs this bot dials, in every config push, for the
+/// hub console's hub del preview.  Mirrors irchub's hub.h.
+pub const HL_ADDR_MAX: usize = 80;
+/// hex of SHA-256(hub Ed25519 key)[0..8]
+pub const HL_FP_LEN: usize = 16;
 pub const CFG_BOT_SYNC_FIELDS: usize = 8;
 pub const CFG_PAYLOAD_SLACK: usize = 8192;
 // modes.md section 2: C| (per channel), D| (one) and B| (bans) lines.  The
@@ -147,6 +179,8 @@ pub const MAX_CONFIG_PAYLOAD: usize = CFG_MAX_GLOBALS * CFG_GLOBAL_LINE_MAX
     + CFG_MAX_BANS * B_LINE_MAX
     + MAX_USER_RECORDS * CFG_USER_LINE_MAX
     + MAX_USER_MASKS * CFG_MASK_LINE_MAX
+    + MAX_USER_FLAGS * CFG_UF_LINE_MAX
+    + MAX_CHAN_BINDS * CFG_UC_LINE_MAX
     + CFG_BOT_SYNC_FIELDS * CFG_BOT_FIELD_LINE
     + MAX_TRUSTED_BOTS * CFG_BLINE_MAX
     + CFG_PAYLOAD_SLACK;
@@ -187,7 +221,9 @@ pub const DCC_IDLE_TIMEOUT: i64 = 3600;
 pub const DCC_MIN_PORT: u32 = 1024;
 pub const DCC_OUTBUF_MAX: usize = 512 * 1024;
 
-pub const BOT_PROTO_VERSION: i32 = 2;
+/// 3 = knows admin flags / oper channel bindings (uf| / uc|): below that the
+/// hub never sends a restricted user (user_flags plan §3.2).
+pub const BOT_PROTO_VERSION: i32 = 3;
 
 // ---- Crypto sizes --------------------------------------------------------------
 pub const GCM_IV_LEN: usize = 12;
@@ -271,6 +307,30 @@ pub const CMD_ADMIN_NET_SET: u8 = 0x79; // console -> hub: network set
 #[allow(dead_code)]
 pub const CMD_ADMIN_SET_SSH: u8 = 0x7A; // console -> hub: hub set ssh / conn
 pub const CMD_CHAN_EVENT: u8 = 0x7B; // bot -> hub: #chan|action|target|detail
+#[allow(dead_code)]
+pub const CMD_ADMIN_USER_ACCESS: u8 = 0x7C; // console -> hub only (reserved here)
+// A person's channel request (irchub user_flags plan section 5): when this bot
+// cannot op / invite / unban an admin or oper itself it asks the hub, which
+// re-checks the user and runs the channel-request election.
+//   CMD_USER_CHAN_REQUEST bot->hub  rid|kind|#chan|user_uuid|nick|nick!user@host
+//   CMD_USER_CHAN_RESULT  hub->bot  rid|ok|detail  or  rid|fail|detail
+// No answer within USER_CHAN_REPLY_WAIT and the bot asks its trusted bots
+// directly over ~B2 instead.
+pub const CMD_USER_CHAN_REQUEST: u8 = 0x7D;
+pub const CMD_USER_CHAN_RESULT: u8 = 0x7E;
+// Revoked bots (irchub docs/plans/2026-10-17_bot_revoke_plan.md).  A bot
+// deleted on the hub is told to wipe its config and exit:
+//   CMD_BOT_RETIRE      hub->bot  empty; a sealed frame in session, or the
+//                                 handshake's 1-byte sealed ACK is 0x7F
+//   CMD_BOT_RETIRE_ACK  bot->hub  "1" config wiped, "0" wipe failed
+// Mirrors irchub/hub.h (0x81 CMD_ADMIN_LIST_REVOKED is console->hub only).
+pub const CMD_BOT_RETIRE: u8 = 0x7F;
+pub const CMD_BOT_RETIRE_ACK: u8 = 0x80;
+#[allow(dead_code)]
+pub const CMD_ADMIN_LIST_REVOKED: u8 = 0x81;
+pub const USER_CHAN_RID_MAX: usize = 32;
+pub const USER_CHAN_PENDING: usize = 8;
+pub const USER_CHAN_REPLY_WAIT: i64 = 45; // s: the hub's CHAN_ELECT_TTL (40) + margin
 pub const CHAN_EVENT_TARGET_MAX: usize = 120;
 pub const CHAN_EVENT_DETAIL_MAX: usize = 160;
 pub const CHAN_EVENT_DEDUPE_SECS: i64 = 10; // per (chan, action, target)
@@ -346,8 +406,12 @@ pub const CMD_UPGRADE_ABORT: u8 = 0x62;
 // authentication.  admins / opers / match ask the hub for the network-wide
 // times (CMD_ACTIVITY_QUERY), park the command for up to
 // ACTIVITY_QUERY_TIMEOUT seconds, and show max(hub, local) per row; with no
-// hub or no answer they show the local times.
+// hub or no answer they show the local times.  A listed, non-sticky ban's
+// last use (an unauthorised member matched it in the ban sweep) is stamped
+// and reported the same way by chancfg::ban_mark_used; bots keep it in memory
+// only, the hub stores it (console `ban list` LAST USED).
 //   CMD_ACTIVITY        a|<user_uuid>|<ts>  /  m|<user_uuid>|<mask>|<ts>
+//                       B|<#chan|*>|<mask>|<ts>
 //   CMD_ACTIVITY_QUERY  <req_id>|users  /  <req_id>|masks|<user_uuid or *>
 //   CMD_ACTIVITY_REPLY  <req_id>|<more>, then a|/m| lines; more=0 last
 pub const CMD_ACTIVITY: u8 = 0x69;

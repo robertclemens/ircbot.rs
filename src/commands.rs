@@ -23,8 +23,8 @@ use crate::state::{
     TrustedBot, UserRecord, has_control_bytes, is_rfc_nick, is_valid_bot_nick, lww_next_ts,
 };
 use crate::{
-    auth, bot_comms, chancfg, chancmd, channel, config, dcc, hub_client, irc_client, ircf, logm,
-    updater,
+    access, auth, bot_comms, chancfg, chancmd, channel, config, dcc, hub_client, irc_client, ircf,
+    logm, updater,
 };
 
 // ---- Reply helpers ---------------------------------------------------------------
@@ -705,7 +705,11 @@ fn run_user_command(state: &mut BotState, nick: &str, user_host: &str, who: usiz
     // The commands that take a free-form tail get the whole argument line,
     // copied before the verb and the first three arguments are cut off.
     let argline: Option<Zeroizing<String>> = {
-        const TAILED: [&str; 5] = ["chanmode", "chanset", "+ban", "-ban", "bans"];
+        // and +admin / +oper, whose fourth word (flags / channels) is read
+        // from it
+        const TAILED: [&str; 7] = [
+            "chanmode", "chanset", "+ban", "-ban", "bans", "+admin", "+oper",
+        ];
         let cl = cmd_line.trim_start_matches(' ');
         let vl = cl.find(' ').unwrap_or(cl.len());
         let a = cl[vl..].trim_start_matches(' ');
@@ -769,7 +773,7 @@ fn run_user_command(state: &mut BotState, nick: &str, user_host: &str, who: usiz
     if is_admin {
         admin_command(state, nick, user_host, who, command, a);
     } else {
-        oper_command(state, nick, who, command, a);
+        oper_command(state, nick, user_host, who, command, a);
     }
 }
 
@@ -1010,6 +1014,8 @@ const HUB_ONLY_CMDS: &[&str] = &[
     "-admin",
     "+oper",
     "-oper",
+    "chattr",
+    "chanoper",
     "+usermask",
     "-usermask",
     "+bot",
@@ -1022,6 +1028,355 @@ const HUB_ONLY_CMDS: &[&str] = &[
     "+ban",
     "-ban", // modes.md 5.2
 ];
+
+// ---- Admin flags (irchub docs/plans/2026-10-16_user_flags_plan.md §2) ----
+/// The flag each admin command needs on a bot ('a' passes every check).
+/// 'x' = the target user's role decides (+a for an admin, +o for an oper).
+/// Not listed = none: views, help, and dcc (a DCC chat only carries
+/// commands, each checked here).  C `BOT_CMD_FLAGS`.
+const BOT_CMD_FLAGS: &[(&str, char)] = &[
+    ("die", 'b'),
+    ("jump", 'b'),
+    ("+bot", 'b'),
+    ("-bot", 'b'),
+    ("givenick", 'b'),
+    ("chnick", 'b'),
+    ("saveconf", 'b'),
+    ("rekey", 'b'),
+    ("+server", 'b'),
+    ("-server", 'b'),
+    ("join", 'c'),
+    ("part", 'c'),
+    ("op", 'c'),
+    ("invite", 'c'),
+    ("unban", 'c'),
+    ("key", 'c'),
+    ("chanmode", 'c'),
+    ("chanset", 'c'),
+    ("+ban", 'c'),
+    ("-ban", 'c'),
+    ("+hub", 'h'),
+    ("-hub", 'h'),
+    ("setlog", 'h'),
+    ("getlog", 'h'),
+    ("update", 'u'),
+    ("+admin", 'a'),
+    ("-admin", 'a'),
+    ("chattr", 'a'),
+    ("+oper", 'o'),
+    ("-oper", 'o'),
+    ("chanoper", 'o'),
+    ("+usermask", 'x'),
+    ("-usermask", 'x'),
+    ("chkey", 'x'),
+];
+
+fn bot_flag_word(f: char) -> &'static str {
+    match f {
+        'a' => "full admin",
+        'b' => "bots",
+        'c' => "channels",
+        'h' => "hub",
+        'o' => "opers",
+        'u' => "upgrades",
+        _ => "?",
+    }
+}
+
+/// An active user record by name.
+fn user_by_name(state: &BotState, name: Option<&str>) -> Option<usize> {
+    let name = name?;
+    state
+        .user_records
+        .iter()
+        .position(|u| u.is_active && eq_ic(&u.name, name))
+}
+
+/// The flag this command line needs from admin `who`, '\0' for none (a
+/// view, your own key, or a target that does not exist).  C `bot_cmd_flag`.
+fn bot_cmd_flag(state: &BotState, who: usize, command: &str, arg1: Option<&str>) -> char {
+    let f = BOT_CMD_FLAGS
+        .iter()
+        .rev()
+        .find(|(n, _)| eq_ic(command, n))
+        .map_or('\0', |(_, f)| *f);
+    if f != 'x' {
+        return f;
+    }
+    if eq_ic(command, "chkey") {
+        if arg1.is_some_and(|a| a.starts_with('#')) {
+            return 'c'; // chkey #chan <key>
+        }
+        if arg1.is_some_and(|a| eq_ic(a, &state.user_records[who].name)) {
+            return '\0'; // your own key
+        }
+    }
+    match user_by_name(state, arg1) {
+        None => '\0',
+        Some(i) if state.user_records[i].typ == 'a' => 'a',
+        Some(_) => 'o',
+    }
+}
+
+/// Whether admin `who` holds the flag (or +a).
+fn bot_has_flag(state: &BotState, who: usize, f: char) -> bool {
+    f == '\0' || access::user_has_flag(state, &state.user_records[who].uuid, f)
+}
+
+/// Plan R2: whether `uuid` is the last live admin holding +a.
+fn last_full_admin(state: &BotState, uuid: &str) -> bool {
+    access::user_flags(state, uuid).contains('a')
+        && !state.user_records.iter().any(|u| {
+            u.is_active
+                && u.typ == 'a'
+                && u.uuid != uuid
+                && access::user_flags(state, &u.uuid).contains('a')
+        })
+}
+
+/// help (admin): the commands this admin may run here, by row; opt 'h'
+/// hides the ones that must go through the hub console.  C
+/// `help_admin_list`.
+fn help_admin_list(state: &mut BotState, nick: &str, who: usize) {
+    const ROWS: &[&[&str]] = &[
+        &[
+            "die", "jump", "op", "invite", "unban", "key", "join", "part", "status", "givenick",
+            "chnick",
+        ],
+        &[
+            "+server", "-server", "servers", "bots", "admins", "opers", "match", "dcc",
+        ],
+        &[
+            "+admin",
+            "-admin",
+            "chattr",
+            "+oper",
+            "-oper",
+            "chanoper",
+            "+usermask",
+            "-usermask",
+            "chkey",
+        ],
+        &["+bot", "-bot", "+hub", "-hub", "rekey"],
+        &["chanmode", "chanset", "+ban", "-ban", "bans"],
+        &["saveconf", "setlog", "getlog", "update", "help"],
+    ];
+    const HUB_ONLY: &[&str] = &[
+        "+admin",
+        "-admin",
+        "chattr",
+        "+oper",
+        "-oper",
+        "chanoper",
+        "+usermask",
+        "-usermask",
+        "+bot",
+        "-bot",
+        "join",
+        "part",
+        "chkey",
+        "chanmode",
+        "chanset",
+        "+ban",
+        "-ban",
+    ];
+    let hub_only = state.is_opt_set(OPT_HUB_ONLY_MUTATIONS);
+    for row in ROWS {
+        let mut line = String::new();
+        for &c in *row {
+            if hub_only && HUB_ONLY.contains(&c) {
+                continue;
+            }
+            let f = BOT_CMD_FLAGS
+                .iter()
+                .find(|(n, _)| *n == c)
+                .map_or('\0', |(_, f)| *f);
+            let ok = if f == 'x' {
+                c == "chkey" || bot_has_flag(state, who, 'a') || bot_has_flag(state, who, 'o')
+            } else {
+                bot_has_flag(state, who, f)
+            };
+            if !ok {
+                continue;
+            }
+            if !line.is_empty() {
+                line.push_str(", ");
+            }
+            line.push_str(c);
+        }
+        if !line.is_empty() {
+            let l = format!(" |   {line}");
+            say(state, nick, &l);
+        }
+    }
+    if hub_only {
+        say(
+            state,
+            nick,
+            " |   (hub-only-mutation mode: users, masks, keys, channels via the hub console)",
+        );
+    }
+    let fl = access::user_flags(state, &state.user_records[who].uuid).to_string();
+    let l = format!(
+        " |   your flags: {}{}",
+        if fl.is_empty() { "" } else { "+" },
+        if fl.is_empty() {
+            "none (views only)"
+        } else {
+            &fl
+        }
+    );
+    say(state, nick, &l);
+}
+
+/// op / invite / unban / key for an admin (+c, checked by the gate) or an
+/// oper on a channel it is bound to (user_flags plan U7/U8, §4.2).  This bot
+/// acts when it can; otherwise the hub's channel-request election is asked,
+/// and with no hub every trusted bot over ~B2.  key never needs anyone.  C
+/// `user_chan_command`.
+fn user_chan_command(
+    state: &mut BotState,
+    nick: &str,
+    user_host: &str,
+    who: usize,
+    kind: &str,
+    arg1: Option<&str>,
+) {
+    let Some(arg1) = arg1.filter(|a| !a.is_empty()) else {
+        let l = format!("Syntax: {kind} <#channel>");
+        say(state, nick, &l);
+        return;
+    };
+    let chan = format!(
+        "{}{}",
+        if arg1.starts_with('#') || arg1.starts_with('&') {
+            ""
+        } else {
+            "#"
+        },
+        arg1
+    );
+    if chan.len() >= MAX_CHAN || !access::chan_name_ok(&chan) || chan == "*" {
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: '{}' is not a channel.\r\n",
+            nick,
+            arg1
+        );
+        return;
+    }
+    let (typ, uuid, name) = {
+        let u = &state.user_records[who];
+        (u.typ, u.uuid.clone(), u.name.clone())
+    };
+    if typ == 'o' && !access::user_chan_ok(state, &uuid, Some(&chan)) {
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: you have no access to {}.\r\n",
+            nick,
+            chan
+        );
+        logm!(
+            state,
+            L_CMD,
+            "[CMD] {} refused '{} {}': not bound to it\n",
+            name,
+            kind,
+            chan
+        );
+        return;
+    }
+    let Some(ci) = channel::find(state, &chan).filter(|&ci| state.chans[ci].is_managed) else {
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: {} is not a managed channel.\r\n",
+            nick,
+            chan
+        );
+        return;
+    };
+    if kind == "key" {
+        let key = state.chans[ci].key.clone();
+        if key.is_empty() {
+            ircf!(
+                state,
+                "PRIVMSG {} :No key is stored for {}.\r\n",
+                nick,
+                chan
+            );
+        } else {
+            ircf!(state, "PRIVMSG {} :Key for {}: {}\r\n", nick, chan, key);
+        }
+        return;
+    }
+    let can = state.chans[ci].status == ChanStatus::In && state.chans[ci].i_am_opped;
+    if can {
+        match kind {
+            "op" => {
+                ircf!(state, "MODE {} +o {}\r\n", chan, nick);
+            }
+            "invite" => {
+                ircf!(state, "INVITE {} {}\r\n", nick, chan);
+                ircf!(state, "PRIVMSG {} :Inviting you to {}\r\n", nick, chan);
+            }
+            _ => {
+                channel::access_service(
+                    state,
+                    "",
+                    crate::state::ChanReq::Unban,
+                    &chan,
+                    None,
+                    Some(user_host),
+                    None,
+                );
+                ircf!(
+                    state,
+                    "PRIVMSG {} :Lifting the bans on {} that match you.\r\n",
+                    nick,
+                    chan
+                );
+            }
+        }
+        return;
+    }
+    // Escalate: the hub (one elected bot does it), else the trusted bots
+    if hub_client::send_user_chan_request(state, kind, &chan, &uuid, nick, user_host) {
+        ircf!(
+            state,
+            "PRIVMSG {} :I am not opped in {}; asked the network.\r\n",
+            nick,
+            chan
+        );
+        return;
+    }
+    bot_comms::user_chan_fallback(state, kind, &chan, nick, user_host);
+    ircf!(
+        state,
+        "PRIVMSG {} :I am not opped in {}; asked the other bots.\r\n",
+        nick,
+        chan
+    );
+}
+
+/// help op / invite / unban / key (admins and opers alike).  C
+/// `help_user_chan`.
+fn help_user_chan(state: &mut BotState, nick: &str, cmd: &str) {
+    let l = if eq_ic(cmd, "op") {
+        "Syntax: op <#channel> - Get operator status on a channel (asks the network if this bot is not opped there)."
+    } else if eq_ic(cmd, "invite") {
+        "Syntax: invite <#channel> - Invite yourself to a channel (asks the network if this bot is not opped there)."
+    } else if eq_ic(cmd, "unban") {
+        "Syntax: unban <#channel> - Lift the bans on a channel that match you (asks the network if this bot is not opped there)."
+    } else {
+        "Syntax: key <#channel> - The channel's key, sent to you (sealed when you sign in with ~A2S)."
+    };
+    say(state, nick, l);
+    say(
+        state,
+        nick,
+        "  Admins: needs +c.  Opers: the channels you are bound to (help shows them).",
+    );
+}
 
 fn chan_arg(arg: &str, amp_ok: bool) -> String {
     if arg.starts_with('#') || (amp_ok && arg.starts_with('&')) {
@@ -1047,6 +1402,28 @@ fn admin_command(
             "PRIVMSG {} :Error: '{}' is disabled — network is in hub-only-mutation mode (opt 'h'). Use the hub console.\r\n",
             nick,
             c
+        );
+        return;
+    }
+    // admin flags (plan R4): every command this bot runs is checked here
+    let need = bot_cmd_flag(state, who, command, a.a1);
+    if !bot_has_flag(state, who, need) {
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: '{}' needs +{} ({}).\r\n",
+            nick,
+            command,
+            need,
+            bot_flag_word(need)
+        );
+        let name = state.user_records[who].name.clone();
+        logm!(
+            state,
+            L_CMD,
+            "[CMD] {} refused '{}': needs +{}\n",
+            name,
+            command,
+            need
         );
         return;
     }
@@ -1077,6 +1454,8 @@ fn admin_command(
                 c.is_managed = false;
                 c.timestamp = lww_next_ts(c.timestamp);
                 let ts = c.timestamp;
+                // its oper bindings go too, at the same stamp (user_flags U6)
+                crate::access::chan_cascade(state, &name, ts);
                 logm!(
                     state,
                     L_DEBUG,
@@ -1088,13 +1467,9 @@ fn admin_command(
                 config::write_with_state_pass(state);
             }
         }
-        "op" => match a.a1 {
-            Some(ch) => {
-                ircf!(state, "MODE {} +o {}\r\n", ch, nick);
-            }
-            None => say(state, nick, "Syntax: op <#channel>"),
-        },
-        "invite" => cmd_invite(state, nick, a),
+        "op" | "invite" | "unban" | "key" => {
+            user_chan_command(state, nick, user_host, who, cmd.as_str(), a.a1)
+        }
         "+bot" => cmd_add_bot(state, nick, a),
         "-bot" => cmd_del_bot(state, nick, a),
         "status" => cmd_status(state, nick),
@@ -1177,6 +1552,8 @@ fn admin_command(
             None => say(state, nick, "Syntax: match <name|*>"),
         },
         "+admin" | "+oper" => cmd_add_user(state, nick, cmd == "+admin", a),
+        "chattr" => cmd_chattr(state, nick, a),
+        "chanoper" => cmd_chanoper(state, nick, a),
         "-admin" | "-oper" => cmd_del_user(state, nick, if cmd == "-admin" { 'a' } else { 'o' }, a),
         "+usermask" => cmd_add_usermask(state, nick, a),
         "-usermask" => cmd_del_usermask(state, nick, a),
@@ -1302,7 +1679,7 @@ In-place 'update' is only available on standalone (hub-less) bots.",
                 fp
             );
         }
-        "help" => admin_help(state, nick, a.a1),
+        "help" => admin_help(state, nick, who, a.a1),
         _ => {}
     }
 }
@@ -1396,34 +1773,6 @@ fn cmd_join(state: &mut BotState, nick: &str, a: Args<'_>) {
         nick,
         arg1
     );
-}
-
-fn cmd_invite(state: &mut BotState, nick: &str, a: Args<'_>) {
-    let Some(arg1) = a.a1 else {
-        say(state, nick, "Syntax: invite <#channel>");
-        return;
-    };
-    let ch = chan_arg(arg1, true);
-    if let Some(ci) = channel::find(state, &ch) {
-        // i_am_opped, not our roster entry (not re-read while opped).
-        if state.chans[ci].status == ChanStatus::In && state.chans[ci].i_am_opped {
-            ircf!(state, "INVITE {} {}\r\n", nick, ch);
-            ircf!(state, "PRIVMSG {} :Inviting you to {}\r\n", nick, ch);
-            return;
-        }
-    }
-    // Escalate: hub, else a sealed ~B2 to each trusted bot.
-    if !hub_client::send_invite_request(state, nick, &ch) {
-        let nicks: Vec<String> = state
-            .trusted_bots
-            .iter()
-            .map(|t| t.nick().to_string())
-            .filter(|n| !n.is_empty())
-            .collect();
-        for tb in nicks {
-            bot_comms::send_command(state, &tb, &format!("INVITE {ch} {nick}"));
-        }
-    }
 }
 
 fn cmd_add_bot(state: &mut BotState, nick: &str, a: Args<'_>) {
@@ -2248,9 +2597,26 @@ fn cmd_list_users(state: &mut BotState, nick: &str, typ: char) {
         .iter()
         .filter(|u| u.typ == typ)
         .map(|u| {
+            // user_flags plan U9: an admin's flags, an oper's channels
+            let acc = if typ == 'a' {
+                let fl = access::user_flags(state, &u.uuid);
+                if fl.is_empty() {
+                    "(no flags)".to_string()
+                } else {
+                    format!("+{fl}")
+                }
+            } else {
+                let cl = access::user_chans(state, &u.uuid, 256);
+                if cl.is_empty() {
+                    "(no channels)".to_string()
+                } else {
+                    cl
+                }
+            };
             format!(
-                "| {}  key {}  (last seen: {}){}",
+                "| {}  {}  key {}  (last seen: {}){}",
                 pad_right(&u.name, name_w),
+                acc,
                 user_key_fp(u),
                 last_seen_str(u.last_seen),
                 if u.is_active { "" } else { " [deleted]" }
@@ -2377,16 +2743,76 @@ fn cmd_match(state: &mut BotState, nick: &str, arg1: &str) {
 /// keypair and hands over only the public half.
 fn cmd_add_user(state: &mut BotState, nick: &str, add_admin: bool, a: Args<'_>) {
     let what = if add_admin { "+admin" } else { "+oper" };
-    let (Some(name), Some(key), Some(mask)) = (a.a1, a.a2, a.a3) else {
+    // the 4th word (user_flags plan U4/U5): an admin's flags, an oper's
+    // channels -- required, no default
+    let acc = a
+        .line
+        .unwrap_or("")
+        .split(' ')
+        .filter(|w| !w.is_empty())
+        .nth(3)
+        .map(|w| trunc_string(w, 512))
+        .unwrap_or_default();
+    let (Some(name), Some(key), Some(mask), false) = (a.a1, a.a2, a.a3, acc.is_empty()) else {
         ircf!(
             state,
-            "PRIVMSG {} :Syntax: {} <name> <pubkey> <nick!user@host> - <pubkey> is the user's 88-char public key. Ask them for it; 'help {}' shows how they make one.\r\n",
+            "PRIVMSG {} :Syntax: {} <name> <pubkey> <nick!user@host> {} - <pubkey> is the user's 88-char public key. Ask them for it; 'help {}' shows how they make one.\r\n",
             nick,
             what,
+            if add_admin {
+                "<+a|flags>"
+            } else {
+                "<*|#chan,#chan>"
+            },
             what
         );
+        let l = format!(
+            "  {}",
+            if add_admin {
+                "flags: +a = full admin, or letters of what they may change: b bots, c channels, h hub, o opers, u upgrades (e.g. +chu)"
+            } else {
+                "channels: * = every channel, or #a,#b (they may op, invite, unban, key there)"
+            }
+        );
+        say(state, nick, &l);
         return;
     };
+    let mut flags = String::new();
+    let mut chans: Vec<String> = Vec::new();
+    if add_admin {
+        match access::flags_edit("", &acc) {
+            Some(f) if !f.is_empty() => flags = f,
+            _ => {
+                say(
+                    state,
+                    nick,
+                    "Error: flags are +a (full admin) or letters from bchou (e.g. +chu).",
+                );
+                return;
+            }
+        }
+    } else {
+        let mut bad = false;
+        for t in acc.split(',').filter(|t| !t.is_empty()) {
+            if chans.iter().any(|c| eq_ic(c, t)) {
+                continue;
+            }
+            if !access::chan_name_ok(t) || chans.len() >= 16 {
+                bad = true;
+                break;
+            }
+            chans.push(t.to_string());
+        }
+        let star = chans.iter().any(|c| c == "*");
+        if bad || chans.is_empty() || (star && chans.len() > 1) {
+            say(
+                state,
+                nick,
+                "Error: channels are * (every channel) or up to 16 of #a,#b.",
+            );
+            return;
+        }
+    }
     if name.len() > 63 {
         say(state, nick, "Error: name too long (max 63).");
         return;
@@ -2424,6 +2850,12 @@ fn cmd_add_user(state: &mut BotState, nick: &str, add_admin: bool, a: Args<'_>) 
         say(state, nick, "Error: mask table full.");
         return;
     }
+    if (add_admin && state.uflag_records.len() >= MAX_USER_FLAGS)
+        || (!add_admin && state.uchan_records.len() + chans.len() + 1 > MAX_CHAN_BINDS)
+    {
+        say(state, nick, "Error: flag / channel table full.");
+        return;
+    }
     let Some(uuid) = crypto::gen_uuid_v4() else {
         say(state, nick, "Error: RNG failure.");
         return;
@@ -2442,23 +2874,198 @@ fn cmd_add_user(state: &mut BotState, nick: &str, add_admin: bool, a: Args<'_>) 
     let fp = user_key_fp(&u);
     state.user_records.push(u);
     state.mask_records.push(MaskRecord {
-        uuid,
+        uuid: uuid.clone(),
         mask: mask.to_string(),
         is_active: true,
         last_used: 0,
         timestamp: now,
         act_pending: 0,
     });
+    // flags / bindings at the user's own stamp; a channel-bound oper also
+    // gets its "*" del (access::migrate must never make it global)
+    if add_admin {
+        access::uflag_put(state, &uuid, &flags, now);
+    } else {
+        for c in &chans {
+            access::uchan_put(state, &uuid, c, true, now);
+        }
+        if chans[0] != "*" {
+            access::uchan_put(state, &uuid, "*", false, now);
+        }
+    }
     config::write_with_state_pass(state);
     hub_client::push_admin_delta(state);
+    let acc_shown = if add_admin {
+        format!("flags +{flags}")
+    } else {
+        access::user_chans(state, &uuid, 512)
+    };
     ircf!(
         state,
-        "PRIVMSG {} :{} '{}' added with mask {} (key {})\r\n",
+        "PRIVMSG {} :{} '{}' added with mask {} (key {}), {}{}\r\n",
         nick,
         if add_admin { "Admin" } else { "Oper" },
         name,
         mask,
-        fp
+        fp,
+        if add_admin { "" } else { "channels " },
+        acc_shown
+    );
+}
+
+/// chattr <name> <+x-y|letters>: an admin's flags (needs +a).  C `chattr`.
+fn cmd_chattr(state: &mut BotState, nick: &str, a: Args<'_>) {
+    let (Some(name), Some(spec)) = (a.a1, a.a2) else {
+        say(
+            state,
+            nick,
+            "Syntax: chattr <name> <+x-y|letters> - e.g. chattr dana +b-u, chattr dana +a",
+        );
+        return;
+    };
+    let Some(ti) = user_by_name(state, Some(name)).filter(|&i| state.user_records[i].typ == 'a')
+    else {
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: no admin called '{}' (an oper has channels: chanoper).\r\n",
+            nick,
+            name
+        );
+        return;
+    };
+    let (tuuid, tname) = (
+        state.user_records[ti].uuid.clone(),
+        state.user_records[ti].name.clone(),
+    );
+    let old = access::user_flags(state, &tuuid).to_string();
+    let Some(nw) = access::flags_edit(&old, spec).filter(|f| !f.is_empty()) else {
+        say(
+            state,
+            nick,
+            "Error: flags are +a (full admin) or letters from bchou; +x-y changes some.",
+        );
+        return;
+    };
+    if !nw.contains('a') && last_full_admin(state, &tuuid) {
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: '{}' is the last full admin (+a); make another admin +a first.\r\n",
+            nick,
+            tname
+        );
+        return;
+    }
+    if old == nw {
+        ircf!(
+            state,
+            "PRIVMSG {} :{} already has +{}.\r\n",
+            nick,
+            tname,
+            nw
+        );
+        return;
+    }
+    let ts = access::next_ts(state, &tuuid);
+    if !access::uflag_put(state, &tuuid, &nw, ts) {
+        say(state, nick, "Error: flag table full.");
+        return;
+    }
+    config::write_with_state_pass(state);
+    hub_client::push_admin_delta(state);
+    ircf!(
+        state,
+        "PRIVMSG {} :{}: +{} -> +{}\r\n",
+        nick,
+        tname,
+        old,
+        nw
+    );
+}
+
+/// chanoper add|del <#chan|*> <oper> (needs +o).  C `chanoper`.
+fn cmd_chanoper(state: &mut BotState, nick: &str, a: Args<'_>) {
+    let add = a.a1.is_some_and(|x| eq_ic(x, "add"));
+    let (Some(act), Some(chan), Some(oper)) = (a.a1, a.a2, a.a3) else {
+        say(
+            state,
+            nick,
+            "Syntax: chanoper add|del <#chan|*> <oper> - * = every channel; add * drops the channels, add #c drops *, del * removes all",
+        );
+        return;
+    };
+    if !add && !eq_ic(act, "del") {
+        say(
+            state,
+            nick,
+            "Syntax: chanoper add|del <#chan|*> <oper> - * = every channel; add * drops the channels, add #c drops *, del * removes all",
+        );
+        return;
+    }
+    let Some(ti) = user_by_name(state, Some(oper)).filter(|&i| state.user_records[i].typ == 'o')
+    else {
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: no oper called '{}' (an admin has flags: chattr).\r\n",
+            nick,
+            oper
+        );
+        return;
+    };
+    if !access::chan_name_ok(chan) {
+        say(
+            state,
+            nick,
+            "Error: a channel is #name, or * for every channel.",
+        );
+        return;
+    }
+    let (tuuid, tname) = (
+        state.user_records[ti].uuid.clone(),
+        state.user_records[ti].name.clone(),
+    );
+    let live =
+        access::uchan_find(state, &tuuid, chan).is_some_and(|i| state.uchan_records[i].is_active);
+    let any_live = access::user_chan_count(state, &tuuid).0 > 0;
+    let star = chan == "*";
+    if !add && (if star { !any_live } else { !live }) {
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: {} has no {}.\r\n",
+            nick,
+            tname,
+            if star { "channels" } else { chan }
+        );
+        return;
+    }
+    if add && live && (star || !access::user_chan_ok(state, &tuuid, None)) {
+        ircf!(
+            state,
+            "PRIVMSG {} :{} already has {}.\r\n",
+            nick,
+            tname,
+            chan
+        );
+        return;
+    }
+    if access::chan_change(state, &tuuid, add, chan).is_none() {
+        say(state, nick, "Error: channel binding table full.");
+        return;
+    }
+    config::write_with_state_pass(state);
+    hub_client::push_admin_delta(state);
+    let cl = access::user_chans(state, &tuuid, 512);
+    ircf!(
+        state,
+        "PRIVMSG {} :{}: channels now {}\r\n",
+        nick,
+        tname,
+        if cl.is_empty() {
+            "none (no channel access)"
+        } else if cl == "*" {
+            "* (every channel)"
+        } else {
+            &cl
+        }
     );
 }
 
@@ -2482,6 +3089,15 @@ fn cmd_del_user(state: &mut BotState, nick: &str, typ: char, a: Args<'_>) {
         );
         return;
     };
+    if typ == 'a' && last_full_admin(state, &state.user_records[ui].uuid) {
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: '{}' is the last full admin (+a); make another admin +a first.\r\n",
+            nick,
+            name
+        );
+        return;
+    }
     let u = &mut state.user_records[ui];
     u.is_active = false;
     u.timestamp = lww_next_ts(u.timestamp);
@@ -2856,6 +3472,7 @@ fn cmd_add_hub(state: &mut BotState, nick: &str, a: Args<'_>) {
         ed_pub_set: true,
     });
     config::write_with_state_pass(state);
+    hub_client::push_config(state); // its hl| list changed
     ircf!(
         state,
         "PRIVMSG {} :Added Hub: {} (pubkey pinned)\r\n",
@@ -2895,6 +3512,7 @@ fn cmd_del_hub(state: &mut BotState, nick: &str, a: Args<'_>) {
     }
     state.hubs.remove(i);
     config::write_with_state_pass(state);
+    hub_client::push_config(state); // its hl| list changed
     ircf!(state, "PRIVMSG {} :Removed Hub: {}\r\n", nick, addr);
     if is_current && !state.hubs.is_empty() {
         say(state, nick, "Reconnecting to another hub...");
@@ -2978,50 +3596,10 @@ fn help_footer(state: &mut BotState, nick: &str) {
     ircf!(state, "PRIVMSG {} : {}\r\n", nick, FOOT);
 }
 
-fn admin_help(state: &mut BotState, nick: &str, topic: Option<&str>) {
+fn admin_help(state: &mut BotState, nick: &str, who: usize, topic: Option<&str>) {
     let Some(t) = topic else {
         help_header(state, nick);
-        if state.is_opt_set(OPT_HUB_ONLY_MUTATIONS) {
-            say(
-                state,
-                nick,
-                " |   die, jump, op, invite, status, givenick, chnick",
-            );
-            say(
-                state,
-                nick,
-                " |   +server, -server, servers, bots, admins, opers, match, dcc",
-            );
-            say(
-                state,
-                nick,
-                " |   +hub, -hub, rekey, saveconf, setlog, getlog, update, help, bans",
-            );
-            say(
-                state,
-                nick,
-                " |   (hub-only-mutation mode: users, masks, keys, channels via the hub console)",
-            );
-        } else {
-            say(
-                state,
-                nick,
-                " |   die, jump, op, invite, join, part, status, givenick, chnick",
-            );
-            say(
-                state,
-                nick,
-                " |   +server, -server, servers, bots, admins, opers, match, dcc",
-            );
-            say(
-                state,
-                nick,
-                " |   +admin, -admin, +oper, -oper, +usermask, -usermask, chkey",
-            );
-            say(state, nick, " |   +bot, -bot, +hub, -hub, rekey");
-            say(state, nick, " |   chanmode, chanset, +ban, -ban, bans");
-            say(state, nick, " |   saveconf, setlog, getlog, update, help");
-        }
+        help_admin_list(state, nick, who);
         say(
             state,
             nick,
@@ -3036,7 +3614,10 @@ fn admin_help(state: &mut BotState, nick: &str, topic: Option<&str>) {
         "jump" => {
             "Syntax: jump [server] - Jump to the next IRC server, or to a specific server by hostname (port-independent match). Servers that banned or throttled the bot are skipped; naming one clears its hold and retries it now."
         }
-        "op" => "Syntax: op <#channel> - Get operator status on a channel.",
+        "op" | "unban" | "key" => {
+            help_user_chan(state, nick, &lower);
+            return;
+        }
         "status" => "Syntax: status - Show bot status.",
         "givenick" => {
             "Syntax: givenick - Temporarily changes the bot nick to an alternate. Will try to regain primary nick after 20 seconds until it accomplishes the task."
@@ -3067,17 +3648,28 @@ fn admin_help(state: &mut BotState, nick: &str, topic: Option<&str>) {
             say(
                 state,
                 nick,
-                "Syntax: +admin <name> <pubkey> <nick!user@host> - Add a named admin with a first usermask. Name must be unique across admins and opers.",
+                "Syntax: +admin <name> <pubkey> <nick!user@host> <+a|flags> - Add a named admin with a first usermask and their flags (needs +a). Name must be unique across admins and opers.",
+            );
+            say(
+                state,
+                nick,
+                "  flags: +a = full admin; else the letters of what they may change: b bots, c channels, h hub, o opers, u upgrades. e.g. +admin dana <key> dana!*@* +chu",
             );
             help_keypair(state, nick);
             return;
+        }
+        "chattr" => {
+            "Syntax: chattr <name> <+x-y|letters> - Change an admin's flags (needs +a): +b-u adds b and removes u, chu or +a replaces them all. The last +a admin keeps +a."
+        }
+        "chanoper" => {
+            "Syntax: chanoper add|del <#chan|*> <oper> - Give an oper a channel or take it away (needs +o). * = every channel; add * drops the channels, add #c drops *, del * removes all."
         }
         "-admin" => "Syntax: -admin <name> - Remove admin and all their masks.",
         "+oper" => {
             say(
                 state,
                 nick,
-                "Syntax: +oper <name> <pubkey> <nick!user@host> - Add a named oper with a first usermask. Opers may use op, chkey (own key) and help.",
+                "Syntax: +oper <name> <pubkey> <nick!user@host> <*|#chan,#chan> - Add a named oper with a first usermask and their channels (needs +o). Opers may use op, invite, unban, key on their channels, chkey (own key) and help.",
             );
             help_keypair(state, nick);
             return;
@@ -3129,7 +3721,8 @@ fn admin_help(state: &mut BotState, nick: &str, topic: Option<&str>) {
             "Syntax: bans [#channel|*] - List the network bans (all, or one channel's plus the '*' ones)."
         }
         "invite" => {
-            "Syntax: invite <#channel> - Invite yourself to a channel (asks the hub or a trusted bot if this bot is not opped there)."
+            help_user_chan(state, nick, "invite");
+            return;
         }
         "auth" => {
             help_auth(state, nick);
@@ -3145,7 +3738,7 @@ fn admin_help(state: &mut BotState, nick: &str, topic: Option<&str>) {
         }
         "match" => "Syntax: match <name|*> - Show all records for a user, or * for all users.",
         "+bot" => {
-            "Syntax: +bot <nick!user@host> <uuid> <pubkey> - Standalone bots only (hub-managed bots get peers from the hub): trust another bot for encrypted bot-to-bot commands. Copy the UUID and Pubkey from that bot's 'status' (or its -setup output). The mask should be the one the network shows for it."
+            "Syntax: +bot <nick!user@host> <uuid> <pubkey> - Standalone bots only (hub-managed bots get peers from the hub): trust another bot for encrypted bot-to-bot commands. Copy the UUID and Pubkey from that bot's 'status' (or run ./ircbot -id on its host). The mask should be the one the network shows for it."
         }
         "-bot" => {
             "Syntax: -bot <nick*!*user@hostmask.com> - Removes a bot from the known bot list as shown in the 'status' command."
@@ -3170,7 +3763,7 @@ fn admin_help(state: &mut BotState, nick: &str, topic: Option<&str>) {
         "join" => "Syntax: join <#channel> - Joins a channel.",
         "part" => "Syntax: part <#channel> - Parts a channel.",
         "+hub" => {
-            "Syntax: +hub <host:port> <pubkey-b64> - Add a hub and pin its Ed25519 pubkey (44 or 88 char base64 from the hub's hub_public.b64)."
+            "Syntax: +hub <host:port> <pubkey-b64> - Add a hub and pin its Ed25519 pubkey (44 or 88 char base64: the public key line of hub show in that hub's console, or of ./irchub -id on its host)."
         }
         "-hub" => "Syntax: -hub <host:port> - Remove a configured hub.",
         "rekey" => {
@@ -3189,11 +3782,19 @@ fn admin_help(state: &mut BotState, nick: &str, topic: Option<&str>) {
     say(state, nick, text);
 }
 
-fn oper_command(state: &mut BotState, nick: &str, who: usize, command: &str, a: Args<'_>) {
-    if eq_ic(command, "op") {
-        if let Some(ch) = a.a1.and_then(|x| Tok::new(x).next(" ")) {
-            ircf!(state, "MODE {} +o {}\r\n", ch, nick);
-        }
+fn oper_command(
+    state: &mut BotState,
+    nick: &str,
+    user_host: &str,
+    who: usize,
+    command: &str,
+    a: Args<'_>,
+) {
+    // an oper: op / invite / unban / key on the channels it is bound to
+    // (user_flags plan U7), chkey for its own key, help
+    let lower = command.to_ascii_lowercase();
+    if matches!(lower.as_str(), "op" | "invite" | "unban" | "key") {
+        user_chan_command(state, nick, user_host, who, &lower, a.a1);
     } else if eq_ic(command, "chkey") {
         // Own key only, and refused under opt 'h' like every local mutation
         // of a hub-authoritative record.
@@ -3228,14 +3829,26 @@ fn oper_command(state: &mut BotState, nick: &str, who: usize, command: &str, a: 
         match a.a1 {
             None => {
                 help_header(state, nick);
-                say(state, nick, " |   op, chkey, help");
+                say(state, nick, " |   op, invite, unban, key, chkey, help");
+                let cl = access::user_chans(state, &state.user_records[who].uuid, 256);
+                let l = format!(
+                    " |   your channels: {}",
+                    if cl.is_empty() {
+                        "none"
+                    } else if cl == "*" {
+                        "every channel"
+                    } else {
+                        &cl
+                    }
+                );
+                say(state, nick, &l);
                 help_footer(state, nick);
             }
-            Some(t) if eq_ic(t, "op") => say(
-                state,
-                nick,
-                "Syntax: op <#channel> - Get operator status on a channel.",
-            ),
+            Some(t)
+                if eq_ic(t, "op") || eq_ic(t, "invite") || eq_ic(t, "unban") || eq_ic(t, "key") =>
+            {
+                help_user_chan(state, nick, t)
+            }
             Some(t) if eq_ic(t, "chkey") => {
                 say(
                     state,

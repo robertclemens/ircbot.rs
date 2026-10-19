@@ -1,7 +1,7 @@
 //! Usermask matching and trusted-bot lookup (auth.c).
 
 use crate::consts::*;
-use crate::glob_overlap::glob_overlap;
+use crate::glob_overlap::hostmask_overlap;
 use crate::logm;
 use crate::state::BotState;
 
@@ -145,11 +145,26 @@ fn mask_has_active_user(state: &BotState, uuid: &str) -> Option<usize> {
         .position(|u| u.is_active && u.uuid == uuid)
 }
 
+/// A user whose standing counts in `chan` (user_flags plan §6, U12): every
+/// active admin everywhere (network staff, whatever their flags); an oper in
+/// the channels it is bound to, or everywhere with "*".  chan None =
+/// anywhere: an oper with any live binding.  C `user_counts_in`.
+fn user_counts_in(state: &BotState, uuid: &str, chan: Option<&str>) -> Option<usize> {
+    let ui = mask_has_active_user(state, uuid)?;
+    let u = &state.user_records[ui];
+    let ok = u.typ == 'a'
+        || match chan {
+            None => crate::access::user_chan_count(state, uuid).0 > 0,
+            Some(c) => crate::access::user_chan_ok(state, uuid, Some(c)),
+        };
+    ok.then_some(ui)
+}
+
 /// modes.md section 1: "authorised" = matches a trusted-bot mask, or an
-/// active usermask of an active admin/oper.  The user record need not hold a
-/// key: what matters is the operator's standing, not whether they can sign
-/// ~A2.
-pub fn is_authorised(state: &BotState, nuh: &str) -> bool {
+/// active usermask of an active admin/oper -- an oper only in its channels
+/// (plan §6).  The user record need not hold a key: what matters is the
+/// operator's standing, not whether they can sign ~A2.
+pub fn is_authorised(state: &BotState, nuh: &str, chan: Option<&str>) -> bool {
     if nuh.is_empty() {
         return false;
     }
@@ -160,32 +175,36 @@ pub fn is_authorised(state: &BotState, nuh: &str) -> bool {
         mr.is_active
             && !mr.mask.is_empty()
             && wildcard_match(&mr.mask, nuh)
-            && mask_has_active_user(state, &mr.uuid).is_some()
+            && user_counts_in(state, &mr.uuid, chan).is_some()
     })
 }
 
 /// Section 6.2 step 2: Some(label of the first conflict) when ban mask `mask`
 /// could also hit a bot or an operator who is not in the channel right now.
 /// Pattern-vs-pattern, so '*' on either side is taken at its widest.
-pub fn mask_overlaps_authorised(state: &BotState, mask: &str) -> Option<String> {
+pub fn mask_overlaps_authorised(
+    state: &BotState,
+    mask: &str,
+    chan: Option<&str>,
+) -> Option<String> {
     // matching drops a leading '~' of the ident (strip_ident_tilde), so the
     // overlap test does too, on both sides
     let nmask = strip_ident_tilde(mask);
     if let Some(tb) = state
         .trusted_bots
         .iter()
-        .find(|tb| glob_overlap(&nmask, &strip_ident_tilde(&tb.mask)))
+        .find(|tb| hostmask_overlap(&nmask, &strip_ident_tilde(&tb.mask)))
     {
         return Some(format!("bot {}", tb.mask));
     }
     for mr in &state.mask_records {
         if !mr.is_active
             || mr.mask.is_empty()
-            || !glob_overlap(&nmask, &strip_ident_tilde(&mr.mask))
+            || !hostmask_overlap(&nmask, &strip_ident_tilde(&mr.mask))
         {
             continue;
         }
-        if let Some(ui) = mask_has_active_user(state, &mr.uuid) {
+        if let Some(ui) = user_counts_in(state, &mr.uuid, chan) {
             return Some(format!("user {}", state.user_records[ui].name));
         }
     }

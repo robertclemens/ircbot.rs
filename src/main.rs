@@ -4,6 +4,7 @@
 
 #![forbid(unsafe_code)]
 
+mod access;
 mod auth;
 mod bot_comms;
 mod botflood;
@@ -141,18 +142,21 @@ fn passfile_create(path: &str, password: &str) -> bool {
         return false;
     }
     let ctx = passfile_context();
-    let key = crypto::derive_config_key(ctx.as_bytes(), &salt);
+    let key = crypto::derive_config_key(ctx.as_bytes(), &salt, PBKDF2_ITERATIONS);
     drop(ctx);
     let Some(enc) = crypto::gcm_seal(key.as_ref(), &[], password.as_bytes()) else {
         eprintln!("Encryption failed.");
         return false;
     };
+    // Written beside it and renamed over it, so a rewrite (-p, or the PBKDF2
+    // migration at start) never leaves a half-written pass file.
+    let tmp = format!("{path}.tmp");
     let mut f = match OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(path)
+        .open(&tmp)
     {
         Ok(f) => f,
         Err(e) => {
@@ -162,17 +166,76 @@ fn passfile_create(path: &str, password: &str) -> bool {
     };
     if let Err(e) = f.set_permissions(fs::Permissions::from_mode(0o600)) {
         eprintln!("fchmod: {e}");
+        let _ = fs::remove_file(&tmp);
         return false;
     }
     // On disk: salt || iv || ct || tag -- the C bot's layout.
-    let ok = f.write_all(&salt).is_ok() && f.write_all(&enc).is_ok();
+    let mut ok = f.write_all(&salt).is_ok() && f.write_all(&enc).is_ok();
     if !ok {
         eprintln!("write {PASS_FILE} failed");
+    }
+    drop(f);
+    if ok {
+        ok = match fs::rename(&tmp, path) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("rename {PASS_FILE}: {e}");
+                false
+            }
+        };
+    }
+    if !ok {
+        let _ = fs::remove_file(&tmp);
     }
     ok
 }
 
-fn passfile_load(path: &str) -> Option<Zeroizing<String>> {
+/// The deferred rewrite of a pre-2.5.0 pass file on an upgrade start (see
+/// UPGRADE_PASS_REWRITE_SECS).  The old file is hard-linked to PASS_PREV_FILE
+/// first; passfile_create() renames a new one over PASS_FILE, so the link
+/// keeps the old bytes and mode.  One attempt: on failure the file stays
+/// readable as it is and the next ordinary start rewrites it.
+fn passfile_upgrade_tick(state: &mut BotState) {
+    if state.pass_rewrite_due == 0 || now() < state.pass_rewrite_due {
+        return;
+    }
+    state.pass_rewrite_due = 0;
+    let pass = state.startup_pass();
+    let _ = fs::remove_file(PASS_PREV_FILE);
+    if pass.is_empty() || fs::hard_link(PASS_FILE, PASS_PREV_FILE).is_err() {
+        logm!(
+            state,
+            L_INFO,
+            "[CFG] {} kept at PBKDF2 {}k: could not keep a copy for rollback\n",
+            PASS_FILE,
+            PBKDF2_ITERATIONS_LEGACY / 1000
+        );
+    } else if passfile_create(PASS_FILE, &pass) {
+        state.pass_prev_saved = true;
+        logm!(
+            state,
+            L_INFO,
+            "[CFG] {} rewritten with PBKDF2 {}k (old copy in {} until the next ordinary start)\n",
+            PASS_FILE,
+            PBKDF2_ITERATIONS / 1000,
+            PASS_PREV_FILE
+        );
+    } else {
+        let _ = fs::remove_file(PASS_PREV_FILE);
+        logm!(
+            state,
+            L_INFO,
+            "[CFG] {} kept at PBKDF2 {}k: rewrite failed\n",
+            PASS_FILE,
+            PBKDF2_ITERATIONS_LEGACY / 1000
+        );
+    }
+}
+
+/// The password, and whether the file only opened under
+/// PBKDF2_ITERATIONS_LEGACY (written before 2.5.0); main() then rewrites it
+/// under the current count.
+fn passfile_load(path: &str) -> Option<(Zeroizing<String>, bool)> {
     let md = fs::metadata(path).ok()?;
     if md.uid() != nix::unistd::getuid().as_raw() {
         eprintln!("[WARN] {path}: wrong owner, ignoring.");
@@ -188,11 +251,19 @@ fn passfile_load(path: &str) -> Option<Zeroizing<String>> {
     let mut buf = Zeroizing::new(Vec::new());
     fs::File::open(path).ok()?.read_to_end(&mut buf).ok()?;
     let ctx = passfile_context();
-    let key = crypto::derive_config_key(ctx.as_bytes(), &buf[..SALT_SIZE]);
-    match crypto::gcm_open(key.as_ref(), &[], &buf[SALT_SIZE..]) {
-        Some(p) if !p.is_empty() && p.len() < MAX_PASS => {
-            Some(Zeroizing::new(String::from_utf8_lossy(&p).into_owned()))
-        }
+    let open = |iterations| {
+        let key = crypto::derive_config_key(ctx.as_bytes(), &buf[..SALT_SIZE], iterations);
+        crypto::gcm_open(key.as_ref(), &[], &buf[SALT_SIZE..])
+    };
+    let opened = match open(PBKDF2_ITERATIONS) {
+        Some(p) => Some((p, false)),
+        None => open(PBKDF2_ITERATIONS_LEGACY).map(|p| (p, true)),
+    };
+    match opened {
+        Some((p, legacy)) if !p.is_empty() && p.len() < MAX_PASS => Some((
+            Zeroizing::new(String::from_utf8_lossy(&p).into_owned()),
+            legacy,
+        )),
         _ => {
             eprintln!("[WARN] {path}: decryption failed (wrong machine or tampered file).");
             None
@@ -353,9 +424,10 @@ fn run_config_wizard() -> io::Result<()> {
         let mut admin: Option<(String, String, Vec<String>)> = None;
         if hub_managed {
             println!("\n--- Hub Configuration ---");
-            println!("You'll need each hub's address and public key (the base64 from");
-            println!("the hub's hub_public.b64 file). Each hub has its own keypair, so");
-            println!("the key is pinned per hub.");
+            println!("You'll need each hub's address and public key: './irchub -id' on");
+            println!("the hub's host prints both (as the '+hub' line), so does 'hub show'");
+            println!("in its console. Each hub has its own keypair, so the key is pinned");
+            println!("per hub.");
             while state.hubs.len() < MAX_SERVERS {
                 println!("\n--- Hub #{} Address ---", state.hubs.len() + 1);
                 let addr = loop {
@@ -373,7 +445,7 @@ fn run_config_wizard() -> io::Result<()> {
                 } else {
                     println!("\n--- Hub #{} Public Key ---", state.hubs.len() + 1);
                     println!(
-                        "Paste the base64 from the hub's hub_public.b64 file (44 or 88 chars)."
+                        "Paste the hub's public key from './irchub -id' or 'hub show' (44 or 88 chars)."
                     );
                     let ed_pub = loop {
                         let k = get_input("Hub public key", 256);
@@ -685,6 +757,7 @@ fn main() {
     };
     let do_setup = args.iter().skip(1).any(|a| a == "-setup");
     let do_passfile = args.iter().skip(1).any(|a| a == "-p");
+    let do_identity = args.iter().skip(1).any(|a| a == "-id");
 
     if do_setup {
         if fs::metadata(CONFIG_FILE).is_ok() {
@@ -725,7 +798,7 @@ fn main() {
     }
 
     // Password: the machine-bound pass file, else a prompt on stdin.
-    let password = match passfile_load(PASS_FILE) {
+    let (password, pass_legacy) = match passfile_load(PASS_FILE) {
         Some(p) => p,
         None => {
             let p = get_password("Config Password", MAX_PASS);
@@ -733,9 +806,42 @@ fn main() {
                 eprintln!("No password provided.");
                 std::process::exit(1);
             }
-            p
+            (p, false)
         }
     };
+
+    if do_identity {
+        std::process::exit(identity(password));
+    }
+
+    // A pre-2.5.0 pass file moves to the current PBKDF2 count on an ordinary
+    // start.  On the start a hub-driven upgrade made (its marker is still
+    // here) it waits UPGRADE_PASS_REWRITE_SECS, until the old build's watchdog
+    // is done with this process, and keeps the old copy for a rollback (see
+    // passfile_upgrade_tick).  An ordinary start drops any such copy left by an
+    // earlier run: a hub rollback is only ever for the process that made it.
+    let upgrade_start = fs::metadata(UPGRADE_MARKER_FILE).is_ok();
+    if !upgrade_start {
+        let _ = fs::remove_file(PASS_PREV_FILE);
+    }
+    if pass_legacy {
+        if upgrade_start {
+            println!(
+                "{PASS_FILE}: rewritten with PBKDF2 {}k in {UPGRADE_PASS_REWRITE_SECS}s (upgrade in progress)",
+                PBKDF2_ITERATIONS / 1000
+            );
+        } else if passfile_create(PASS_FILE, &password) {
+            println!(
+                "{PASS_FILE}: rewritten with PBKDF2 {}k",
+                PBKDF2_ITERATIONS / 1000
+            );
+        } else {
+            eprintln!(
+                "{PASS_FILE}: could not rewrite with PBKDF2 {}k; still readable as it is",
+                PBKDF2_ITERATIONS / 1000
+            );
+        }
+    }
 
     println!("{BOT_NAME} {BOT_VERSION}");
     daemonize();
@@ -743,7 +849,7 @@ fn main() {
     let Some(pid_file) = lock_pid_file() else {
         std::process::exit(1)
     };
-    let code = run(password, pid_file, self_exe);
+    let code = run(password, pid_file, self_exe, pass_legacy && upgrade_start);
     std::process::exit(code);
 }
 
@@ -766,7 +872,7 @@ fn selftest() -> i32 {
     if fs::metadata(CONFIG_FILE).is_err() {
         return fail(&format!("no {CONFIG_FILE}"));
     }
-    let Some(password) = passfile_load(PASS_FILE) else {
+    let Some((password, _)) = passfile_load(PASS_FILE) else {
         return fail(&format!("{PASS_FILE} missing or unreadable"));
     };
     let registry = match Poll::new().and_then(|p| p.registry().try_clone()) {
@@ -785,8 +891,50 @@ fn selftest() -> i32 {
     0
 }
 
+/// `ircbot -id`: print this bot's uuid, public key and fingerprint — what the
+/// hub console's `bot add` (or a standalone peer's +bot) needs — from the
+/// config, and exit.  Read-only: no daemon, no PID lock, no config rewrite.
+fn identity(password: Zeroizing<String>) -> i32 {
+    let registry = match Poll::new().and_then(|p| p.registry().try_clone()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("poll: {e}");
+            return 1;
+        }
+    };
+    let mut state = BotState::new(registry);
+    config::READ_ONLY.store(true, Ordering::Relaxed);
+    if !config::load(&mut state, &password, CONFIG_FILE) {
+        eprintln!("Cannot load {CONFIG_FILE} (wrong password?).");
+        return 1;
+    }
+    drop(password);
+    if !state.self_pub_set || state.bot_uuid.is_empty() {
+        eprintln!("{CONFIG_FILE} has no identity key or uuid; re-run -setup.");
+        return 1;
+    }
+    let pub_b64 = crypto::b64_encode(&state.self_pub);
+    println!("Bot nick:        {}", state.target_nick);
+    println!("Bot UUID:        {}", state.bot_uuid);
+    println!("Bot public key:  {pub_b64}");
+    println!(
+        "Key fingerprint: {}",
+        crypto::key_fingerprint(&state.self_pub)
+    );
+    println!(
+        "Hub console:     bot add {} {} {pub_b64}",
+        state.target_nick, state.bot_uuid
+    );
+    0
+}
+
 /// Load the config and run the poll loop until `die` or a signal.
-fn run(password: Zeroizing<String>, pid_file: fs::File, self_exe: String) -> i32 {
+fn run(
+    password: Zeroizing<String>,
+    pid_file: fs::File,
+    self_exe: String,
+    pass_deferred: bool,
+) -> i32 {
     let mut poll = match Poll::new() {
         Ok(p) => p,
         Err(e) => {
@@ -821,6 +969,9 @@ fn run(password: Zeroizing<String>, pid_file: fs::File, self_exe: String) -> i32
     }
     state.set_startup_pass(&password);
     drop(password);
+    if pass_deferred {
+        state.pass_rewrite_due = now() + UPGRADE_PASS_REWRITE_SECS;
+    }
 
     let mut events = Events::with_capacity(64);
     while state.status & S_DIE == 0 && !shutdown.load(Ordering::Relaxed) {
@@ -828,6 +979,7 @@ fn run(password: Zeroizing<String>, pid_file: fs::File, self_exe: String) -> i32
         channel::check_joins(&mut state);
         commands::activity_tick(&mut state, now());
         chanenf::tick(&mut state);
+        passfile_upgrade_tick(&mut state);
 
         // Debounced flush of last_seen / last_used (set on every successful
         // admin auth): at most once per CONFIG_WRITE_DEBOUNCE_S, local only.
@@ -844,6 +996,7 @@ fn run(password: Zeroizing<String>, pid_file: fs::File, self_exe: String) -> i32
         if !state.hubs.is_empty() {
             hub_client::connect(&mut state);
             hub_client::heartbeat(&mut state);
+            hub_client::user_chan_tick(&mut state); // unanswered person requests -> ~B2
             hub_client::upgrade_ready_tick(&mut state);
         }
 

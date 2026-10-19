@@ -433,7 +433,10 @@ pub fn request(state: &mut BotState, ci: usize) {
 /// whether it is authorised.
 pub fn member_authorised(state: &BotState, ci: usize, nick: &str) -> (bool, bool) {
     match state.chans[ci].roster.iter().find(|r| eq_ic(&r.nick, nick)) {
-        Some(r) => (true, auth::is_authorised(state, &r.hostmask)),
+        Some(r) => (
+            true,
+            auth::is_authorised(state, &r.hostmask, Some(&state.chans[ci].name)),
+        ),
         None => (false, false),
     }
 }

@@ -23,7 +23,7 @@ use crate::state::{
     BotState, BotTreeRow, ChanReq, ChanStatus, HubAuthState, MaskRecord, S_AUTHED, S_CONNECTED,
     UserRecord, lww_accepts, opt_accepts,
 };
-use crate::{bot_comms, chancfg, chanlive, channel, config, ircf, logm, updater};
+use crate::{access, bot_comms, chancfg, chanlive, channel, config, ircf, logm, updater};
 
 /// Unsent bytes past which a hub that stopped reading is dropped.
 const HUB_WBUF_MAX: usize = 4 * 1024 * 1024;
@@ -100,7 +100,16 @@ fn send_raw(state: &mut BotState, data: &[u8]) -> bool {
 
 /// Encrypt one [cmd][len][payload] frame under the session key and send it.
 fn send_frame(state: &mut BotState, cmd: u8, payload: &[u8]) -> bool {
-    if !state.hub_authenticated || state.hub.is_none() {
+    if !state.hub_authenticated {
+        return false;
+    }
+    seal_frame(state, cmd, payload)
+}
+
+/// send_frame() authenticated or not (CMD_BOT_RETIRE_ACK answers
+/// mid-handshake).
+fn seal_frame(state: &mut BotState, cmd: u8, payload: &[u8]) -> bool {
+    if state.hub.is_none() {
         return false;
     }
     if payload.len() > MAX_BUFFER - 64 {
@@ -120,7 +129,8 @@ fn send_frame(state: &mut BotState, cmd: u8, payload: &[u8]) -> bool {
     send_raw(state, &frame)
 }
 
-/// Send every pending activity report (auth::mark_used) to the hub, chunked
+/// Send every pending activity report (auth::mark_used,
+/// chancfg::ban_mark_used) to the hub, chunked
 /// under MAX_BUFFER.  A record is cleared only once its frame went out; with
 /// no hub link they wait for the next authentication.
 pub fn send_activity(state: &mut BotState) {
@@ -129,16 +139,20 @@ pub fn send_activity(state: &mut BotState) {
     }
     let cap = MAX_BUFFER - 64;
     let nu = state.user_records.len();
-    let total = nu + state.mask_records.len();
+    let nm = state.mask_records.len();
+    let total = nu + nm + state.cfg_bans.len();
     let mut buf = String::new();
     let mut first = 0; // first record index in the current chunk
     for i in 0..=total {
         let line = if i < nu {
             let u = &state.user_records[i];
             (u.act_pending > 0).then(|| format!("a|{}|{}\n", u.uuid, u.act_pending))
-        } else if i < total {
+        } else if i < nu + nm {
             let m = &state.mask_records[i - nu];
             (m.act_pending > 0).then(|| format!("m|{}|{}|{}\n", m.uuid, m.mask, m.act_pending))
+        } else if i < total {
+            let b = &state.cfg_bans[i - nu - nm];
+            (b.act_pending > 0).then(|| format!("B|{}|{}|{}\n", b.chan, b.mask, b.act_pending))
         } else {
             None
         };
@@ -151,8 +165,10 @@ pub fn send_activity(state: &mut BotState) {
             for j in first..i {
                 if j < nu {
                     state.user_records[j].act_pending = 0;
-                } else {
+                } else if j < nu + nm {
                     state.mask_records[j - nu].act_pending = 0;
+                } else {
+                    state.cfg_bans[j - nu - nm].act_pending = 0;
                 }
             }
             buf.clear();
@@ -763,8 +779,43 @@ fn chan_line(c: &crate::state::Chan) -> String {
     )
 }
 
+/// hub_client_hublist_line(): hl|<addr>/<fp>,..., the hubs this bot dials,
+/// so the hub console's hub del can say which bots still list a hub.  <fp> is
+/// the first 8 bytes of SHA-256 over the hub's pinned Ed25519 key, in hex:
+/// never the key.  An address the hub would refuse (over HL_ADDR_MAX, or a
+/// byte outside a host:port) goes out empty.  The hub stamps the record
+/// itself.
+fn hublist_line(state: &BotState) -> String {
+    use sha2::{Digest, Sha256};
+    let mut out = String::from("hl|");
+    let mut n = 0;
+    for he in state.hubs.iter().take(MAX_SERVERS) {
+        if !he.ed_pub_set {
+            continue;
+        }
+        let md = Sha256::digest(he.ed_pub);
+        let addr_ok = !he.addr.is_empty()
+            && he.addr.len() <= HL_ADDR_MAX
+            && he
+                .addr
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b".:-_[]".contains(&c));
+        if n > 0 {
+            out.push(',');
+        }
+        out.push_str(if addr_ok { &he.addr } else { "" });
+        out.push('/');
+        for b in &md[..HL_FP_LEN / 2] {
+            out.push_str(&format!("{b:02x}"));
+        }
+        n += 1;
+    }
+    out.push('\n');
+    out
+}
+
 /// The bot's own config for the hub: c| (unless opt 'h'), pending bot-written
-/// B|, v|, h|, n|.  a|/o|/m| are hub-authoritative and go via
+/// B|, v|, h|, n|, hl| (the hubs this bot dials).  a|/o|/m| are hub-authoritative and go via
 /// push_admin_delta; s|, u|, g|, l|, i|, k| are local-only.  Under opt 'h'
 /// c| is omitted as well, except a channel with `enf_pending` (a key / mode
 /// this bot learned and has not yet got to a hub: enforcement is never gated,
@@ -830,6 +881,7 @@ pub fn generate_config_payload(state: &BotState) -> String {
             state.current_nick, state.current_nick_ts
         ));
     }
+    add(hublist_line(state));
     out
 }
 
@@ -844,9 +896,19 @@ pub fn grant_held_ops(state: &mut BotState, ci: usize) {
             continue;
         }
         let c = &state.chans[ci];
-        if c.roster.iter().find(|r| eq_ic(&r.nick, &nick)).is_some_and(|r| !r.is_op) {
+        if c.roster
+            .iter()
+            .find(|r| eq_ic(&r.nick, &nick))
+            .is_some_and(|r| !r.is_op)
+        {
             let name = c.name.clone();
-            logm!(state, L_INFO, "[HUB] Granting ops to {} in {} (held hub request)\n", nick, name);
+            logm!(
+                state,
+                L_INFO,
+                "[HUB] Granting ops to {} in {} (held hub request)\n",
+                nick,
+                name
+            );
             ircf!(state, "MODE {} +o {}\r\n", name, nick);
         }
     }
@@ -888,28 +950,6 @@ pub fn relay_bot_command(state: &mut BotState, target_uuid: &str, frame_line: &s
         target_uuid
     );
     true
-}
-
-/// CMD_INVITE_REQUEST: the hub broadcasts it to every bot.
-pub fn send_invite_request(state: &mut BotState, nick: &str, channel: &str) -> bool {
-    if !state.hub_connected || !state.hub_authenticated || state.hub.is_none() {
-        return false;
-    }
-    let payload = format!("{nick}|{channel}");
-    if payload.len() >= 256 {
-        return false;
-    }
-    if send_frame(state, CMD_INVITE_REQUEST, payload.as_bytes()) {
-        logm!(
-            state,
-            L_INFO,
-            "[HUB] Sent INVITE_REQUEST for {} in {}\n",
-            nick,
-            channel
-        );
-        return true;
-    }
-    false
 }
 
 /// kind|channel only: the hub resolves our nick and mask itself.
@@ -973,6 +1013,10 @@ pub fn push_admin_delta(state: &mut BotState) {
         .map(config::format_user_line)
         .collect();
     lines.extend(state.mask_records.iter().map(config::format_mask_line));
+    // then the admin flags and oper channel bindings, after the users they
+    // name
+    lines.extend(state.uflag_records.iter().map(access::format_uflag));
+    lines.extend(state.uchan_records.iter().map(access::format_uchan));
     let mut payload = String::new();
     let mut frames = 0;
     for (i, line) in lines.iter().enumerate() {
@@ -1229,6 +1273,9 @@ fn apply_purge(state: &mut BotState, arg: &str) -> usize {
     let mut purged =
         before - (state.chans.len() + state.user_records.len() + state.mask_records.len());
     purged += chancfg::purge_bans(state, cutoff);
+    // binding tombstones, and flags / bindings whose user went above (a live
+    // user's "*" del stays)
+    purged += access::purge(state, cutoff);
     if purged > 0 {
         logm!(
             state,
@@ -1435,6 +1482,11 @@ fn sync_channel_line(state: &mut BotState, data: &str) -> bool {
             c.timestamp = ts;
             let (status, ckey) = (c.status, c.key.clone());
             logm!(state, L_INFO, "[HUB] Updated channel: {} ({})\n", chan, op);
+            // a channel removed takes its oper bindings with it, at the same
+            // stamp, as on every hub (user_flags plan U6)
+            if !is_add {
+                access::chan_cascade(state, &chan, ts);
+            }
             if was_managed && !is_add && status == ChanStatus::In {
                 logm!(
                     state,
@@ -1642,9 +1694,12 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
     let mut has_user_lines = false;
     let mut has_mask_lines = false;
     let mut has_trust_set = false;
+    let mut has_access_lines = false;
     for l in payload.split('\n') {
         let b = l.as_bytes();
-        if b.len() >= 2 && b[1] == b'|' {
+        if l.starts_with("uf|") || l.starts_with("uc|") {
+            has_access_lines = true;
+        } else if b.len() >= 2 && b[1] == b'|' {
             match b[0] {
                 b'a' | b'o' => has_user_lines = true,
                 b'm' => has_mask_lines = true,
@@ -1661,6 +1716,13 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
     if has_mask_lines {
         state.mask_records.clear();
     }
+    // uf| / uc| (user_flags plan): the hub's set replaces ours like
+    // a|/o|/m|.  A hub that predates them sends none and ours stay (then
+    // migrated).
+    if has_access_lines {
+        state.uflag_records.clear();
+        state.uchan_records.clear();
+    }
 
     let work = crate::cstr::trunc(payload, MAX_CONFIG_PAYLOAD);
     let mut listed: Vec<String> = Vec::new();
@@ -1672,6 +1734,23 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
         // PURGE is the one line whose type is a word, not a letter.
         if let Some(arg) = line.strip_prefix("PURGE|") {
             apply_purge(state, arg);
+            continue;
+        }
+        // uf| / uc|: admin flags and oper channel bindings (access.rs)
+        if let Some(body) = line
+            .strip_prefix("uf|")
+            .or_else(|| line.strip_prefix("uc|"))
+        {
+            match access::ingest(state, line.as_bytes()[1] as char, body, false) {
+                None => logm!(
+                    state,
+                    L_DEBUG,
+                    "[HUB-SYNC] Malformed {}| record ignored\n",
+                    &line[..2]
+                ),
+                Some(true) => updates += 1,
+                Some(false) => {}
+            }
             continue;
         }
         let b = line.as_bytes();
@@ -1767,6 +1846,14 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
             state.trusted_bots.remove(i);
             updates += 1;
         }
+    }
+
+    // Flags / bindings of users this payload dropped go; a user it brought
+    // without any (an older hub, an older bot's +admin / +oper) gets what it
+    // could do before flags (access::migrate).
+    access::prune(state);
+    if access::migrate(state) > 0 {
+        updates += 1;
     }
 
     // Keep locally newer last_seen / last_used (auths not yet pushed).
@@ -1957,6 +2044,140 @@ fn chan_elect_do(state: &mut BotState, payload: &str) {
     );
 }
 
+// ---- A person's channel request (irchub user_flags plan section 5) --------
+
+/// Ask the hub to op / invite / unban a person this bot could not serve
+/// itself.  false = no hub link (the caller asks its trusted bots
+/// directly).  C `hub_client_send_user_chan_request`.
+pub fn send_user_chan_request(
+    state: &mut BotState,
+    kind: &str,
+    chan: &str,
+    user_uuid: &str,
+    nick: &str,
+    mask: &str,
+) -> bool {
+    if !state.hub_connected || !state.hub_authenticated || state.hub.is_none() {
+        return false;
+    }
+    let mut rnd = [0u8; 8];
+    if !crate::crypto::random_bytes(&mut rnd) {
+        return false;
+    }
+    let rid: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
+    let payload = format!("{rid}|{kind}|{chan}|{user_uuid}|{nick}|{mask}");
+    if payload.len() >= MAX_BUFFER {
+        return false;
+    }
+    if !send_frame(state, CMD_USER_CHAN_REQUEST, payload.as_bytes()) {
+        return false;
+    }
+    // the oldest slot goes if all are taken
+    let p = crate::state::UserChanPending {
+        rid: rid.clone(),
+        kind: trunc_string(kind, 8),
+        chan: trunc_string(chan, MAX_CHAN),
+        nick: trunc_string(nick, MAX_MEMBER_NICK),
+        mask: trunc_string(mask, MAX_MASK_LEN),
+        sent: crate::cstr::now(),
+    };
+    if state.user_chan_pending.len() < USER_CHAN_PENDING {
+        state.user_chan_pending.push(p);
+    } else if let Some(oldest) = state.user_chan_pending.iter_mut().min_by_key(|q| q.sent) {
+        *oldest = p;
+    }
+    logm!(
+        state,
+        L_INFO,
+        "[CHANREQ] Asked the hub to {} {} on {} (rid {})\n",
+        kind,
+        nick,
+        chan,
+        rid
+    );
+    true
+}
+
+/// CMD_USER_CHAN_RESULT: rid|ok|detail or rid|fail|detail -> tell the
+/// person.  C `user_chan_result`.
+fn user_chan_result(state: &mut BotState, payload: &str) {
+    let mut t = payload.splitn(3, '|');
+    let (Some(rid), Some(status)) = (t.next(), t.next()) else {
+        return;
+    };
+    let detail: String = t
+        .next()
+        .unwrap_or("")
+        .split(['\r', '\n'])
+        .next()
+        .unwrap_or("")
+        .chars()
+        .map(|c| {
+            if (c as u32) < 0x20 || c == '\x7f' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let detail = trunc_string(&detail, 200);
+    let rid = trunc_string(rid, USER_CHAN_RID_MAX + 1);
+    let status = trunc_string(status, 8);
+    let Some(i) = state.user_chan_pending.iter().position(|p| p.rid == rid) else {
+        return;
+    };
+    let p = state.user_chan_pending.remove(i);
+    let ok = status == "ok";
+    ircf!(
+        state,
+        "PRIVMSG {} :{} {}: {}{}{}{}\r\n",
+        p.nick,
+        p.kind,
+        p.chan,
+        if ok { "done" } else { "not done" },
+        if detail.is_empty() {
+            ""
+        } else if ok {
+            " ("
+        } else {
+            " - "
+        },
+        detail,
+        if !detail.is_empty() && ok { ")" } else { "" }
+    );
+    logm!(
+        state,
+        L_INFO,
+        "[CHANREQ] {} {} on {}: {} {}\n",
+        p.kind,
+        p.nick,
+        p.chan,
+        status,
+        detail
+    );
+}
+
+/// Requests the hub never answered (an older hub ignores the frame): ask
+/// the trusted bots directly instead, once.  C `hub_client_user_chan_tick`.
+pub fn user_chan_tick(state: &mut BotState) {
+    let now = crate::cstr::now();
+    let (due, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut state.user_chan_pending)
+        .into_iter()
+        .partition(|p| now - p.sent >= USER_CHAN_REPLY_WAIT);
+    state.user_chan_pending = keep;
+    for p in due {
+        logm!(
+            state,
+            L_INFO,
+            "[CHANREQ] No answer from the hub for {} {} on {}; asking the bots directly\n",
+            p.kind,
+            p.nick,
+            p.chan
+        );
+        bot_comms::user_chan_fallback(state, &p.kind, &p.chan, &p.nick, &p.mask);
+    }
+}
+
 fn handle_response(state: &mut BotState, cmd: u8, payload: &str) {
     match cmd {
         CMD_PING => {
@@ -1966,6 +2187,7 @@ fn handle_response(state: &mut BotState, cmd: u8, payload: &str) {
         }
         CMD_BOT_TREE => process_tree(state, payload),
         CMD_ACTIVITY_REPLY => crate::commands::activity_reply(state, payload),
+        CMD_USER_CHAN_RESULT => user_chan_result(state, payload),
         CMD_CONFIG_PULL => logm!(state, L_INFO, "[HUB] Hub requested config sync\n"),
         CMD_CONFIG_DATA => {
             logm!(
@@ -2443,6 +2665,11 @@ fn process_packet(state: &mut BotState, body: &[u8]) {
         }
     };
     let cmd = plain[0];
+    if cmd == CMD_BOT_RETIRE {
+        // Empty payload: handled before the payload dispatch below.
+        retire(state);
+        return;
+    }
     if cmd == CMD_PING {
         // Answer at most once per 5 s.
         let now = now();
@@ -2532,6 +2759,78 @@ fn handle_challenge(state: &mut BotState, body: &[u8]) {
     }
 }
 
+/// Overwrite a file with zeros, flush it and unlink it.  True when it is gone
+/// (or never existed).  O_NOFOLLOW: a symlink planted in the bot's directory
+/// never gets another file zeroed.
+fn retire_wipe_file(path: &str) -> bool {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let gone = |r: std::io::Result<()>| match r {
+        Ok(()) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    };
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits() | nix::fcntl::OFlag::O_CLOEXEC.bits())
+        .open(path);
+    let mut f = match f {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return gone(std::fs::remove_file(path)),
+    };
+    let mut ok = match f.metadata() {
+        Ok(m) if m.is_file() => {
+            let zero = [0u8; 4096];
+            let mut left = m.len();
+            let mut ok = true;
+            while ok && left > 0 {
+                let n = left.min(zero.len() as u64) as usize;
+                match f.write(&zero[..n]) {
+                    Ok(w) if w > 0 => left -= w as u64,
+                    _ => ok = false,
+                }
+            }
+            ok && f.sync_all().is_ok()
+        }
+        _ => false,
+    };
+    drop(f);
+    if !gone(std::fs::remove_file(path)) {
+        ok = false;
+    }
+    ok
+}
+
+/// CMD_BOT_RETIRE: this bot was deleted on the hub (bot del).  Wipe every
+/// config file (keys, hubs, channels), tell the hub, leave IRC and exit.  A
+/// cron restart then finds no config and stops at once.
+fn retire(state: &mut BotState) {
+    logm!(
+        state,
+        L_INFO,
+        "[HUB] This bot was deleted on the hub: wiping its config and exiting\n"
+    );
+    state.retired = true;
+    let mut ok = retire_wipe_file(CONFIG_FILE);
+    ok = retire_wipe_file(&format!("{CONFIG_FILE}.tmp")) && ok;
+    ok = retire_wipe_file(&format!("{CONFIG_FILE}{UPGRADE_PREV_SUFFIX}")) && ok;
+    ok = retire_wipe_file(PASS_FILE) && ok;
+    ok = retire_wipe_file(PASS_PREV_FILE) && ok;
+    if !ok {
+        logm!(
+            state,
+            L_INFO,
+            "[HUB] Could not wipe every config file; exiting anyway\n"
+        );
+    }
+    seal_frame(state, CMD_BOT_RETIRE_ACK, if ok { b"1" } else { b"0" });
+    if state.irc.is_some() {
+        ircf!(state, "QUIT :Removed from the botnet\r\n");
+    }
+    state.status |= crate::state::S_DIE;
+    disconnect(state);
+}
+
 /// The hub's ACK: an encrypted single byte 0x01.
 fn handle_ack(state: &mut BotState, body: &[u8]) {
     if body.len() < GCM_IV_LEN + 1 + GCM_TAG_LEN {
@@ -2545,6 +2844,11 @@ fn handle_ack(state: &mut BotState, body: &[u8]) {
         return;
     }
     let ack = crypto::gcm_open(state.hub_session_key.get(), &[], body);
+    if matches!(&ack, Some(p) if p.len() == 1 && p[0] == CMD_BOT_RETIRE) {
+        // Revoked: the hub proved itself (signed challenge, sealed ACK).
+        retire(state);
+        return;
+    }
     let ok = matches!(&ack, Some(p) if p.len() == 1 && p[0] == 0x01);
     if !ok {
         logm!(

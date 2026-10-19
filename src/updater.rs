@@ -1164,6 +1164,16 @@ pub fn hub_rollback(state: &mut BotState, reason: &str) -> bool {
             prev_cfg
         );
     }
+    // The pre-2.5.0 pass file, only if this process rewrote it (the old build
+    // cannot read the new one).
+    if state.pass_prev_saved && std::fs::rename(PASS_PREV_FILE, PASS_FILE).is_err() {
+        logm!(
+            state,
+            L_INFO,
+            "[UPGRADE] Could not restore {}; keeping the current one\n",
+            PASS_PREV_FILE
+        );
+    }
     if std::fs::rename(&prev_exe, &exe).is_err() {
         logm!(state, L_INFO, "[UPGRADE] Could not restore {}\n", prev_exe);
         return false;

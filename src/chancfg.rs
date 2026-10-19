@@ -453,7 +453,11 @@ fn ban_store(state: &mut BotState, inb: &CfgBan) -> bool {
         if inb.active && !b.active && !ban_active_room(state, &inb.chan) {
             return false;
         }
+        let (last_used, act_pending) = (b.last_used, b.act_pending);
         state.cfg_bans[i] = inb.clone();
+        // runtime activity outlives a record update
+        state.cfg_bans[i].last_used = last_used;
+        state.cfg_bans[i].act_pending = act_pending;
         state.cfg_gen = state.cfg_gen.wrapping_add(1);
         return true;
     }
@@ -531,8 +535,32 @@ pub fn apply_b_line(state: &mut BotState, data: &str) -> bool {
         ts,
         active: add,
         push_pending: false,
+        last_used: 0,
+        act_pending: 0,
     };
     ban_store(state, &b)
+}
+
+/// chancfg_ban_mark_used(): a listed ban (chan, mask) matched an
+/// unauthorised member: stamp its last use; the first in an ACTIVITY_BUCKET
+/// goes to the hub.  Sticky: ignored.
+pub fn ban_mark_used(state: &mut BotState, chan: &str, mask: &str, t: i64) {
+    let Some(b) = state
+        .cfg_bans
+        .iter_mut()
+        .find(|b| eq_ic(&b.chan, chan) && eq_ic(&b.mask, mask))
+    else {
+        return;
+    };
+    if !b.active || b.flags.contains('s') || t <= b.last_used {
+        return;
+    }
+    let new_bucket = b.last_used / ACTIVITY_BUCKET < t / ACTIVITY_BUCKET;
+    b.last_used = t;
+    if new_bucket {
+        b.act_pending = t;
+        crate::hub_client::send_activity(state);
+    }
 }
 
 /// "B|...\n" for one ban; None on overflow of the B line buffer.
@@ -780,6 +808,8 @@ pub fn local_ban(
             active: true,
             ts: old.map_or_else(now, |o| lww_next_ts(o.ts)),
             push_pending: false,
+            last_used: 0,
+            act_pending: 0,
         }
     };
     if !ban_store(state, &b) {

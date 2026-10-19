@@ -289,13 +289,13 @@ pub fn ctcp_at(state: &mut BotState, nuh: &str, authorised: bool, now: i64) -> B
 /// Per-host flood for non-command PRIVMSG / NOTICE to the bot.  Authorised
 /// sources are never counted.  `Bf::Ignore` = answer nothing.
 pub fn msg(state: &mut BotState, nuh: &str) -> Bf {
-    let a = auth::is_authorised(state, nuh);
+    let a = auth::is_authorised(state, nuh, None);
     msg_at(state, nuh, a, now_ms())
 }
 
 /// Per-host flood for CTCP to the bot.
 pub fn ctcp(state: &mut BotState, nuh: &str) -> Bf {
-    let a = auth::is_authorised(state, nuh);
+    let a = auth::is_authorised(state, nuh, None);
     ctcp_at(state, nuh, a, now_ms())
 }
 
@@ -304,7 +304,7 @@ pub fn host_ignored(state: &mut BotState, nuh: &str) -> bool {
     let Some(host) = src_host(nuh) else {
         return false;
     };
-    if auth::is_authorised(state, nuh) {
+    if auth::is_authorised(state, nuh, None) {
         return false;
     }
     let now = now_ms();

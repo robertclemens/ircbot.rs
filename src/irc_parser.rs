@@ -704,11 +704,21 @@ fn on_end_of_who(state: &mut BotState, params: &str) {
             c.op_request_retry_count += 1;
         }
     } else {
+        // Another channel just asked.  Book the next free slot instead of
+        // sitting out the 60 s pending timeout: back-date the request so
+        // channel_manager's timeout re-WHOs this channel the moment its slot
+        // opens.  Slots are MIN_INTERVAL + 1 apart so the WHO round trip
+        // cannot land a request inside the previous one's window.
+        let slot =
+            (state.last_op_request_sent + OP_REQUEST_MIN_INTERVAL).max(state.op_request_next_slot);
+        state.op_request_next_slot = slot + OP_REQUEST_MIN_INTERVAL + 1;
+        state.chans[ci].last_op_request_time = slot - 61;
         logm!(
             state,
             L_DEBUG,
-            "[OP-REQ] Rate limited in {}; will retry (attempt {} pending)\n",
+            "[OP-REQ] Rate limited in {}; retry in {}s (attempt {} pending)\n",
             name,
+            slot - now,
             state.chans[ci].op_request_retry_count + 1
         );
     }

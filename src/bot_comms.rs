@@ -190,6 +190,36 @@ fn open_and_dispatch(state: &mut BotState, ti: usize, b64: &str, sender_nick: Op
             );
             ircf!(state, "INVITE {} {}\r\n", arg2, arg1);
         }
+    } else if eq_ic(verb, "OPUSER") {
+        // OPUSER #chan nick: a person the sender vouched for (an admin or an
+        // oper bound to the channel, user_flags plan section 5).  +bitch
+        // still holds here: only an authorised member is opped.
+        if let Some(arg2) = t.next(" ")
+            && let Some(ci) = channel::find(state, arg1)
+            && state.chans[ci].status == ChanStatus::In
+            && state.chans[ci].i_am_opped
+        {
+            let (found, auth) = crate::chanlive::member_authorised(state, ci, arg2);
+            if !crate::chanlive::bitch(state, ci) || (found && auth) {
+                logm!(
+                    state,
+                    L_INFO,
+                    "[BOT-COMMS] Opping {} in {} (bot req)\n",
+                    arg2,
+                    arg1
+                );
+                ircf!(state, "MODE {} +o {}\r\n", arg1, arg2);
+            }
+        }
+    } else if eq_ic(verb, "UNBANUSER") {
+        // UNBANUSER #chan nick!user@host: lift the bans that match a person
+        // the sender vouched for (its hostmask as the IRC server showed it)
+        if let Some(arg2) = t.next(" ")
+            && arg2.contains('!')
+            && arg2.contains('@')
+        {
+            channel::access_service(state, "", ChanReq::Unban, arg1, None, Some(arg2), None);
+        }
     } else if eq_ic(verb, "UNBAN") {
         // The mask matched against the ban list is the sender's own b|
         // record, never anything in the message.
@@ -349,6 +379,28 @@ pub fn send_command(state: &mut BotState, target_nick: &str, command: &str) {
 pub fn send_to_host(state: &mut BotState, hostmask: &str, target_nick: &str, command: &str) {
     let ti = auth::trusted_bot_by_host(state, hostmask);
     b2_send(state, ti, target_nick, command);
+}
+
+/// A person's op / invite / unban with no hub to ask (or a hub that never
+/// answered): every trusted bot gets it over ~B2; one that is in the channel
+/// and opped does it (user_flags plan section 5).  C
+/// `bot_comms_user_chan_fallback`.
+pub fn user_chan_fallback(state: &mut BotState, kind: &str, chan: &str, nick: &str, mask: &str) {
+    let nicks: Vec<String> = state
+        .trusted_bots
+        .iter()
+        .map(|t| t.nick().to_string())
+        .filter(|n| !n.is_empty())
+        .collect();
+    for tb in nicks {
+        let cmd = match kind {
+            "invite" => format!("INVITE {chan} {nick}"),
+            "op" => format!("OPUSER {chan} {nick}"),
+            "unban" => format!("UNBANUSER {chan} {mask}"),
+            _ => continue,
+        };
+        send_command(state, &tb, &cmd);
+    }
 }
 
 #[cfg(test)]

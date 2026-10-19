@@ -62,11 +62,12 @@ pub fn gen_uuid_v4() -> Option<String> {
     ))
 }
 
-/// PBKDF2-HMAC-SHA256 (PBKDF2_ITERATIONS) over a password: the config-file
-/// and pass-file key.
-pub fn derive_config_key(password: &[u8], salt: &[u8]) -> Key32 {
+/// PBKDF2-HMAC-SHA256 over a password: the config-file and pass-file key.
+/// `iterations` is PBKDF2_ITERATIONS, or PBKDF2_ITERATIONS_LEGACY to read a
+/// pre-2.5.0 file.
+pub fn derive_config_key(password: &[u8], salt: &[u8], iterations: u32) -> Key32 {
     let mut key = Zeroizing::new([0u8; 32]);
-    pbkdf2::pbkdf2_hmac::<Sha256>(password, salt, PBKDF2_ITERATIONS, key.as_mut());
+    pbkdf2::pbkdf2_hmac::<Sha256>(password, salt, iterations, key.as_mut());
     key
 }
 

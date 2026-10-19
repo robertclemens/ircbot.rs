@@ -19,7 +19,7 @@ use crate::cstr::{
 use crate::state::{
     BotState, ChanStatus, HubEntry, MaskRecord, TrustedBot, UserLine, UserRecord, lww_accepts,
 };
-use crate::{chancfg, channel, hub_client, logm};
+use crate::{access, chancfg, channel, hub_client, logm};
 
 /// A key-shaped field: Some(b64) only if it is exactly a valid key.
 fn field_pubkey(f: &str) -> Option<String> {
@@ -226,13 +226,14 @@ fn parse_cfg_chan(data: &str) -> Option<(String, String, String, i64)> {
     (parsed >= 2).then_some((chan, key, op, ts))
 }
 
-/// Read and decrypt the config file; returns the plaintext and whether the
-/// legacy (pre-PBKDF2) key had to be used.
+/// Read and decrypt the config file; returns the plaintext and, when an older
+/// key had to be used, which one (PBKDF2 at the pre-2.5.0 count, or the
+/// pre-PBKDF2 EVP_BytesToKey key) for the one-time rewrite.
 fn decrypt_file(
     state: &BotState,
     password: &str,
     filename: &str,
-) -> Option<(Zeroizing<Vec<u8>>, bool)> {
+) -> Option<(Zeroizing<Vec<u8>>, Option<&'static str>)> {
     let mut f = fs::File::open(filename).ok()?;
     let mut data = Vec::new();
     if f.read_to_end(&mut data).is_err() {
@@ -263,14 +264,19 @@ fn decrypt_file(
         );
         return None;
     }
-    let key = crypto::derive_config_key(password.as_bytes(), salt);
+    let key = crypto::derive_config_key(password.as_bytes(), salt, PBKDF2_ITERATIONS);
     if let Some(pt) = crypto::gcm_decrypt_detached(key.as_ref(), iv, &[], ct, tag) {
-        return Some((pt, false));
+        return Some((pt, None));
     }
-    // Configs written before the PBKDF2 upgrade: migrate once.
+    // Configs written under the pre-2.5.0 PBKDF2 count, or before PBKDF2:
+    // migrate once.
+    let key = crypto::derive_config_key(password.as_bytes(), salt, PBKDF2_ITERATIONS_LEGACY);
+    if let Some(pt) = crypto::gcm_decrypt_detached(key.as_ref(), iv, &[], ct, tag) {
+        return Some((pt, Some("PBKDF2 100k")));
+    }
     let legacy = crypto::legacy_config_key(password.as_bytes(), salt);
     if let Some(pt) = crypto::gcm_decrypt_detached(legacy.as_ref(), iv, &[], ct, tag) {
-        return Some((pt, true));
+        return Some((pt, Some("EVP_BytesToKey")));
     }
     logm!(
         state,
@@ -312,6 +318,23 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
     for raw in text.split('\n') {
         let line = raw.strip_suffix('\r').unwrap_or(raw);
         let line = crate::cstr::until_nul(line);
+        // uf| / uc|: admin flags and oper channel bindings (access.rs);
+        // users load first in this file, records of a user that never loads
+        // go with access::prune below
+        if let Some(body) = line
+            .strip_prefix("uf|")
+            .or_else(|| line.strip_prefix("uc|"))
+        {
+            if access::ingest(state, line.as_bytes()[1] as char, body, false).is_none() {
+                logm!(
+                    state,
+                    L_INFO,
+                    "[CFG] Ignoring invalid {}| line\n",
+                    &line[..2]
+                );
+            }
+            continue;
+        }
         if line.len() < 2 || line.starts_with('#') || line.as_bytes()[1] != b'|' {
             continue;
         }
@@ -513,11 +536,15 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
     if needs_migration {
         migrate_legacy_records(state);
     }
-    if migrated_from_legacy {
+    if let Some(was) =
+        migrated_from_legacy.filter(|_| !READ_ONLY.load(std::sync::atomic::Ordering::Relaxed))
+    {
         logm!(
             state,
             L_INFO,
-            "[CFG] Config re-encrypted with PBKDF2 (legacy migration).\n"
+            "[CFG] Config re-encrypted with PBKDF2 {}k (was {}).\n",
+            PBKDF2_ITERATIONS / 1000,
+            was
         );
     }
 
@@ -585,14 +612,22 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
         );
     }
 
+    // Flags / bindings: drop those with no user, then give every user that
+    // has none what they could do before flags (admins +a, opers *).
+    let access_before = state.uflag_records.len() + state.uchan_records.len();
+    access::prune(state);
+    let mut access_changed = state.uflag_records.len() + state.uchan_records.len() != access_before;
+    access_changed |= access::migrate(state) > 0;
+
     // Rewrite once if anything above changed the on-disk shape — never from
     // `-selftest`, which only asks whether this build could read it.
     if !READ_ONLY.load(std::sync::atomic::Ordering::Relaxed)
         && (needs_migration
-            || migrated_from_legacy
+            || migrated_from_legacy.is_some()
             || legacy_user_lines > 0
             || dropped_botpass
-            || identity_minted)
+            || identity_minted
+            || access_changed)
     {
         write(state, password);
     }
@@ -821,6 +856,13 @@ fn serialize(state: &BotState) -> Option<Zeroizing<String>> {
     for m in &state.mask_records {
         push(&format_mask_line(m));
     }
+    // admin flags and oper channel bindings, after the users they name
+    for r in &state.uflag_records {
+        push(&access::format_uflag(r));
+    }
+    for r in &state.uchan_records {
+        push(&access::format_uchan(r));
+    }
     for tb in &state.trusted_bots {
         let l = format_bot_line(tb);
         if l.len() >= CFG_BLINE_MAX {
@@ -869,6 +911,9 @@ fn serialize(state: &BotState) -> Option<Zeroizing<String>> {
 /// Serialize and encrypt to CONFIG_FILE through a 0600 temp file and a
 /// rename.  Does NOT push to the hub.
 fn write_file(state: &BotState, password: &str) {
+    if state.retired {
+        return; // wiped on the hub's order: stays gone
+    }
     if password.len() >= MAX_PASS {
         return;
     }
@@ -886,7 +931,7 @@ fn write_file(state: &BotState, password: &str) {
         eprintln!("[CFG] RNG/KDF failure; aborting config write.");
         return;
     }
-    let key = crypto::derive_config_key(password.as_bytes(), &salt);
+    let key = crypto::derive_config_key(password.as_bytes(), &salt, PBKDF2_ITERATIONS);
     let Some((ct, tag)) =
         crypto::gcm_encrypt_detached(key.as_ref(), &iv, &[], plaintext.as_bytes())
     else {
