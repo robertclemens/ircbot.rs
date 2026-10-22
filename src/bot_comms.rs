@@ -260,7 +260,7 @@ pub fn process_payload(state: &mut BotState, payload: &str) {
         logm!(
             state,
             L_CMD,
-            "[BOT-COMM] Relayed frame from {} is not ~B2 (pre-passwordless sender?); dropped\n",
+            "[BOT-COMM] Relayed frame from {} is not ~B2; dropped\n",
             uuid
         );
         return;

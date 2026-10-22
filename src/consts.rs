@@ -12,15 +12,13 @@ pub const BOT_NAME: &str = "ircbot.rs by trojanman";
 /// made against.
 pub const BOT_VERSION: &str = match option_env!("IRCBOT_VERSION") {
     Some(v) => v,
-    None => "2.5.0",
+    None => "2.5.1",
 };
 pub const PASS_FILE: &str = ".ircbot.pass"; // machine-bound password file
-/// PBKDF2-HMAC-SHA256 rounds for the .ircbot.cnf and .ircbot.pass keys.
-/// 2.5.0 raised them from 100k (PBKDF2_ITERATIONS_LEGACY); a file still under
-/// the legacy count is read and rewritten once (config::load, passfile_load).
-/// Releases after 2.5.0 carry min_from 2.5.0 so no node skips that rewrite.
+/// PBKDF2-HMAC-SHA256 rounds for the .ircbot.cnf and .ircbot.pass keys
+/// (OWASP's 2023 figure).  2.5.0 moved both files here from 100k; releases
+/// after it carry min_from 2.5.0, so only this count is read.
 pub const PBKDF2_ITERATIONS: u32 = 600_000;
-pub const PBKDF2_ITERATIONS_LEGACY: u32 = 100_000;
 pub const VERSION_RESPONSE: &str = "A robot may not injure a human being";
 pub const CONFIG_FILE: &str = ".ircbot.cnf";
 pub const PID_FILE: &str = ".ircbot.pid";
@@ -44,7 +42,8 @@ pub const UPGRADE_MARKER_FILE: &str = ".ircbot.upgrade";
 /// Retained previous binary/config, kept (not deleted) after a hub-driven
 /// upgrade so CMD_UPGRADE_ABORT can put the node back.
 pub const UPGRADE_PREV_SUFFIX: &str = ".prev";
-/// The pre-2.5.0 pass file kept for a rollback (PASS_FILE + UPGRADE_PREV_SUFFIX).
+/// 2.5.0's rollback copy of the pass file (PASS_FILE + UPGRADE_PREV_SUFFIX):
+/// removed at start.
 pub const PASS_PREV_FILE: &str = ".ircbot.pass.prev";
 /// How long a CMD_UPGRADE_PREPARE stays commitable.
 pub const UPGRADE_PREPARE_TTL: i64 = 900;
@@ -57,23 +56,13 @@ pub const UPDATE_FETCH_TIMEOUT: u64 = 300;
 /// The upgrade script's startup watchdog: how long the new build's daemon
 /// has to be up before the script keeps it (bot.h UPGRADE_WATCH_SECS).
 pub const UPGRADE_WATCH_SECS: u32 = 20;
-/// A pre-2.5.0 PASS_FILE found on the start a hub-driven upgrade made is
-/// rewritten at PBKDF2_ITERATIONS this long after that start: past the old
-/// build's watchdog, which restores `<exe>.prev` and the config but not this
-/// file.  The old copy stays as PASS_PREV_FILE until the next ordinary start,
-/// for this process's own hub-ordered rollback to put back (bot.h).
-pub const UPGRADE_PASS_REWRITE_SECS: i64 = 120;
-const _: () = assert!(
-    UPGRADE_PASS_REWRITE_SECS > 3 * UPGRADE_WATCH_SECS as i64,
-    "the pass rewrite must wait out the old build's watchdog"
-);
 /// After an upgrade restart the bot holds its "ok" until it is back in every
 /// channel it held ops in before, opped — at most this long (seconds), then
 /// it reports "ok" anyway with what is missing (bot.h UPGRADE_OPS_WAIT).
 pub const UPGRADE_OPS_WAIT: i64 = 180;
-/// The first bot version with `-selftest`: an older build would not know the
-/// flag and would start a second daemon instead (bot.h SELFTEST_MIN_BOT).
-pub const SELFTEST_MIN_BOT: &str = "2.4.5";
+/// The oldest upgrade target: an older build cannot read this config or
+/// pass file (PBKDF2 600k since 2.5.0; bot.h UPGRADE_TARGET_MIN).
+pub const UPGRADE_TARGET_MIN: &str = "2.5.0";
 /// How long a staged build's `-selftest` may run before it is killed.
 pub const SELFTEST_TIMEOUT: u64 = 15;
 /// The release tree ROOT; one variant subdirectory below it holds that build's
@@ -86,10 +75,6 @@ pub const BOT_UPDATE_BASE: &str =
     "https://raw.githubusercontent.com/robertclemens/ircbot-releases/main/ircbot";
 /// The variant THIS build is: the standalone `update` command stays on it.
 pub const BOT_UPDATE_VARIANT: &str = "rs";
-pub const BOT_UPDATE_URL: &str =
-    "https://raw.githubusercontent.com/robertclemens/ircbot-releases/main/ircbot/rs/releases.txt";
-pub const BOT_UPDATE_SIG_URL: &str =
-    "https://raw.githubusercontent.com/robertclemens/ircbot-releases/main/ircbot/rs/releases.sig";
 /// Base64 of the raw Ed25519 public key that signs releases.txt.  Empty
 /// disables the self-updater (fail closed).
 pub const BOT_UPDATE_PUBKEY_B64: &str = "qkXMh/F8TC+cnKuIwrP5TJIynfrLBD+MDUwvkyh9lBU=";
@@ -314,8 +299,8 @@ pub const CMD_ADMIN_USER_ACCESS: u8 = 0x7C; // console -> hub only (reserved her
 // re-checks the user and runs the channel-request election.
 //   CMD_USER_CHAN_REQUEST bot->hub  rid|kind|#chan|user_uuid|nick|nick!user@host
 //   CMD_USER_CHAN_RESULT  hub->bot  rid|ok|detail  or  rid|fail|detail
-// No answer within USER_CHAN_REPLY_WAIT and the bot asks its trusted bots
-// directly over ~B2 instead.
+// No answer within USER_CHAN_REPLY_WAIT (the request was lost) and the bot
+// asks its trusted bots directly over ~B2 instead.
 pub const CMD_USER_CHAN_REQUEST: u8 = 0x7D;
 pub const CMD_USER_CHAN_RESULT: u8 = 0x7E;
 // Revoked bots (irchub docs/plans/2026-10-17_bot_revoke_plan.md).  A bot
@@ -355,7 +340,6 @@ pub const JOB_LIMIT: usize = 4;
 pub const JOB_COUNT: usize = 5;
 pub const JOB_STEP_MS: i64 = 1500; // backup delay = backup index x this
 pub const MAX_PENDING_JOBS: usize = 32;
-pub const JOB_MIN_VERSION: &str = "2.4.7"; // older bots are left out of the deal
 pub const JOB_MAX_AGE_MS: i64 = 30000; // a pending job older than this is dropped
 pub const ENF_SWEEP_SECS: i64 = 5; // per-channel state sweep when nothing happened
 /// Idle clocks (ban_track, grown on demand): one per channel x listed ban, so a

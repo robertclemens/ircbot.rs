@@ -50,7 +50,7 @@ There are no admin, oper or bot passwords: bots, admins and opers are each ident
         ```
         This creates `.ircbot.pass` (mode 0600, encrypted and bound to this machine). The bot will load it automatically on every start with no interaction required, at the cost of storing the encrypted password on disk. This is required if you want to use crontab or any other automated restart mechanism.
 
-        Since 2.5.0 the `.ircbot.cnf` and `.ircbot.pass` keys use PBKDF2-HMAC-SHA256 with 600,000 rounds (was 100,000). A 2.5.0+ bot still reads older files and rewrites them once: the config on its first start, the pass file at once on an ordinary start, or 120 s after a start made by a hub-driven upgrade (once the old build's 20 s watchdog can no longer put that build back). That later rewrite keeps the old file as `.ircbot.pass.prev`, which a hub-ordered rollback of that same run restores, and the next ordinary start deletes. After that an older build cannot read them, so do not copy a pre-2.5.0 binary over a migrated bot.
+        From 2.5.1 only files keyed with PBKDF2-HMAC-SHA256 at 600,000 rounds are read (`.ircbot.cnf` and `.ircbot.pass`). A node must run 2.5.0 once first, which rewrites them; a pass file 2.5.0 never rewrote makes `-selftest` refuse the upgrade. A pre-2.5.0 binary cannot read the migrated files, so do not copy one over a bot.
 
         Example crontab line (optional):
         ```
@@ -86,6 +86,9 @@ See `utils/README.txt` for the other transports and for why these scripts must n
 8) Channel modes, settings and bans from IRC (admins; for networks without a hub, refused under opt `h`): `chanmode <#c> [<modes> [args]|-]` (modes `i m n p s t k l`; `+k` and `+l` take their argument left to right; `chkey <#c> <key>` is `chanmode <#c> +k <key>`), `chanset <#c|default> [+opt -opt] [<name> <value|default>] [flood <type> <N:S|off|default>]` (no arguments lists the values and where each comes from), `+ban <#c|*> <nick!user@host> [<minutes>|perm] [sticky] [reason]`, `-ban <#c|*> <mask>` and `bans [#c]`. A ban that would hit a bot or an authorised user is refused. `help <command>` has the syntax.
 
 ### Changelog
+
+* v2.5.1
+    * Change: Requires 2.5.0; legacy read paths and pre-2.5.0 compatibility removed; bots and hubs below 2.5.0 are refused
 
 * Unreleased (passwordless branch)
     * Enhancement: Flood protection. Channel floods (`chan ctcp join nick deop kick ban`, per source host, trip at N+1, kick/ban ladder, bots that are not opped only log) and bot floods (`cmd` per user, `msg` and `ctcp` per host, ignore table of 64, quiet mode). New admin commands `chanmode`, `chanset`, `+ban`, `-ban`, `bans` write the bot's own `C|`/`D|`/`B|` records. NOTICEs are now counted by the flood checks; the 329/367 timestamp parse accepts up to 20 digits; a case-only nick change keeps the roster entry

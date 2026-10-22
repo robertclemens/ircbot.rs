@@ -585,7 +585,11 @@ pub fn purge_bans(state: &mut BotState, cutoff: i64) -> usize {
     let mut i = 0;
     while i < state.cfg_bans.len() {
         let b = &state.cfg_bans[i];
-        if !b.active && (cutoff == 0 || b.ts < cutoff) {
+        // a live ban of a channel no one manages is an orphan (irchub purge)
+        let orphan = b.active
+            && b.chan != "*"
+            && crate::channel::find(state, &b.chan).is_none_or(|ci| !state.chans[ci].is_managed);
+        if orphan || (!b.active && (cutoff == 0 || b.ts < cutoff)) {
             state.cfg_bans.swap_remove(i);
             removed += 1;
         } else {

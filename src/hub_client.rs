@@ -21,7 +21,7 @@ use crate::cstr::{
 use crate::net::{self, ReadOutcome};
 use crate::state::{
     BotState, BotTreeRow, ChanReq, ChanStatus, HubAuthState, MaskRecord, S_AUTHED, S_CONNECTED,
-    UserRecord, lww_accepts, opt_accepts,
+    UchanRecord, UflagRecord, UserRecord, lww_accepts, opt_accepts,
 };
 use crate::{access, bot_comms, chancfg, chanlive, channel, config, ircf, logm, updater};
 
@@ -534,12 +534,13 @@ fn handle_upgrade_prepare(state: &mut BotState, payload: &str) {
     let (id, ver) = (f[0], f[1]);
     let variant = f.get(2).copied().unwrap_or("");
     let min_from = f.get(4).copied().unwrap_or("");
-    let base = f.get(5).copied().unwrap_or("");
+    // f[5] once carried a release base and is ignored: this bot reads only
+    // its own root, the one its pinned key verifies.
 
     // Everything COMMIT will need is checked now — including the signed
     // manifest for the wanted build and whether this CPU can fetch it — so a
     // "ready" answer is one COMMIT can keep.
-    let check = updater::hub_prepare_check(state, ver, variant, min_from, base);
+    let check = updater::hub_prepare_check(state, ver, variant, min_from);
     let ready = check.is_ok();
     let reason = check.err().unwrap_or_default();
     if ready {
@@ -551,7 +552,6 @@ fn handle_upgrade_prepare(state: &mut BotState, payload: &str) {
         } else {
             variant.to_string()
         };
-        state.upgrade_base = base.to_string();
         state.upgrade_prepared = now();
     }
     // The artifact kind is chosen from the manifest at COMMIT, so f[3] is
@@ -616,10 +616,9 @@ fn handle_upgrade_commit(state: &mut BotState, payload: &str) {
     } else {
         variant
     };
-    let base = state.upgrade_base.clone();
     // On success hub_commit() does not return: the process is replaced and
     // report_upgrade_result() reports in after the restart.
-    if let Err(e) = updater::hub_commit(state, &id, &ver, &variant, &base) {
+    if let Err(e) = updater::hub_commit(state, &id, &ver, &variant) {
         // Nothing was changed on disk; stay on this build and say why.
         logm!(state, L_INFO, "[UPGRADE] Commit {} refused: {}\n", id, e);
         let status = if commit_err_is_integrity(&e) {
@@ -772,7 +771,7 @@ fn chan_line(c: &crate::state::Chan) -> String {
     format!(
         "c|{}|{}|{}|{}|{}\n",
         c.name,
-        c.key,
+        c.ckey,
         c.modes as i32,
         if c.is_managed { "add" } else { "del" },
         c.timestamp
@@ -814,21 +813,17 @@ fn hublist_line(state: &BotState) -> String {
     out
 }
 
-/// The bot's own config for the hub: c| (unless opt 'h'), pending bot-written
-/// B|, v|, h|, n|, hl| (the hubs this bot dials).  a|/o|/m| are hub-authoritative and go via
-/// push_admin_delta; s|, u|, g|, l|, i|, k| are local-only.  Under opt 'h'
-/// c| is omitted as well, except a channel with `enf_pending` (a key / mode
-/// this bot learned and has not yet got to a hub: enforcement is never gated,
-/// D43): the bot refuses join/part locally, so other c| records can only be
-/// the hub's own copy.
+/// The bot's own config for the hub: c| (unless opt 'h'), K| (what this bot
+/// saw on IRC, every opt: enforcement is never gated, D43), pending
+/// bot-written B|, v|, h|, n|, hl| (the hubs this bot dials).  a|/o|/m| are
+/// hub-authoritative and go via push_admin_delta; s|, u|, g|, l|, i|, k| are
+/// local-only.  Under opt 'h' c| is omitted: the bot refuses join/part
+/// locally, so its c| records can only be the hub's own copy.
 pub fn generate_config_payload(state: &BotState) -> String {
     let max = MAX_BUFFER - 64;
     let mut out = String::new();
     let hub_only = state.is_opt_set(OPT_HUB_ONLY_MUTATIONS);
-    for c in &state.chans {
-        if hub_only && !c.enf_pending {
-            continue;
-        }
+    for c in state.chans.iter().filter(|_| !hub_only) {
         if c.timestamp == 0 && !c.is_managed {
             continue; // known only from its C| line: no c| of its own yet
         }
@@ -842,6 +837,13 @@ pub fn generate_config_payload(state: &BotState) -> String {
             c.timestamp
         );
         let l = chan_line(c);
+        if out.len() + l.len() >= max {
+            break;
+        }
+        out.push_str(&l);
+    }
+    for c in state.chans.iter().filter(|c| c.is_managed && c.l_ts > 0) {
+        let l = channel::format_k(c);
         if out.len() + l.len() >= max {
             break;
         }
@@ -866,7 +868,8 @@ pub fn generate_config_payload(state: &BotState) -> String {
             out.push_str(&s);
         }
     };
-    // Protocol capability (passwordless.md 3.4); the ts field is unused.
+    // Protocol capability (passwordless.md 3.4): the hub refuses a bot below
+    // BOT_PROTO_USER_FLAGS.  The ts field is unused.
     add(format!("v|{}|{}\n", BOT_PROTO_VERSION, 1));
     // Stable timestamps: now() here would make every push look new.
     if !state.actual_hostname.is_empty() && state.actual_hostname_ts > 0 {
@@ -885,6 +888,34 @@ pub fn generate_config_payload(state: &BotState) -> String {
     out
 }
 
+/// +bitch (D12) on CMD_OP_GRANT: the hub's op for a bot (OP_FORWARD) or an
+/// old-style fan-out is refused for a nick that may not hold ops here, as
+/// chan_elect_do refuses it.  A nick not in our roster is not vouched for
+/// (fail closed).
+fn op_grant_bitch_refuses(state: &mut BotState, ci: usize, nick: &str) -> bool {
+    if !chanlive::bitch(state, ci) {
+        return false;
+    }
+    let (found, authorised) = chanlive::member_authorised(state, ci, nick);
+    if found && authorised {
+        return false;
+    }
+    let name = state.chans[ci].name.clone();
+    logm!(
+        state,
+        L_INFO,
+        "[HUB] Not granting ops to {} in {}: +bitch and {}\n",
+        nick,
+        name,
+        if found {
+            "not authorised"
+        } else {
+            "not in my roster"
+        }
+    );
+    true
+}
+
 /// Ask a bot for ops through the hub; false means fall back to PRIVMSG.
 /// Our own +o landed: grant the OP_GRANTs held while we had none, for nicks
 /// still in the channel and not opped.  Older than OP_GRANT_HOLD_SECS: dropped.
@@ -900,8 +931,9 @@ pub fn grant_held_ops(state: &mut BotState, ci: usize) {
             .iter()
             .find(|r| eq_ic(&r.nick, &nick))
             .is_some_and(|r| !r.is_op)
+            && !op_grant_bitch_refuses(state, ci, &nick)
         {
-            let name = c.name.clone();
+            let name = state.chans[ci].name.clone();
             logm!(
                 state,
                 L_INFO,
@@ -1093,15 +1125,21 @@ pub fn push_config(state: &mut BotState) {
 }
 
 /// Push one channel after a live MODE change.
+/// Push what this bot saw on a channel (K|) after a live MODE change or a
+/// key another bot handed over.  Never c|: that would move the channel's
+/// existence stamp, and a delete it races would be undone.
 pub fn push_channel(state: &mut BotState, ci: usize) {
     if !link_ready(state) {
         return;
     }
-    let Some(c) = state.chans.get(ci) else { return };
-    let (payload, name, modes) = (chan_line(c), c.name.clone(), c.modes as i32);
-    if payload.len() >= MAX_BUFFER {
+    let Some(c) = state.chans.get(ci).filter(|c| c.is_managed && c.l_ts > 0) else {
         return;
-    }
+    };
+    let (payload, name, modes) = (
+        zeroize::Zeroizing::new(channel::format_k(c)),
+        c.name.clone(),
+        c.modes as i32,
+    );
     if send_frame(state, CMD_CONFIG_PUSH, payload.as_bytes()) {
         state.chans[ci].enf_pending = false;
         logm!(
@@ -1249,7 +1287,10 @@ pub fn chan_event(
     sent
 }
 
-/// PURGE|<cutoff>: drop tombstones stamped before cutoff (0: all).
+/// PURGE|<cutoff>: drop tombstones stamped before cutoff (0: all).  Orphans
+/// go at every purge, as on the hubs: live bans and oper bindings of a
+/// channel no one manages, masks whose user is gone (a channel's K| and C|
+/// live in its Chan and go with it).
 fn apply_purge(state: &mut BotState, arg: &str) -> usize {
     let cutoff = match arg
         .trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r'])
@@ -1267,9 +1308,11 @@ fn apply_purge(state: &mut BotState, arg: &str) -> usize {
     state
         .user_records
         .retain(|u| u.is_active || !old(u.timestamp));
+    // a mask whose user is gone is an orphan (irchub purge)
+    let users: Vec<String> = state.user_records.iter().map(|u| u.uuid.clone()).collect();
     state
         .mask_records
-        .retain(|m| m.is_active || !old(m.timestamp));
+        .retain(|m| users.contains(&m.uuid) && (m.is_active || !old(m.timestamp)));
     let mut purged =
         before - (state.chans.len() + state.user_records.len() + state.mask_records.len());
     purged += chancfg::purge_bans(state, cutoff);
@@ -1440,13 +1483,14 @@ fn sync_channel_line(state: &mut BotState, data: &str) -> bool {
             let Some(ci) = channel::add(state, &chan) else {
                 return false;
             };
+            // c| is existence and the admin's key; what the bots saw comes as
+            // K| (a 2.5.0 hub's modes field is still taken).
             let c = &mut state.chans[ci];
-            if !key.is_empty() {
-                c.key = trunc_string(&key, MAX_KEY);
-            }
-            c.modes = modes;
+            c.ckey = trunc_string(&key, MAX_KEY);
+            c.modes = modes & (crate::state::M_K | crate::state::M_I);
             c.is_managed = true;
             c.timestamp = ts;
+            channel::key_refresh(c);
             logm!(state, L_INFO, "[HUB] Added channel: {}\n", chan);
             true
         }
@@ -1473,13 +1517,18 @@ fn sync_channel_line(state: &mut BotState, data: &str) -> bool {
                 return false;
             }
             let c = &mut state.chans[ci];
-            if !key.is_empty() {
-                c.key = trunc_string(&key, MAX_KEY);
+            c.ckey = trunc_string(&key, MAX_KEY);
+            if c.l_ts == 0 {
+                c.modes = modes & (crate::state::M_K | crate::state::M_I);
             }
-            c.modes = modes;
             let was_managed = c.is_managed;
             c.is_managed = is_add;
             c.timestamp = ts;
+            // what the bots saw goes with a deleted channel (no tombstone)
+            if !is_add {
+                channel::learned_forget(c);
+            }
+            channel::key_refresh(c);
             let (status, ckey) = (c.status, c.key.clone());
             logm!(state, L_INFO, "[HUB] Updated channel: {} ({})\n", chan, op);
             // a channel removed takes its oper bindings with it, at the same
@@ -1517,18 +1566,106 @@ fn sync_channel_line(state: &mut BotState, data: &str) -> bool {
     }
 }
 
-fn sync_mask_line(state: &mut BotState, data: &str) -> bool {
+/// A hub config replaces the user / mask / flag / binding tables wholesale;
+/// these find a rebuilt record's twin in the copy taken before, so only a
+/// real difference counts as an update (and costs a config write).  Every
+/// full config re-sends every record: counting them all rewrote the .cnf (a
+/// 600k-round KDF) on each push.
+fn saved_user_find<'a>(saved: &'a [UserRecord], uuid: &str) -> Option<&'a UserRecord> {
+    saved.iter().find(|s| s.uuid == uuid)
+}
+
+/// Persisted fields only; last_seen is compared by the caller.
+fn user_rec_same(a: &UserRecord, b: &UserRecord) -> bool {
+    a.name == b.name
+        && a.pubkey_b64 == b.pubkey_b64
+        && a.has_pubkey == b.has_pubkey
+        && a.typ == b.typ
+        && a.is_active == b.is_active
+        && a.timestamp == b.timestamp
+}
+
+fn saved_mask_find<'a>(saved: &'a [MaskRecord], uuid: &str, mask: &str) -> Option<&'a MaskRecord> {
+    saved
+        .iter()
+        .find(|s| s.uuid == uuid && eq_ic(&s.mask, mask))
+}
+
+/// Records that differ from (or are missing in) the saved table, plus saved
+/// ones the rebuild dropped.
+fn user_table_changes(state: &BotState, saved: &[UserRecord]) -> usize {
+    let mut matched = 0;
+    let mut changes = 0;
+    for u in &state.user_records {
+        let w = saved_user_find(saved, &u.uuid);
+        if w.is_some() {
+            matched += 1;
+        }
+        if !w.is_some_and(|w| user_rec_same(w, u) && w.last_seen == u.last_seen) {
+            changes += 1;
+        }
+    }
+    changes + (saved.len() - matched)
+}
+
+fn mask_table_changes(state: &BotState, saved: &[MaskRecord]) -> usize {
+    let mut matched = 0;
+    let mut changes = 0;
+    for m in &state.mask_records {
+        let w = saved_mask_find(saved, &m.uuid, &m.mask);
+        if w.is_some() {
+            matched += 1;
+        }
+        if !w.is_some_and(|w| {
+            w.is_active == m.is_active && w.timestamp == m.timestamp && w.last_used == m.last_used
+        }) {
+            changes += 1;
+        }
+    }
+    changes + (saved.len() - matched)
+}
+
+fn access_table_changes(state: &BotState, sf: &[UflagRecord], sc: &[UchanRecord]) -> usize {
+    let mut matched = 0;
+    let mut changes = 0;
+    for f in &state.uflag_records {
+        let w = sf.iter().find(|s| s.uuid == f.uuid);
+        if w.is_some() {
+            matched += 1;
+        }
+        if !w.is_some_and(|w| w.flags == f.flags && w.timestamp == f.timestamp) {
+            changes += 1;
+        }
+    }
+    changes += sf.len() - matched;
+    matched = 0;
+    for c in &state.uchan_records {
+        let w = sc
+            .iter()
+            .find(|s| s.uuid == c.uuid && eq_ic(&s.chan, &c.chan));
+        if w.is_some() {
+            matched += 1;
+        }
+        if !w.is_some_and(|w| w.is_active == c.is_active && w.timestamp == c.timestamp) {
+            changes += 1;
+        }
+    }
+    changes + (sc.len() - matched)
+}
+
+/// Counted after the parse (mask_table_changes); logged only when it changed.
+fn sync_mask_line(state: &mut BotState, data: &str, saved: &[MaskRecord]) {
     let first = data
         .find('|')
         .map(|p| &data[..p])
         .filter(|f| f.len() < 40)
         .unwrap_or("");
     if !has_uuid_dashes(first) {
-        return false;
+        return;
     }
     let f: Vec<&str> = data.splitn(5, '|').collect();
     if f.len() < 5 {
-        return false;
+        return;
     }
     let uuid = trunc_string(f[0], UUID_BUF);
     let mask = trunc_string(f[1], MAX_MASK_LEN);
@@ -1547,21 +1684,25 @@ fn sync_mask_line(state: &mut BotState, data: &str) -> bool {
         });
         mi = Some(state.mask_records.len() - 1);
     }
-    let Some(mi) = mi else { return false };
+    let Some(mi) = mi else { return };
     let m = &mut state.mask_records[mi];
     if !lww_accepts(ts, is_active, m.timestamp, m.is_active) {
-        return false;
+        return;
     }
     m.is_active = is_active;
     if last_used > m.last_used {
         m.last_used = last_used;
     }
     m.timestamp = ts;
-    logm!(state, L_INFO, "[HUB] Synced mask {} ({})\n", mask, act);
-    true
+    if !saved_mask_find(saved, &uuid, &mask)
+        .is_some_and(|w| w.is_active == is_active && w.timestamp == ts)
+    {
+        logm!(state, L_INFO, "[HUB] Synced mask {} ({})\n", mask, act);
+    }
 }
 
-fn sync_user_line(state: &mut BotState, typ: char, data: &str) -> bool {
+/// Counted after the parse (user_table_changes); logged only when it changed.
+fn sync_user_line(state: &mut BotState, typ: char, data: &str, saved: &[UserRecord]) {
     let Some(ul) = config::parse_user_line(data) else {
         logm!(
             state,
@@ -1569,7 +1710,7 @@ fn sync_user_line(state: &mut BotState, typ: char, data: &str) -> bool {
             "[HUB-SYNC] Malformed {}| record ignored\n",
             typ
         );
-        return false;
+        return;
     };
     let mut ui = state.user_records.iter().position(|u| u.uuid == ul.uuid);
     if ui.is_none() && state.user_records.len() < MAX_USER_RECORDS {
@@ -1580,10 +1721,10 @@ fn sync_user_line(state: &mut BotState, typ: char, data: &str) -> bool {
         });
         ui = Some(state.user_records.len() - 1);
     }
-    let Some(ui) = ui else { return false };
+    let Some(ui) = ui else { return };
     let u = &mut state.user_records[ui];
     if !lww_accepts(ul.timestamp, ul.is_active, u.timestamp, u.is_active) {
-        return false;
+        return;
     }
     u.name = ul.name.clone();
     // The hub is authoritative for the key too: keyless stays keyless.
@@ -1595,6 +1736,9 @@ fn sync_user_line(state: &mut BotState, typ: char, data: &str) -> bool {
         u.last_seen = ul.last_seen;
     }
     u.timestamp = ul.timestamp;
+    if saved_user_find(saved, &ul.uuid).is_some_and(|w| user_rec_same(w, &state.user_records[ui])) {
+        return;
+    }
     logm!(
         state,
         L_INFO,
@@ -1604,7 +1748,6 @@ fn sync_user_line(state: &mut BotState, typ: char, data: &str) -> bool {
         if ul.is_active { "add" } else { "del" },
         if ul.has_pubkey { "" } else { ", no key" }
     );
-    true
 }
 
 fn sync_bot_line(state: &mut BotState, data: &str, listed: &mut Vec<String>) -> bool {
@@ -1646,10 +1789,11 @@ fn sync_bot_line(state: &mut BotState, data: &str, listed: &mut Vec<String>) -> 
             let ex = &state.trusted_bots[ei];
             let key_is_new = inb.has_pub && (!ex.has_pub || ex.pub_key != inb.pub_key);
             // ts = max(hostmask ts, key ts) on the hub, so a rekey alone
-            // bumps it; the tie case covers a keyless legacy line first.
+            // bumps it; the tie case takes a key that arrived after a keyless
+            // line under the same hostmask ts.
             if inb.ts > ex.ts || (inb.ts == ex.ts && key_is_new) {
                 if !inb.has_pub && ex.has_pub && ex.uuid == inb.uuid {
-                    // Legacy-shaped line (hub has not seen our v|2): keep ours.
+                    // A keyless line for a bot whose key we hold: keep the key.
                     inb.has_pub = true;
                     inb.pub_key = ex.pub_key;
                 }
@@ -1710,6 +1854,8 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
     }
     let saved_users = state.user_records.clone();
     let saved_masks = state.mask_records.clone();
+    let saved_uflags = state.uflag_records.clone();
+    let saved_uchans = state.uchan_records.clone();
     if has_user_lines {
         state.user_records.clear();
     }
@@ -1741,15 +1887,14 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
             .strip_prefix("uf|")
             .or_else(|| line.strip_prefix("uc|"))
         {
-            match access::ingest(state, line.as_bytes()[1] as char, body, false) {
-                None => logm!(
+            // counted against the saved tables after the parse
+            if access::ingest(state, line.as_bytes()[1] as char, body, false).is_none() {
+                logm!(
                     state,
                     L_DEBUG,
                     "[HUB-SYNC] Malformed {}| record ignored\n",
                     &line[..2]
-                ),
-                Some(true) => updates += 1,
-                Some(false) => {}
+                );
             }
             continue;
         }
@@ -1760,7 +1905,20 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
         let data = &line[2..];
         let applied = match b[0] {
             b'c' => sync_channel_line(state, data),
-            b'm' => sync_mask_line(state, data),
+            b'm' => {
+                sync_mask_line(state, data, &saved_masks);
+                false
+            }
+            // K|: what the bots saw on IRC.  Never existence:
+            // channel::learned_ingest takes it only for a channel managed
+            // here.
+            b'K' => {
+                let ok = channel::learned_ingest(state, data);
+                if ok {
+                    logm!(state, L_DEBUG, "[HUB-SYNC] Learned channel state updated\n");
+                }
+                ok
+            }
             // modes.md records.  Each is bounded and validated in chancfg.rs;
             // a line that does not parse is dropped, one this build cannot
             // use is kept.
@@ -1785,7 +1943,10 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
                 }
                 ok
             }
-            b'a' | b'o' => sync_user_line(state, b[0] as char, data),
+            b'a' | b'o' => {
+                sync_user_line(state, b[0] as char, data, &saved_users);
+                false
+            }
             b'O' => match config::parse_opt_line(data) {
                 Some((flags, ts))
                     if opt_accepts(ts, &flags, state.opt_flags_ts, &state.opt_flags) =>
@@ -1802,10 +1963,6 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
                 }
                 _ => false,
             },
-            b'p' => {
-                logm!(state, L_DEBUG, "[HUB-SYNC] Ignored retired p| line\n");
-                false
-            }
             b'b' => sync_bot_line(state, data, &mut listed),
             b'T' => false, // end of the complete trusted-bot list: swept below
             other => {
@@ -1849,30 +2006,31 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
     }
 
     // Flags / bindings of users this payload dropped go; a user it brought
-    // without any (an older hub, an older bot's +admin / +oper) gets what it
-    // could do before flags (access::migrate).
+    // without any gets what it could do before flags (access::migrate).
     access::prune(state);
-    if access::migrate(state) > 0 {
-        updates += 1;
-    }
+    access::migrate(state);
 
-    // Keep locally newer last_seen / last_used (auths not yet pushed).
+    // Keep locally newer last_seen / last_used (auths not yet pushed), and
+    // the runtime-only fields the rebuild zeroed: an unsent CMD_ACTIVITY
+    // time and the ~A2K rate limit.
     for u in &mut state.user_records {
-        if let Some(s) = saved_users.iter().find(|s| s.uuid == u.uuid)
-            && s.last_seen > u.last_seen
-        {
-            u.last_seen = s.last_seen;
+        if let Some(s) = saved_user_find(&saved_users, &u.uuid) {
+            u.last_seen = u.last_seen.max(s.last_seen);
+            u.act_pending = s.act_pending;
+            u.last_auth_reply = s.last_auth_reply;
         }
     }
     for m in &mut state.mask_records {
-        if let Some(s) = saved_masks
-            .iter()
-            .find(|s| s.uuid == m.uuid && eq_ic(&s.mask, &m.mask))
-            && s.last_used > m.last_used
-        {
-            m.last_used = s.last_used;
+        if let Some(s) = saved_mask_find(&saved_masks, &m.uuid, &m.mask) {
+            m.last_used = m.last_used.max(s.last_used);
+            m.act_pending = s.act_pending;
         }
     }
+
+    // Only what differs from before the replace is an update.
+    updates += user_table_changes(state, &saved_users);
+    updates += mask_table_changes(state, &saved_masks);
+    updates += access_table_changes(state, &saved_uflags, &saved_uchans);
 
     if updates > 0 {
         logm!(
@@ -2157,8 +2315,8 @@ fn user_chan_result(state: &mut BotState, payload: &str) {
     );
 }
 
-/// Requests the hub never answered (an older hub ignores the frame): ask
-/// the trusted bots directly instead, once.  C `hub_client_user_chan_tick`.
+/// Requests the hub never answered (the link dropped, or the elected bot
+/// never reported): ask the trusted bots directly instead, once.  C `hub_client_user_chan_tick`.
 pub fn user_chan_tick(state: &mut BotState) {
     let now = crate::cstr::now();
     let (due, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut state.user_chan_pending)
@@ -2220,7 +2378,9 @@ fn handle_response(state: &mut BotState, cmd: u8, payload: &str) {
             let nick = crate::cstr::mask_nick(hostmask, MAX_NICK).to_string();
             match channel::find(state, chan) {
                 Some(ci) if state.chans[ci].status == ChanStatus::In => {
-                    if state.chans[ci].i_am_opped {
+                    if op_grant_bitch_refuses(state, ci, &nick) {
+                        // logged; not held either
+                    } else if state.chans[ci].i_am_opped {
                         logm!(
                             state,
                             L_INFO,
@@ -2815,7 +2975,6 @@ fn retire(state: &mut BotState) {
     ok = retire_wipe_file(&format!("{CONFIG_FILE}.tmp")) && ok;
     ok = retire_wipe_file(&format!("{CONFIG_FILE}{UPGRADE_PREV_SUFFIX}")) && ok;
     ok = retire_wipe_file(PASS_FILE) && ok;
-    ok = retire_wipe_file(PASS_PREV_FILE) && ok;
     if !ok {
         logm!(
             state,
@@ -2875,7 +3034,7 @@ fn handle_ack(state: &mut BotState, body: &[u8]) {
     // Activity reports held while the hub was unreachable.
     send_activity(state);
     if state.admin_delta_pending {
-        // After the config push, so the hub already knows v|2.
+        // After the config push, so the hub already knows our v|.
         logm!(
             state,
             L_INFO,

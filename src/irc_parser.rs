@@ -3,7 +3,7 @@
 use crate::botflood::{self, Bf};
 use crate::consts::*;
 use crate::cstr::{Tok, eq_ic, now, starts_with_ic, trunc, trunc_string};
-use crate::state::{BotState, ChanReq, ChanStatus, M_I, M_K, RosterEntry, S_AUTHED, lww_next_ts};
+use crate::state::{BotState, ChanReq, ChanStatus, M_I, M_K, RosterEntry, S_AUTHED};
 use crate::{
     auth, bot_comms, chanenf, chanflood, chanlive, channel, commands, crypto, dcc, hub_client,
     irc_client, ircf, logm,
@@ -39,10 +39,15 @@ fn find_uuid_for_helper(state: &BotState, helper: &RosterEntry) -> Option<String
 
 /// MODE on a channel: our own op state (with immediate re-read on deop),
 /// roster op flags, the key and +i.
-fn handle_mode_change(state: &mut BotState, channel: &str, modes: &str, args: &str) {
+/// True when a managed channel's learned key / +k+i changed (K|, to be
+/// pushed).
+fn handle_mode_change(state: &mut BotState, channel: &str, modes: &str, args: &str) -> bool {
     let Some(ci) = channel::find(state, channel) else {
-        return;
+        return false;
     };
+    // What this MODE shows of the key and +k/+i: learned (K|) at the end.
+    let mut seen_key = zeroize::Zeroizing::new(state.chans[ci].key.clone());
+    let mut seen_modes = state.chans[ci].modes;
     // Live modes, key, limit, ban list and halfop/voice flags (chanlive.rs).
     // The C copy of the arguments exists because its tokeniser works in
     // place; here a copy is not needed, but the same 1024-byte bound holds.
@@ -115,18 +120,17 @@ fn handle_mode_change(state: &mut BotState, channel: &str, modes: &str, args: &s
                 current_arg = toks.next(" ");
             }
             'k' => {
-                let c = &mut state.chans[ci];
                 if key_managed {
                     // the mode job puts the stored key back; learn nothing
                 } else if adding {
                     if let Some(arg) = current_arg {
-                        c.key = trunc_string(arg, MAX_KEY);
-                        c.modes |= M_K;
+                        *seen_key = trunc_string(arg, MAX_KEY);
+                        seen_modes |= M_K;
                     }
                 } else {
                     // -k clears the key regardless of its argument.
-                    c.key.clear();
-                    c.modes &= !M_K;
+                    seen_key.clear();
+                    seen_modes &= !M_K;
                 }
                 if current_arg.is_some() {
                     current_arg = toks.next(" ");
@@ -139,16 +143,19 @@ fn handle_mode_change(state: &mut BotState, channel: &str, modes: &str, args: &s
                 }
             }
             'i' => {
-                let c = &mut state.chans[ci];
                 if adding {
-                    c.modes |= M_I;
+                    seen_modes |= M_I;
                 } else {
-                    c.modes &= !M_I;
+                    seen_modes &= !M_I;
                 }
             }
             _ => {}
         }
     }
+    // Learned, never existence: the c| stamp stays, so a delete this MODE
+    // races is not undone (an unmanaged channel learns nothing).
+    let c = &mut state.chans[ci];
+    c.is_managed && channel::learn(c, &seen_key, seen_modes)
 }
 
 /// Record our own hostmask -- only ever from our 352 entry or our JOIN
@@ -480,20 +487,16 @@ fn on_mode(state: &mut BotState, prefix: Option<&str>, params: &str) {
     if !(target.starts_with('#') || target.starts_with('&')) {
         return;
     }
-    handle_mode_change(state, target, modes, args);
+    let learned = handle_mode_change(state, target, modes, args);
     // The enforcement pass sees the same arguments; an oversized set is
     // skipped (fail closed).
     if args.len() < 1024 {
         chanenf::on_mode(state, target, prefix, modes, args);
     }
-    // Key / invite-only changes go to the hub, and to our own config: with no
-    // hub to echo them back, a key we learned and saved must not outlive a -k.
-    if (modes.contains('k') || modes.contains('i'))
-        && let Some(ci) = channel::find(state, target).filter(|&ci| {
-            state.chans[ci].is_managed && (modes.contains('i') || !chanenf::key_managed(state, ci))
-        })
-    {
-        state.chans[ci].timestamp = lww_next_ts(state.chans[ci].timestamp);
+    // Key / invite-only changes go to the hub (K|), and to our own config:
+    // with no hub to echo them back, a key we learned and saved must not
+    // outlive a -k.
+    if learned && let Some(ci) = channel::find(state, target) {
         state.chans[ci].enf_pending = true; // cleared once a hub has it (D43)
         hub_client::push_channel(state, ci);
         crate::config::write_with_state_pass(state);

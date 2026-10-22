@@ -13,9 +13,7 @@ use zeroize::Zeroizing;
 
 use crate::consts::*;
 use crate::crypto;
-use crate::cstr::{
-    Scan, atoll, has_uuid_dashes, is_uuid, now, split_fields, strtoll, trunc, trunc_string,
-};
+use crate::cstr::{Scan, atoll, is_uuid, now, split_fields, strtoll, trunc_string};
 use crate::state::{
     BotState, ChanStatus, HubEntry, MaskRecord, TrustedBot, UserLine, UserRecord, lww_accepts,
 };
@@ -30,10 +28,9 @@ fn field_pubkey(f: &str) -> Option<String> {
 }
 
 /// a|/o| body codec (irchub/docs/passwordless.md 3.1):
-///   new     uuid|name|pubkey|add/del|last_seen|ts|<reserved, empty>
-///   legacy  uuid|name|password|add/del|last_seen|ts[|pubkey]
-/// Field 3 decides: a valid key there means the new format; anything else is
-/// a legacy password, never copied anywhere, and the key (if any) is field 7.
+///   uuid|name|pubkey|add/del|last_seen|ts|<reserved, empty>
+/// pubkey may be empty (a user not given a key yet); anything else that is
+/// not a valid key refuses the line.
 pub fn parse_user_line(data: &str) -> Option<UserLine> {
     let f = split_fields(data, 8);
     if f.len() < 6 || !is_uuid(f[0]) {
@@ -47,15 +44,9 @@ pub fn parse_user_line(data: &str) -> Option<UserLine> {
         name: f[1].to_string(),
         ..UserLine::default()
     };
-    if let Some(k) = field_pubkey(f[2]) {
-        out.pubkey_b64 = k;
+    if !f[2].is_empty() {
+        out.pubkey_b64 = field_pubkey(f[2])?;
         out.has_pubkey = true;
-    } else {
-        out.legacy = true;
-        if let Some(k) = f.get(6).and_then(|x| field_pubkey(x)) {
-            out.pubkey_b64 = k;
-            out.has_pubkey = true;
-        }
     }
     out.is_active = f[3] == "add";
     out.last_seen = atoll(f[4]);
@@ -82,33 +73,21 @@ pub fn format_user_line(u: &UserRecord) -> String {
 }
 
 /// b| body codec (passwordless.md 3.2):
-///   new     mask|uuid|pubkey|ts       (pubkey may be empty)
-///   legacy  mask|uuid|ts
-///   bare    mask                       (hand-typed; no uuid, no key)
+///   mask|uuid|pubkey|ts       (pubkey may be empty)
 /// Oversized fields are refused rather than truncated.
 pub fn parse_bot_line(data: &str) -> Option<TrustedBot> {
     let f = split_fields(data, 5);
-    if f[0].is_empty() || f[0].len() >= MAX_MASK_LEN {
+    if f.len() < 4 || f[0].is_empty() || f[0].len() >= MAX_MASK_LEN {
         return None;
     }
     let mut out = TrustedBot {
         mask: f[0].to_string(),
         ..TrustedBot::default()
     };
-    if f.len() == 1 {
-        return Some(out);
-    }
     if f[1].len() >= UUID_BUF {
         return None;
     }
     out.uuid = f[1].to_string();
-    if f.len() == 2 {
-        return Some(out);
-    }
-    if f.len() == 3 {
-        out.ts = atoll(f[2]);
-        return Some(out);
-    }
     if !f[2].is_empty()
         && let Some(k) = field_pubkey(f[2]).and_then(|b| crypto::pubkey_b64_decode(&b))
     {
@@ -226,14 +205,8 @@ fn parse_cfg_chan(data: &str) -> Option<(String, String, String, i64)> {
     (parsed >= 2).then_some((chan, key, op, ts))
 }
 
-/// Read and decrypt the config file; returns the plaintext and, when an older
-/// key had to be used, which one (PBKDF2 at the pre-2.5.0 count, or the
-/// pre-PBKDF2 EVP_BytesToKey key) for the one-time rewrite.
-fn decrypt_file(
-    state: &BotState,
-    password: &str,
-    filename: &str,
-) -> Option<(Zeroizing<Vec<u8>>, Option<&'static str>)> {
+/// Read and decrypt the config file (PBKDF2_ITERATIONS only).
+fn decrypt_file(state: &BotState, password: &str, filename: &str) -> Option<Zeroizing<Vec<u8>>> {
     let mut f = fs::File::open(filename).ok()?;
     let mut data = Vec::new();
     if f.read_to_end(&mut data).is_err() {
@@ -266,22 +239,12 @@ fn decrypt_file(
     }
     let key = crypto::derive_config_key(password.as_bytes(), salt, PBKDF2_ITERATIONS);
     if let Some(pt) = crypto::gcm_decrypt_detached(key.as_ref(), iv, &[], ct, tag) {
-        return Some((pt, None));
-    }
-    // Configs written under the pre-2.5.0 PBKDF2 count, or before PBKDF2:
-    // migrate once.
-    let key = crypto::derive_config_key(password.as_bytes(), salt, PBKDF2_ITERATIONS_LEGACY);
-    if let Some(pt) = crypto::gcm_decrypt_detached(key.as_ref(), iv, &[], ct, tag) {
-        return Some((pt, Some("PBKDF2 100k")));
-    }
-    let legacy = crypto::legacy_config_key(password.as_bytes(), salt);
-    if let Some(pt) = crypto::gcm_decrypt_detached(legacy.as_ref(), iv, &[], ct, tag) {
-        return Some((pt, Some("EVP_BytesToKey")));
+        return Some(pt);
     }
     logm!(
         state,
         L_INFO,
-        "[CFG] Decryption failed (wrong password?).\n"
+        "[CFG] Decryption failed (wrong password, or a config written before 2.5.0: run 2.5.0 once).\n"
     );
     None
 }
@@ -305,16 +268,12 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
             );
         }
     }
-    let Some((plaintext, migrated_from_legacy)) = decrypt_file(state, password, filename) else {
+    let Some(plaintext) = decrypt_file(state, password, filename) else {
         return false;
     };
     let text = Zeroizing::new(String::from_utf8_lossy(&plaintext).into_owned());
     drop(plaintext);
 
-    let mut legacy_user_lines = 0;
-    let mut dropped_botpass = false;
-    // MIGRATE sentinel records carry the old oper mask in `name` until the
-    // migration pass below.
     for raw in text.split('\n') {
         let line = raw.strip_suffix('\r').unwrap_or(raw);
         let line = crate::cstr::until_nul(line);
@@ -362,20 +321,23 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
                         if c.timestamp == 0
                             || lww_accepts(eff_ts, is_add, c.timestamp, c.is_managed)
                         {
-                            c.key = trunc_string(&key, MAX_KEY);
+                            c.ckey = trunc_string(&key, MAX_KEY);
                             c.is_managed = is_add;
                             c.timestamp = eff_ts;
                             if !c.is_managed {
                                 c.status = ChanStatus::Out;
+                                channel::learned_forget(c);
                             }
+                            channel::key_refresh(c);
                         }
                     } else if let Some(ci) = channel::add(state, &chan) {
                         let c = &mut state.chans[ci];
                         if !key.is_empty() {
-                            c.key = trunc_string(&key, MAX_KEY);
+                            c.ckey = trunc_string(&key, MAX_KEY);
                         }
                         c.is_managed = is_add;
                         c.timestamp = eff_ts;
+                        channel::key_refresh(c);
                         // Don't join deleted channels
                         if !c.is_managed {
                             c.status = ChanStatus::Out;
@@ -386,6 +348,10 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
             b'C' => {
                 chancfg::apply_c_line(state, data);
             }
+            // K|#chan|key|modes|ts: learned on IRC, after its c| line
+            b'K' => {
+                channel::learned_ingest(state, data);
+            }
             b'B' => {
                 chancfg::apply_b_line(state, data);
             }
@@ -394,61 +360,28 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
                 if state.user_records.len() >= MAX_USER_RECORDS {
                     continue;
                 }
-                let f = split_fields(data, 5);
-                if is_uuid(f[0]) {
-                    let Some(ul) = parse_user_line(data) else {
-                        logm!(
-                            state,
-                            L_INFO,
-                            "[CFG] Malformed {}| record ignored.\n",
-                            typ as char
-                        );
-                        continue;
-                    };
-                    if ul.legacy {
-                        legacy_user_lines += 1;
-                    }
-                    state.user_records.push(UserRecord {
-                        uuid: ul.uuid,
-                        name: ul.name,
-                        pubkey_b64: ul.pubkey_b64,
-                        has_pubkey: ul.has_pubkey,
-                        typ: typ as char,
-                        is_active: ul.is_active,
-                        last_seen: ul.last_seen,
-                        timestamp: ul.timestamp,
-                        last_auth_reply: 0,
-                        act_pending: 0,
-                    });
-                } else {
-                    // Pre-UUID shapes, tagged for migration; their password is
-                    // never copied:  a|<password>|<ts>
-                    //                o|<mask>|<password>|<add/del>|<ts>
-                    let mut u = UserRecord {
-                        typ: typ as char,
-                        ..UserRecord::default()
-                    };
-                    if typ == b'a' {
-                        u.uuid = "MIGRATE".into();
-                        let ts = f.get(1).map_or(0, |x| atoll(x));
-                        u.is_active = true;
-                        u.timestamp = if ts > 0 { ts } else { now() };
-                    } else {
-                        if f.len() < 3 || f[0].is_empty() || f[0].len() >= MAX_MASK_LEN {
-                            continue;
-                        }
-                        u.uuid = "MIGRATE_O".into();
-                        u.name = f[0].to_string(); // the old mask, full length
-                        u.is_active = f[2] != "del";
-                        let ts = f.get(3).map_or(0, |x| atoll(x));
-                        u.timestamp = if ts > 0 { ts } else { now() };
-                    }
-                    state.user_records.push(u);
-                    legacy_user_lines += 1;
-                }
+                let Some(ul) = parse_user_line(data) else {
+                    logm!(
+                        state,
+                        L_INFO,
+                        "[CFG] Malformed {}| record ignored.\n",
+                        typ as char
+                    );
+                    continue;
+                };
+                state.user_records.push(UserRecord {
+                    uuid: ul.uuid,
+                    name: ul.name,
+                    pubkey_b64: ul.pubkey_b64,
+                    has_pubkey: ul.has_pubkey,
+                    typ: typ as char,
+                    is_active: ul.is_active,
+                    last_seen: ul.last_seen,
+                    timestamp: ul.timestamp,
+                    last_auth_reply: 0,
+                    act_pending: 0,
+                });
             }
-            // Retired shared bot password (p|<pass>|<ts>): dropped.
-            b'p' => dropped_botpass = true,
             b'b' => {
                 if state.trusted_bots.len() < MAX_TRUSTED_BOTS {
                     match parse_bot_line(data) {
@@ -481,19 +414,7 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
                 _ => logm!(
                     state,
                     L_INFO,
-                    "[CFG] Bot key in config is not a valid 64-byte Curve25519 key (legacy RSA?). Re-run 'ircbot -setup' to regenerate the bot's identity.\n"
-                ),
-            },
-            b'j' => match crypto::b64_decode(data) {
-                // Legacy single global hub pubkey; migrated into h| below.
-                Some(dec) if dec.len() == 32 => {
-                    state.hub_remote_ed_pub.copy_from_slice(&dec);
-                    state.hub_remote_ed_pub_set = true;
-                }
-                _ => logm!(
-                    state,
-                    L_INFO,
-                    "[CFG] Legacy 'j|' hub pubkey is not 32 raw bytes — ignored. Pin per-hub keys with '+hub <host:port> <pubkey>'.\n"
+                    "[CFG] Bot key in config is not a valid 64-byte Curve25519 key. Re-run 'ircbot -setup' to regenerate the bot's identity.\n"
                 ),
             },
             b'i' => state.bot_uuid = trunc_string(data, 64),
@@ -518,35 +439,6 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
         }
     }
     drop(text);
-
-    // A legacy j| key applies to every hub without its own pin.
-    if state.hub_remote_ed_pub_set {
-        let k = state.hub_remote_ed_pub;
-        for h in state.hubs.iter_mut().filter(|h| !h.ed_pub_set) {
-            h.ed_pub = k;
-            h.ed_pub_set = true;
-        }
-    }
-
-    let needs_migration = state
-        .user_records
-        .iter()
-        .any(|u| u.uuid.starts_with("MIGRATE"))
-        || state.mask_records.iter().any(|m| m.uuid == "MIGRATE");
-    if needs_migration {
-        migrate_legacy_records(state);
-    }
-    if let Some(was) =
-        migrated_from_legacy.filter(|_| !READ_ONLY.load(std::sync::atomic::Ordering::Relaxed))
-    {
-        logm!(
-            state,
-            L_INFO,
-            "[CFG] Config re-encrypted with PBKDF2 {}k (was {}).\n",
-            PBKDF2_ITERATIONS / 1000,
-            was
-        );
-    }
 
     // Identity key: a standalone config from before bots had keys gets one
     // minted here.  A hub-managed bot without one must re-run -setup.
@@ -596,22 +488,6 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
             );
         }
     }
-    if legacy_user_lines > 0 {
-        logm!(
-            state,
-            L_INFO,
-            "[CFG] Migrated {} password-era user record(s); passwords dropped.\n",
-            legacy_user_lines
-        );
-    }
-    if dropped_botpass {
-        logm!(
-            state,
-            L_INFO,
-            "[CFG] Dropped the retired bot password (p|); bots use public keys now.\n"
-        );
-    }
-
     // Flags / bindings: drop those with no user, then give every user that
     // has none what they could do before flags (admins +a, opers *).
     let access_before = state.uflag_records.len() + state.uchan_records.len();
@@ -621,13 +497,7 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
 
     // Rewrite once if anything above changed the on-disk shape — never from
     // `-selftest`, which only asks whether this build could read it.
-    if !READ_ONLY.load(std::sync::atomic::Ordering::Relaxed)
-        && (needs_migration
-            || migrated_from_legacy.is_some()
-            || legacy_user_lines > 0
-            || dropped_botpass
-            || identity_minted
-            || access_changed)
+    if !READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) && (identity_minted || access_changed)
     {
         write(state, password);
     }
@@ -643,54 +513,23 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
     true
 }
 
-/// m| line: new uuid|mask|add/del|last_used|ts, or old mask|add/del|ts
-/// (tagged MIGRATE).
+/// m| line: uuid|mask|add/del|last_used|ts.
 fn load_mask_line(state: &mut BotState, data: &str) {
     if state.mask_records.len() >= MAX_USER_MASKS {
         return;
     }
-    let first = data
-        .find('|')
-        .map(|p| &data[..p])
-        .filter(|f| f.len() < 40)
-        .unwrap_or("");
-    if has_uuid_dashes(first) {
-        let f: Vec<&str> = data.splitn(5, '|').collect();
-        if f.len() == 5 {
-            state.mask_records.push(MaskRecord {
-                uuid: trunc_string(f[0], UUID_BUF),
-                mask: trunc_string(f[1], MAX_MASK_LEN),
-                is_active: f[2].starts_with("add"),
-                last_used: atoll(f[3]),
-                timestamp: atoll(f[4]),
-                act_pending: 0,
-            });
-        }
-    } else {
-        let mut sc = Scan::new(data);
-        let Some(mask) = sc.set_not(255, b"|") else {
-            return;
-        };
-        if !sc.lit(b'|') {
-            return;
-        }
-        let Some(op) = sc.set_not(15, b"|") else {
-            return;
-        };
-        let ts = if sc.lit(b'|') {
-            sc.int().unwrap_or(0)
-        } else {
-            0
-        };
-        state.mask_records.push(MaskRecord {
-            uuid: "MIGRATE".into(),
-            mask: mask.to_string(),
-            is_active: op != "del",
-            last_used: 0,
-            timestamp: if ts > 0 { ts } else { now() },
-            act_pending: 0,
-        });
+    let f = split_fields(data, 5);
+    if f.len() < 5 || !is_uuid(f[0]) || f[1].is_empty() || f[1].len() >= MAX_MASK_LEN {
+        return;
     }
+    state.mask_records.push(MaskRecord {
+        uuid: f[0].to_string(),
+        mask: f[1].to_string(),
+        is_active: f[2] == "add",
+        last_used: atoll(f[3]),
+        timestamp: atoll(f[4]),
+        act_pending: 0,
+    });
 }
 
 /// h|<host:port>[|<pubkey_b64>]: the pin is the hub's Ed25519 key, 44-char
@@ -722,98 +561,6 @@ fn load_hub_line(state: &mut BotState, data: &str) {
     state.hubs.push(he);
 }
 
-/// Convert MIGRATE sentinel records (pre-UUID admin and oper lines) into
-/// UUID-keyed user and mask records.
-fn migrate_legacy_records(state: &mut BotState) {
-    let now = now();
-    let admin_uuid = crypto::gen_uuid_v4().unwrap_or_default();
-    let mut new_users: Vec<UserRecord> = Vec::new();
-    let mut new_masks: Vec<MaskRecord> = Vec::new();
-
-    if let Some(u) = state
-        .user_records
-        .iter()
-        .find(|u| u.uuid == "MIGRATE" && u.typ == 'a')
-    {
-        new_users.push(UserRecord {
-            uuid: admin_uuid.clone(),
-            name: "admin".into(),
-            typ: 'a',
-            is_active: true,
-            timestamp: if u.timestamp != 0 { u.timestamp } else { now },
-            ..UserRecord::default()
-        });
-    }
-    for m in state.mask_records.iter().filter(|m| m.uuid == "MIGRATE") {
-        if new_masks.len() >= MAX_USER_MASKS {
-            break;
-        }
-        new_masks.push(MaskRecord {
-            uuid: admin_uuid.clone(),
-            mask: m.mask.clone(),
-            is_active: m.is_active,
-            last_used: 0,
-            timestamp: m.timestamp,
-            act_pending: 0,
-        });
-    }
-    for (i, u) in state.user_records.iter().enumerate() {
-        if u.uuid != "MIGRATE_O" || new_users.len() >= MAX_USER_RECORDS {
-            continue;
-        }
-        let ouuid = crypto::gen_uuid_v4().unwrap_or_default();
-        // Name from the nick part of the old mask (held in `name`).
-        let derived = match u.name.find('!') {
-            Some(b) => trunc_string(&u.name[..b], USER_NAME_BUF),
-            None => format!("oper{i}"),
-        };
-        let mut try_name = derived.clone();
-        let mut suffix = 2;
-        while new_users.iter().any(|n| n.name == try_name) {
-            // Room for "_<suffix>" so a long name cannot push it out.
-            try_name = format!("{}_{}", trunc(&derived, USER_NAME_BUF - 11), suffix);
-            suffix += 1;
-        }
-        let ts = if u.timestamp != 0 { u.timestamp } else { now };
-        new_users.push(UserRecord {
-            uuid: ouuid.clone(),
-            name: try_name,
-            typ: 'o',
-            is_active: u.is_active,
-            timestamp: ts,
-            ..UserRecord::default()
-        });
-        if new_masks.len() < MAX_USER_MASKS {
-            new_masks.push(MaskRecord {
-                uuid: ouuid,
-                mask: trunc_string(&u.name, MAX_MASK_LEN),
-                is_active: u.is_active,
-                last_used: 0,
-                timestamp: ts,
-                act_pending: 0,
-            });
-        }
-    }
-    for u in state
-        .user_records
-        .iter()
-        .filter(|u| !u.uuid.starts_with("MIGRATE"))
-    {
-        if new_users.len() >= MAX_USER_RECORDS {
-            break;
-        }
-        new_users.push(u.clone());
-    }
-    for m in state.mask_records.iter().filter(|m| m.uuid != "MIGRATE") {
-        if new_masks.len() >= MAX_USER_MASKS {
-            break;
-        }
-        new_masks.push(m.clone());
-    }
-    state.user_records = new_users;
-    state.mask_records = new_masks;
-}
-
 /// Serialize the state.  None if the result would exceed MAX_CONFIG_SIZE
 /// (a truncated write would silently drop records).
 fn serialize(state: &BotState) -> Option<Zeroizing<String>> {
@@ -832,10 +579,14 @@ fn serialize(state: &BotState) -> Option<Zeroizing<String>> {
         push(&format!(
             "c|{}|{}|{}|{}\n",
             c.name,
-            c.key,
+            c.ckey,
             if c.is_managed { "add" } else { "del" },
             c.timestamp
         ));
+    }
+    // K|: what this bot saw on IRC, after every c| it needs at load.
+    for c in state.chans.iter().filter(|c| c.is_managed && c.l_ts > 0) {
+        push(&channel::format_k(c));
     }
     // modes.md records: per-channel settings, network defaults, bans.  Raw
     // settings text goes back out unchanged, unknown names included.
@@ -881,7 +632,7 @@ fn serialize(state: &BotState) -> Option<Zeroizing<String>> {
     if !state.vhost.is_empty() {
         push(&format!("v|{}\n", state.vhost));
     }
-    // Per-hub pins; the legacy global j| line is no longer written.
+    // Per-hub pins.
     for h in &state.hubs {
         if h.ed_pub_set {
             push(&format!("h|{}|{}\n", h.addr, crypto::b64_encode(&h.ed_pub)));
@@ -1000,24 +751,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn user_line_new_and_legacy() {
+    fn user_line_codec() {
         let (_, p) = crypto::generate_combined_keypair().unwrap();
         let k = crypto::b64_encode(&p);
         let uuid = "12345678-1234-4234-8234-123456789abc";
         let ul = parse_user_line(&format!("{uuid}|bob|{k}|add|5|6|")).unwrap();
-        assert!(ul.has_pubkey && !ul.legacy && ul.is_active);
+        assert!(ul.has_pubkey && ul.is_active);
         assert_eq!((ul.last_seen, ul.timestamp), (5, 6));
-        let ul = parse_user_line(&format!("{uuid}|bob|secret|del|0|9|{k}")).unwrap();
-        assert!(ul.legacy && ul.has_pubkey && !ul.is_active);
+        let ul = parse_user_line(&format!("{uuid}|bob||del|0|9|")).unwrap();
+        assert!(!ul.has_pubkey && !ul.is_active);
+        // the password-era shape (field 3 not a key) is refused
+        assert!(parse_user_line(&format!("{uuid}|bob|secret|del|0|9|{k}")).is_none());
         assert!(parse_user_line("nope|bob|x|add|0|0").is_none());
     }
 
     #[test]
     fn bot_line_shapes() {
-        let tb = parse_bot_line("n!u@h").unwrap();
-        assert!(tb.uuid.is_empty());
-        let tb = parse_bot_line("n!u@h|uuid|42").unwrap();
-        assert_eq!(tb.ts, 42);
+        // only mask|uuid|pubkey|ts: the bare and three-field shapes are gone
+        assert!(parse_bot_line("n!u@h").is_none());
+        assert!(parse_bot_line("n!u@h|uuid|42").is_none());
+        let tb = parse_bot_line("n!u@h|uuid||42").unwrap();
+        assert!(!tb.has_pub && tb.ts == 42);
         let (_, p) = crypto::generate_combined_keypair().unwrap();
         let tb = parse_bot_line(&format!("n!u@h|uuid|{}|7", crypto::b64_encode(&p))).unwrap();
         assert!(tb.has_pub && tb.ts == 7);

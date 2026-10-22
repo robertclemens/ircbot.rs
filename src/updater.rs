@@ -251,56 +251,84 @@ fn download(url: &str, path: &str) -> bool {
     std::io::copy(&mut reader, &mut f).is_ok() && f.flush().is_ok()
 }
 
-/// Fetch the manifest and its signature and verify one against the other.
-/// A non-empty IRCBOT_UPDATE_BASE repoints the updater at a local
-/// ircbot-releases tree (the sandboxed testnet uses a file:// base with no
-/// outbound network).  Signature + SHA-256 verification stay active; only the
-/// github/https host allow-list in validate_url() is relaxed for this base.
-fn update_base() -> Option<String> {
-    if let Ok(b) = HUB_UPDATE_BASE.read()
-        && !b.is_empty()
-    {
-        return Some(b.clone());
-    }
+/// Test hook, compiled in only with the `test-hooks` feature (the testnet's
+/// builds; never a release): a non-empty IRCBOT_UPDATE_BASE overrides the
+/// compiled release ROOT (`BOT_UPDATE_BASE`) so the sandbox can read a local
+/// ircbot-releases tree over file://, and IRCBOT_UPDATE_PUBKEY then names the
+/// throwaway key that signs it.  A production binary has no code that reads
+/// either: its root and key are the compiled-in ones, so nobody who can set
+/// the daemon's environment can point it at their own signed releases.
+/// Nothing a hub sends can set or move the root either.
+#[cfg(feature = "test-hooks")]
+fn env_root() -> Option<String> {
     std::env::var("IRCBOT_UPDATE_BASE")
         .ok()
         .filter(|s| !s.is_empty())
 }
 
-/// The release base the hub named at CMD_UPGRADE_PREPARE time.  The C twin
-/// puts it in the environment (setenv); `#![forbid(unsafe_code)]` rules that
-/// out here, so it lives in a process-global that update_base() consults
-/// ahead of the env var.  Same effect, same verification: only the
-/// github/https host allow-list is relaxed, never the signature or hash.
-static HUB_UPDATE_BASE: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+#[cfg(not(feature = "test-hooks"))]
+fn env_root() -> Option<String> {
+    None
+}
 
-fn set_hub_update_base(base: &str) -> bool {
-    match HUB_UPDATE_BASE.write() {
+#[cfg(feature = "test-hooks")]
+fn env_pubkey() -> Option<String> {
+    env_root()?;
+    std::env::var("IRCBOT_UPDATE_PUBKEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn env_pubkey() -> Option<String> {
+    None
+}
+
+fn update_root() -> String {
+    env_root().unwrap_or_else(|| BOT_UPDATE_BASE.to_string())
+}
+
+/// The release tree `<root>/<variant>` the next manifest read uses; empty =
+/// this build's own variant.  A hub-driven run or -checkupdate names the
+/// variant (set_tree); the root is never the hub's to choose.
+static UPDATE_TREE: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+
+fn set_tree(variant: &str) -> bool {
+    if variant.is_empty()
+        || variant.len() > 7
+        || variant.contains(['/', ';', '|', '&', '`', '$', ' ', '\t', '\r', '\n'])
+    {
+        return false;
+    }
+    match UPDATE_TREE.write() {
         Ok(mut slot) => {
-            slot.clear();
-            slot.push_str(base);
+            *slot = format!("{}/{variant}", update_root());
             true
         }
         Err(_) => false,
     }
 }
 
+fn update_tree() -> String {
+    match UPDATE_TREE.read() {
+        Ok(t) if !t.is_empty() => t.clone(),
+        _ => format!("{}/{}", update_root(), host_variant()),
+    }
+}
+
 fn fetch_verified_manifest() -> Result<String, &'static str> {
-    let base = update_base();
-    // Test key honored only alongside the local-source override (sandbox).
-    let pubkey_b64: String = match (&base, std::env::var("IRCBOT_UPDATE_PUBKEY")) {
-        (Some(_), Ok(k)) if !k.is_empty() => k,
-        _ => BOT_UPDATE_PUBKEY_B64.to_string(),
-    };
+    // Pinned key; only a test-hooks build takes a throwaway one (env_pubkey).
+    let pubkey_b64 = env_pubkey().unwrap_or_else(|| BOT_UPDATE_PUBKEY_B64.to_string());
     if pubkey_b64.is_empty() {
         return Err("self-updater disabled (no signing key configured)");
     }
     let pk = crypto::update_pubkey_b64_decode(&pubkey_b64)
         .ok_or("configured update public key is malformed")?;
-    let (man_url, sig_url) = match &base {
-        Some(b) => (format!("{b}/releases.txt"), format!("{b}/releases.sig")),
-        None => (BOT_UPDATE_URL.to_string(), BOT_UPDATE_SIG_URL.to_string()),
-    };
+    let tree = update_tree();
+    let (man_url, sig_url) = (
+        format!("{tree}/releases.txt"),
+        format!("{tree}/releases.sig"),
+    );
     let man = fetch(&man_url, MAX_MANIFEST).ok_or("failed to download release manifest")?;
     let sig = fetch(&sig_url, MAX_MANIFEST)
         .ok_or("failed to download release signature (releases.txt.sig)")?;
@@ -372,11 +400,11 @@ pub fn check_cli(variant: Option<&str>) -> i32 {
         println!("checkupdate: FAIL malformed variant");
         return 1;
     }
-    if update_base().is_none() && !set_hub_update_base(&format!("{BOT_UPDATE_BASE}/{want}")) {
+    if !set_tree(want) {
         println!("checkupdate: FAIL could not record the release base");
         return 1;
     }
-    let base = update_base().unwrap_or_default();
+    let base = update_tree();
     let manifest = match fetch_verified_manifest() {
         Ok(m) => m,
         Err(e) => {
@@ -469,7 +497,7 @@ fn validate_url(url: &str) -> bool {
     if url.contains([';', '|', '&', '`', '$']) {
         return false;
     }
-    if let Some(b) = update_base()
+    if let Some(b) = env_root()
         && url.starts_with(&b)
     {
         return true;
@@ -959,7 +987,7 @@ pub fn marker_write(upgrade_id: &str, target_ver: &str, variant: &str, ops: &[St
 pub struct PendingUpgrade {
     pub id: String,
     pub version: String,
-    /// "" when an older build wrote a two-field line 1.
+    /// May be empty.
     pub variant: String,
     /// Channels opped in before the restart (line 2); empty when absent.
     pub ops: Vec<String>,
@@ -1042,15 +1070,15 @@ fn cpu_missing<'a>(
 /// A PREPARE refused because this CPU cannot run the wanted build: say so,
 /// and when the OTHER build of the same version fits, say that too.  Never
 /// switches — the admin decides (=c / =rs).
-fn other_variant_hint(why: String, target_ver: &str, want_variant: &str, base: &str) -> String {
+fn other_variant_hint(why: String, target_ver: &str, want_variant: &str) -> String {
     let other = if want_variant == "c" { "rs" } else { "c" };
-    let fits = hub_set_tree(base, other).is_ok() && {
+    let fits = hub_set_tree(other).is_ok() && {
         QUICK_FETCH.store(true, std::sync::atomic::Ordering::Relaxed);
         let m = fetch_verified_manifest();
         QUICK_FETCH.store(false, std::sync::atomic::Ordering::Relaxed);
         m.is_ok_and(|m| manifest_select(&m, target_ver, other).is_ok())
     };
-    let _ = hub_set_tree(base, want_variant);
+    let _ = hub_set_tree(want_variant);
     if fits {
         format!("{why} — the {other} build fits: select this node with ={other}")
     } else {
@@ -1164,16 +1192,6 @@ pub fn hub_rollback(state: &mut BotState, reason: &str) -> bool {
             prev_cfg
         );
     }
-    // The pre-2.5.0 pass file, only if this process rewrote it (the old build
-    // cannot read the new one).
-    if state.pass_prev_saved && std::fs::rename(PASS_PREV_FILE, PASS_FILE).is_err() {
-        logm!(
-            state,
-            L_INFO,
-            "[UPGRADE] Could not restore {}; keeping the current one\n",
-            PASS_PREV_FILE
-        );
-    }
     if std::fs::rename(&prev_exe, &exe).is_err() {
         logm!(state, L_INFO, "[UPGRADE] Could not restore {}\n", prev_exe);
         return false;
@@ -1241,21 +1259,13 @@ fn hub_local_check(
 }
 
 /// Point the updater at the tree a hub-driven run names: <root>/<variant>.
-fn hub_set_tree(base: &str, want_variant: &str) -> Result<(), String> {
-    // The hub names the release tree ROOT; the variant picks the subtree.
-    // That is what lets one network-wide run leave each node on its own kind
-    // of build — and lets an admin move a node from the Rust build to the C
-    // one by naming the other variant.
-    let root = if base.is_empty() {
-        BOT_UPDATE_BASE
-    } else {
-        base
-    };
-    if root.len() >= 512 || root.contains([';', '|', '&', '`', '$', ' ', '\t', '\r', '\n']) {
-        return Err("rejected malformed manifest base from hub".to_string());
-    }
-    if !set_hub_update_base(&format!("{root}/{want_variant}")) {
-        return Err("could not record the hub's manifest base".to_string());
+/// The run picks only the variant — that is what lets one network-wide run
+/// leave each node on its own kind of build, and lets an admin move a node
+/// from the Rust build to the C one.  The root is this build's own (or the
+/// operator's env override): the only tree its pinned key can verify.
+fn hub_set_tree(want_variant: &str) -> Result<(), String> {
+    if !set_tree(want_variant) {
+        return Err("rejected malformed release variant".to_string());
     }
     Ok(())
 }
@@ -1271,7 +1281,6 @@ pub fn hub_prepare_check(
     target_ver: &str,
     variant: &str,
     min_from: &str,
-    base: &str,
 ) -> Result<(), String> {
     let want_variant = if variant.is_empty() {
         host_variant()
@@ -1281,12 +1290,12 @@ pub fn hub_prepare_check(
     hub_local_check(state, target_ver, want_variant, min_from)?;
     // A local (file://) tree needs no TLS; anything else does, and on a CPU
     // graviola cannot run on the fetch itself would kill the bot.
-    if file_url_path(base).is_none()
+    if file_url_path(&update_root()).is_none()
         && let Some(why) = tls_unusable_reason()
     {
         return Err(why);
     }
-    hub_set_tree(base, want_variant)?;
+    hub_set_tree(want_variant)?;
     QUICK_FETCH.store(true, std::sync::atomic::Ordering::Relaxed);
     let manifest = fetch_verified_manifest();
     QUICK_FETCH.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1297,7 +1306,7 @@ pub fn hub_prepare_check(
     ) {
         Ok(row) => row,
         Err(why) if why.starts_with("this CPU lacks ") => {
-            return Err(other_variant_hint(why, target_ver, want_variant, base));
+            return Err(other_variant_hint(why, target_ver, want_variant));
         }
         Err(why) => return Err(why),
     };
@@ -1317,24 +1326,19 @@ pub fn hub_commit(
     upgrade_id: &str,
     target_ver: &str,
     variant: &str,
-    base: &str,
 ) -> Result<(), String> {
-    // The hub may point us at a different release base than the compiled-in
-    // one (the testnet serves a local ircbot-releases tree).  It travels the
-    // same path as the operator-set env var, so signature and hash checks are
-    // unchanged — see update_base().
     let want_variant = if variant.is_empty() {
         host_variant()
     } else {
         variant
     };
     hub_local_check(state, target_ver, want_variant, "")?;
-    if file_url_path(base).is_none()
+    if file_url_path(&update_root()).is_none()
         && let Some(why) = tls_unusable_reason()
     {
         return Err(why);
     }
-    hub_set_tree(base, want_variant)?;
+    hub_set_tree(want_variant)?;
     logm!(
         state,
         L_INFO,
@@ -1381,11 +1385,14 @@ pub fn hub_commit(
     }
     // Run the new build's own -selftest BEFORE anything is renamed: a build
     // that cannot run here (a CPU it needs, a library, a config it cannot
-    // read) is refused with nothing touched.  Only a build new enough to know
-    // the flag is asked — an older one would start a second daemon instead.
-    if eq_ic(&row.kind, "bin")
-        && version_cmp(target_ver, SELFTEST_MIN_BOT) != std::cmp::Ordering::Less
-    {
+    // read) is refused with nothing touched.
+    if version_cmp(target_ver, UPGRADE_TARGET_MIN) == std::cmp::Ordering::Less {
+        let _ = std::fs::remove_file(&archive);
+        return Err(format!(
+            "target predates {UPGRADE_TARGET_MIN} and cannot read this config"
+        ));
+    }
+    if eq_ic(&row.kind, "bin") {
         logm!(
             state,
             L_INFO,
@@ -1422,7 +1429,7 @@ pub fn hub_commit(
         &archive,
         &prev_exe,
         &exe,
-        version_cmp(target_ver, SELFTEST_MIN_BOT) != std::cmp::Ordering::Less,
+        true,
     );
     // The channels we hold ops in now: after the restart the "ok" is held
     // until we are back in each of them, opped (hub_client::upgrade_ready_tick).
@@ -1482,7 +1489,7 @@ mod tests {
     use std::cmp::Ordering::*;
 
     /// The marker carries the variant so a same-version C<->Rust switch is
-    /// checkable; a legacy two-field marker still parses, with no variant.
+    /// checkable; a marker with no variant still parses.
     #[test]
     fn marker_parse() {
         let p = parse_marker("abc-1|2.4.5|c\nops #a #B\n").unwrap();
@@ -1491,15 +1498,15 @@ mod tests {
             ("abc-1", "2.4.5", "c")
         );
         assert_eq!(p.ops, vec!["#a".to_string(), "#B".to_string()]);
-        // An empty ops line, and a legacy one-line marker with no variant.
+        // An empty ops line, and a one-line marker with no variant.
         assert!(
             parse_marker("abc-1|2.4.5|rs\nops\n")
                 .unwrap()
                 .ops
                 .is_empty()
         );
-        let legacy = parse_marker("abc-1|2.4.5\n").unwrap();
-        assert_eq!((legacy.variant.as_str(), legacy.ops.len()), ("", 0));
+        let bare = parse_marker("abc-1|2.4.5\n").unwrap();
+        assert_eq!((bare.variant.as_str(), bare.ops.len()), ("", 0));
         assert_eq!(parse_marker("|2.4.5|c"), None);
         assert_eq!(parse_marker("abc"), None);
     }

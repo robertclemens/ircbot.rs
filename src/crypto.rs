@@ -63,23 +63,10 @@ pub fn gen_uuid_v4() -> Option<String> {
 }
 
 /// PBKDF2-HMAC-SHA256 over a password: the config-file and pass-file key.
-/// `iterations` is PBKDF2_ITERATIONS, or PBKDF2_ITERATIONS_LEGACY to read a
-/// pre-2.5.0 file.
+/// `iterations` is PBKDF2_ITERATIONS.
 pub fn derive_config_key(password: &[u8], salt: &[u8], iterations: u32) -> Key32 {
     let mut key = Zeroizing::new([0u8; 32]);
     pbkdf2::pbkdf2_hmac::<Sha256>(password, salt, iterations, key.as_mut());
-    key
-}
-
-/// The pre-PBKDF2 config key: OpenSSL EVP_BytesToKey(aes-256-gcm, sha256,
-/// salt, password, 1 round), i.e. SHA-256(password || salt[0..8]).  Only used
-/// to migrate an old config once.
-pub fn legacy_config_key(password: &[u8], salt: &[u8]) -> Key32 {
-    let mut h = Sha256::new();
-    h.update(password);
-    h.update(&salt[..salt.len().min(8)]);
-    let mut key = Zeroizing::new([0u8; 32]);
-    key.copy_from_slice(&h.finalize());
     key
 }
 

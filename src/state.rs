@@ -75,8 +75,7 @@ pub struct UserRecord {
     pub act_pending: i64,
 }
 
-/// A parsed a|/o| line body.  `legacy` is true when field 3 carried a
-/// password (never copied anywhere).
+/// A parsed a|/o| line body.
 #[derive(Clone, Debug, Default)]
 pub struct UserLine {
     pub uuid: String,
@@ -84,7 +83,6 @@ pub struct UserLine {
     pub pubkey_b64: String,
     pub has_pubkey: bool,
     pub is_active: bool,
-    pub legacy: bool,
     pub last_seen: i64,
     pub timestamp: i64,
 }
@@ -503,11 +501,22 @@ impl Default for ChanEventLim {
 #[derive(Clone, Debug, Default)]
 pub struct Chan {
     pub name: String,
+    /// The key the bot joins with: `ckey` (c|, the admin's) or `lkey` (K|,
+    /// learned on IRC), whichever is newer -- `channel::key_refresh` keeps it
+    /// so.
     pub key: String,
     pub status: ChanStatus,
+    /// K|: the +k/+i the bots saw.
     pub modes: u32,
     pub is_managed: bool,
+    /// c| stamp: existence + `ckey`.
     pub timestamp: i64,
+    pub ckey: String,
+    /// K| (irchub docs/plans/2026-10-20_learned_state_purge_plan.md): what
+    /// the bots saw on IRC.  Never existence: a learned change never moves
+    /// `timestamp`, so a delete it races is not undone.  `l_ts` 0 = none.
+    pub lkey: String,
+    pub l_ts: i64,
     pub last_who_request: i64,
     pub roster: Vec<RosterEntry>,
     pub last_join_attempt: i64,
@@ -561,8 +570,7 @@ pub struct Chan {
     pub ban_overflow_logged: bool,
     /// The channel WHO finished (315) this stay.
     pub who_done: bool,
-    /// A key / mode this bot learned and has not yet got to a hub: pushed in
-    /// a full config push even under opt 'h' (D43).
+    /// A key / mode this bot learned (K|) and has not yet got to a hub.
     pub enf_pending: bool,
     /// chanflood.rs: per-source flood windows, MAX_FLOOD_TRACK slots,
     /// allocated on the first counted event (empty until then) and freed by
@@ -843,7 +851,7 @@ pub struct BotState {
     pub self_pub: [u8; HUB_KEY_RAW_LEN],
     pub self_pub_set: bool,
     /// Pinned key of the hub being connected to (copied from hubs[] at
-    /// connect time), or the legacy global j| key while loading.
+    /// connect time).
     pub hub_remote_ed_pub: [u8; 32],
     pub hub_remote_ed_pub_set: bool,
     pub hubs: Vec<HubEntry>,
@@ -882,18 +890,12 @@ pub struct BotState {
     pub upgrade_id: String,
     pub upgrade_target: String,
     pub upgrade_variant: String,
-    pub upgrade_base: String,
     pub upgrade_prepared: i64,
     /// The run whose build this process IS, from UPGRADE_MARKER_FILE when the
     /// upgraded binary first reports in.  An ABORT rolls back to `<exe>.prev`
     /// only for this run — `.prev` otherwise holds the build from before some
     /// earlier, completed run, and a bot that refused a COMMIT never moved.
     pub upgrade_installed_id: String,
-    /// UPGRADE_PASS_REWRITE_SECS: when the deferred pass rewrite is due (0 =
-    /// none), and whether this process saved PASS_PREV_FILE — hub_rollback()
-    /// restores it only then, never a stale copy.
-    pub pass_rewrite_due: i64,
-    pub pass_prev_saved: bool,
     /// An upgrade's "ok" not sent yet: held until this bot is back in every
     /// channel it held ops in before the restart, opped, or UPGRADE_OPS_WAIT
     /// has passed (hub_client::upgrade_ready_tick).  Volatile.
@@ -1040,11 +1042,8 @@ impl BotState {
             upgrade_id: String::new(),
             upgrade_target: String::new(),
             upgrade_variant: String::new(),
-            upgrade_base: String::new(),
             upgrade_prepared: 0,
             upgrade_installed_id: String::new(),
-            pass_rewrite_due: 0,
-            pass_prev_saved: false,
             upgrade_report: None,
             sendq: SendQ::default(),
             isup: Isupport::default(),

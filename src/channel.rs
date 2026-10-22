@@ -11,7 +11,7 @@
 use crate::auth::wildcard_match;
 use crate::consts::*;
 use crate::cstr::{eq_ic, now, trunc_string};
-use crate::state::{BotState, Chan, ChanReq, ChanStatus, S_AUTHED, UnbanJob};
+use crate::state::{BotState, Chan, ChanReq, ChanStatus, M_I, M_K, S_AUTHED, UnbanJob};
 use crate::{bot_comms, config, hub_client, ircf, logm};
 
 /// channel_add(): None if the channel is already listed.
@@ -456,9 +456,19 @@ pub fn access_accept_key(state: &mut BotState, channel: &str, key: &str) {
     if c.key == key {
         return;
     }
+    // learned, never existence (K|): the c| stamp stays, so a delete this
+    // races is not undone
     let c = &mut state.chans[ci];
-    c.key = key.to_string();
-    c.timestamp = crate::state::lww_next_ts(c.timestamp);
+    let modes = c.modes | M_K;
+    if !learn(c, key, modes) {
+        logm!(
+            state,
+            L_INFO,
+            "[CHANREQ] Malformed key for {} ignored\n",
+            channel
+        );
+        return;
+    }
     logm!(
         state,
         L_INFO,
@@ -471,4 +481,87 @@ pub fn access_accept_key(state: &mut BotState, channel: &str, key: &str) {
     if let Some(c) = state.chans.get_mut(ci) {
         c.last_join_attempt = 0;
     }
+}
+
+// ---- K|: learned channel state ----------------------------------------------
+
+/// chan_key_refresh(): key = the newer of ckey@timestamp and lkey@l_ts (a tie
+/// keeps ckey).
+pub fn key_refresh(c: &mut Chan) {
+    c.key = if c.l_ts > c.timestamp {
+        c.lkey.clone()
+    } else {
+        c.ckey.clone()
+    };
+}
+
+fn learned_key_ok(k: &str) -> bool {
+    k.len() < MAX_KEY
+        && k.bytes()
+            .all(|c| c > 0x20 && c != b',' && c != b'|' && c < 0x7f)
+}
+
+/// chan_learn(): a key / +k+i this bot saw, stamped past both stamps; false
+/// when nothing changed or the key is malformed.
+pub fn learn(c: &mut Chan, key: &str, modes: u32) -> bool {
+    if !learned_key_ok(key) {
+        return false;
+    }
+    let modes = modes & (M_K | M_I);
+    if c.l_ts > 0 && c.key == key && c.modes == modes {
+        return false;
+    }
+    // past the c| stamp as well: what was just seen is the key in use
+    c.l_ts = crate::state::lww_next_ts(c.l_ts.max(c.timestamp));
+    c.lkey = key.to_string();
+    c.modes = modes;
+    key_refresh(c);
+    true
+}
+
+/// chan_learned_forget(): the channel went.
+pub fn learned_forget(c: &mut Chan) {
+    zeroize::Zeroize::zeroize(&mut c.lkey);
+    c.l_ts = 0;
+    c.modes = 0;
+    key_refresh(c);
+}
+
+/// chan_learned_ingest(): one "chan|key|modes|ts" body from a hub or the
+/// config (managed channels only).
+pub fn learned_ingest(state: &mut BotState, body: &str) -> bool {
+    if body.len() >= MAX_CHAN + MAX_KEY + 48 {
+        return false;
+    }
+    let f: Vec<&str> = body.split('|').collect();
+    if f.len() != 4 || !learned_key_ok(f[1]) {
+        return false;
+    }
+    let (Ok(modes), Ok(ts)) = (f[2].parse::<i64>(), f[3].parse::<i64>()) else {
+        return false;
+    };
+    if modes < 0 || modes & !i64::from(M_K | M_I) != 0 || ts <= 0 {
+        return false;
+    }
+    // never existence: only for a channel managed here
+    let Some(ci) = find(state, f[0]) else {
+        return false;
+    };
+    let c = &mut state.chans[ci];
+    if !c.is_managed
+        || ts < c.l_ts
+        || (ts == c.l_ts && format!("{}|{modes}", f[1]) <= format!("{}|{}", c.lkey, c.modes))
+    {
+        return false;
+    }
+    c.lkey = f[1].to_string();
+    c.modes = modes as u32;
+    c.l_ts = ts;
+    key_refresh(c);
+    true
+}
+
+/// chan_format_l(): the K| line.
+pub fn format_k(c: &Chan) -> String {
+    format!("K|{}|{}|{}|{}\n", c.name, c.lkey, c.modes, c.l_ts)
 }

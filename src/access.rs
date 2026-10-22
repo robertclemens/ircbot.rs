@@ -330,11 +330,24 @@ pub fn purge(state: &mut BotState, cutoff: i64) -> usize {
         .filter(|u| u.is_active)
         .map(|u| u.uuid.clone())
         .collect();
+    // a live binding to a channel no one manages is an orphan (irchub)
+    let orphan: Vec<bool> = state
+        .uchan_records
+        .iter()
+        .map(|r| {
+            r.is_active
+                && r.chan != "*"
+                && crate::channel::find(state, &r.chan).is_none_or(|ci| !state.chans[ci].is_managed)
+        })
+        .collect();
     let before = state.uchan_records.len();
+    let mut i = 0;
     state.uchan_records.retain(|r| {
-        !(!r.is_active
-            && (cutoff == 0 || r.timestamp < cutoff)
-            && !(live.contains(&r.uuid) && r.chan == "*"))
+        i += 1;
+        !(orphan[i - 1]
+            || (!r.is_active
+                && (cutoff == 0 || r.timestamp < cutoff)
+                && !(live.contains(&r.uuid) && r.chan == "*")))
     });
     let dropped = before - state.uchan_records.len();
     prune(state);

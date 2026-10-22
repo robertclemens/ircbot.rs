@@ -830,8 +830,7 @@ pub fn handle_private_message(
     if bot_comms::handle_privmsg(state, nick, &user_host, message) {
         return;
     }
-    // Admin/oper: ~A2A auth, ~A2 / ~A2S commands.  Anything else --
-    // including the retired ~A1 / ~A1c password frames -- is dropped.
+    // Admin/oper: ~A2A auth, ~A2 / ~A2S commands.  Anything else is dropped.
     // Section 9.1: a host the msg / ctcp flood ignores (or quiet mode) gets
     // nothing from here on -- no auth reply, no command.  Authorised hosts
     // never are.
@@ -851,14 +850,6 @@ pub fn handle_private_message(
         let b64 = &message[if sealed { 5 } else { 4 }..];
         a2_open_command(state, nick, &user_host, dest, None, b64, sealed)
     } else {
-        if message.starts_with("~A1") {
-            logm!(
-                state,
-                L_CMD,
-                "[CMD] Retired password frame (~A1/~A1c) from {}; the client script needs updating to the key-based ~A2\n",
-                user_host
-            );
-        }
         None
     };
     // Nothing past this point may run for an unauthenticated sender.
@@ -1452,7 +1443,8 @@ fn admin_command(
                 // Soft delete: tombstone rather than remove.
                 let c = &mut state.chans[ci];
                 c.is_managed = false;
-                c.timestamp = lww_next_ts(c.timestamp);
+                c.timestamp = lww_next_ts(c.timestamp.max(c.l_ts));
+                channel::learned_forget(c); // what it saw goes with it (no tombstone)
                 let ts = c.timestamp;
                 // its oper bindings go too, at the same stamp (user_flags U6)
                 crate::access::chan_cascade(state, &name, ts);
@@ -1752,10 +1744,11 @@ fn cmd_join(state: &mut BotState, nick: &str, a: Args<'_>) {
     if let Some(ci) = ci {
         let c = &mut state.chans[ci];
         if let Some(k) = a.a2 {
-            c.key = trunc_string(k, MAX_KEY);
+            c.ckey = trunc_string(k, MAX_KEY);
         }
         c.is_managed = true;
-        c.timestamp = lww_next_ts(prev_ts);
+        c.timestamp = lww_next_ts(prev_ts.max(c.l_ts));
+        channel::key_refresh(c);
         let ts = c.timestamp;
         logm!(
             state,

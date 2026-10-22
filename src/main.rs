@@ -148,8 +148,8 @@ fn passfile_create(path: &str, password: &str) -> bool {
         eprintln!("Encryption failed.");
         return false;
     };
-    // Written beside it and renamed over it, so a rewrite (-p, or the PBKDF2
-    // migration at start) never leaves a half-written pass file.
+    // Written beside it and renamed over it, so a rewrite (-p) never leaves
+    // a half-written pass file.
     let tmp = format!("{path}.tmp");
     let mut f = match OpenOptions::new()
         .write(true)
@@ -190,52 +190,8 @@ fn passfile_create(path: &str, password: &str) -> bool {
     ok
 }
 
-/// The deferred rewrite of a pre-2.5.0 pass file on an upgrade start (see
-/// UPGRADE_PASS_REWRITE_SECS).  The old file is hard-linked to PASS_PREV_FILE
-/// first; passfile_create() renames a new one over PASS_FILE, so the link
-/// keeps the old bytes and mode.  One attempt: on failure the file stays
-/// readable as it is and the next ordinary start rewrites it.
-fn passfile_upgrade_tick(state: &mut BotState) {
-    if state.pass_rewrite_due == 0 || now() < state.pass_rewrite_due {
-        return;
-    }
-    state.pass_rewrite_due = 0;
-    let pass = state.startup_pass();
-    let _ = fs::remove_file(PASS_PREV_FILE);
-    if pass.is_empty() || fs::hard_link(PASS_FILE, PASS_PREV_FILE).is_err() {
-        logm!(
-            state,
-            L_INFO,
-            "[CFG] {} kept at PBKDF2 {}k: could not keep a copy for rollback\n",
-            PASS_FILE,
-            PBKDF2_ITERATIONS_LEGACY / 1000
-        );
-    } else if passfile_create(PASS_FILE, &pass) {
-        state.pass_prev_saved = true;
-        logm!(
-            state,
-            L_INFO,
-            "[CFG] {} rewritten with PBKDF2 {}k (old copy in {} until the next ordinary start)\n",
-            PASS_FILE,
-            PBKDF2_ITERATIONS / 1000,
-            PASS_PREV_FILE
-        );
-    } else {
-        let _ = fs::remove_file(PASS_PREV_FILE);
-        logm!(
-            state,
-            L_INFO,
-            "[CFG] {} kept at PBKDF2 {}k: rewrite failed\n",
-            PASS_FILE,
-            PBKDF2_ITERATIONS_LEGACY / 1000
-        );
-    }
-}
-
-/// The password, and whether the file only opened under
-/// PBKDF2_ITERATIONS_LEGACY (written before 2.5.0); main() then rewrites it
-/// under the current count.
-fn passfile_load(path: &str) -> Option<(Zeroizing<String>, bool)> {
+/// The password from the machine-bound pass file.
+fn passfile_load(path: &str) -> Option<Zeroizing<String>> {
     let md = fs::metadata(path).ok()?;
     if md.uid() != nix::unistd::getuid().as_raw() {
         eprintln!("[WARN] {path}: wrong owner, ignoring.");
@@ -251,21 +207,15 @@ fn passfile_load(path: &str) -> Option<(Zeroizing<String>, bool)> {
     let mut buf = Zeroizing::new(Vec::new());
     fs::File::open(path).ok()?.read_to_end(&mut buf).ok()?;
     let ctx = passfile_context();
-    let open = |iterations| {
-        let key = crypto::derive_config_key(ctx.as_bytes(), &buf[..SALT_SIZE], iterations);
-        crypto::gcm_open(key.as_ref(), &[], &buf[SALT_SIZE..])
-    };
-    let opened = match open(PBKDF2_ITERATIONS) {
-        Some(p) => Some((p, false)),
-        None => open(PBKDF2_ITERATIONS_LEGACY).map(|p| (p, true)),
-    };
-    match opened {
-        Some((p, legacy)) if !p.is_empty() && p.len() < MAX_PASS => Some((
-            Zeroizing::new(String::from_utf8_lossy(&p).into_owned()),
-            legacy,
-        )),
+    let key = crypto::derive_config_key(ctx.as_bytes(), &buf[..SALT_SIZE], PBKDF2_ITERATIONS);
+    match crypto::gcm_open(key.as_ref(), &[], &buf[SALT_SIZE..]) {
+        Some(p) if !p.is_empty() && p.len() < MAX_PASS => {
+            Some(Zeroizing::new(String::from_utf8_lossy(&p).into_owned()))
+        }
         _ => {
-            eprintln!("[WARN] {path}: decryption failed (wrong machine or tampered file).");
+            eprintln!(
+                "[WARN] {path}: decryption failed (wrong machine, tampered, or written before 2.5.0)."
+            );
             None
         }
     }
@@ -798,7 +748,7 @@ fn main() {
     }
 
     // Password: the machine-bound pass file, else a prompt on stdin.
-    let (password, pass_legacy) = match passfile_load(PASS_FILE) {
+    let password = match passfile_load(PASS_FILE) {
         Some(p) => p,
         None => {
             let p = get_password("Config Password", MAX_PASS);
@@ -806,7 +756,7 @@ fn main() {
                 eprintln!("No password provided.");
                 std::process::exit(1);
             }
-            (p, false)
+            p
         }
     };
 
@@ -814,34 +764,9 @@ fn main() {
         std::process::exit(identity(password));
     }
 
-    // A pre-2.5.0 pass file moves to the current PBKDF2 count on an ordinary
-    // start.  On the start a hub-driven upgrade made (its marker is still
-    // here) it waits UPGRADE_PASS_REWRITE_SECS, until the old build's watchdog
-    // is done with this process, and keeps the old copy for a rollback (see
-    // passfile_upgrade_tick).  An ordinary start drops any such copy left by an
-    // earlier run: a hub rollback is only ever for the process that made it.
-    let upgrade_start = fs::metadata(UPGRADE_MARKER_FILE).is_ok();
-    if !upgrade_start {
-        let _ = fs::remove_file(PASS_PREV_FILE);
-    }
-    if pass_legacy {
-        if upgrade_start {
-            println!(
-                "{PASS_FILE}: rewritten with PBKDF2 {}k in {UPGRADE_PASS_REWRITE_SECS}s (upgrade in progress)",
-                PBKDF2_ITERATIONS / 1000
-            );
-        } else if passfile_create(PASS_FILE, &password) {
-            println!(
-                "{PASS_FILE}: rewritten with PBKDF2 {}k",
-                PBKDF2_ITERATIONS / 1000
-            );
-        } else {
-            eprintln!(
-                "{PASS_FILE}: could not rewrite with PBKDF2 {}k; still readable as it is",
-                PBKDF2_ITERATIONS / 1000
-            );
-        }
-    }
+    // The pre-2.5.0 pass file 2.5.0 kept for its own rollback: nothing reads
+    // it any more.
+    let _ = fs::remove_file(PASS_PREV_FILE);
 
     println!("{BOT_NAME} {BOT_VERSION}");
     daemonize();
@@ -849,7 +774,7 @@ fn main() {
     let Some(pid_file) = lock_pid_file() else {
         std::process::exit(1)
     };
-    let code = run(password, pid_file, self_exe, pass_legacy && upgrade_start);
+    let code = run(password, pid_file, self_exe);
     std::process::exit(code);
 }
 
@@ -872,8 +797,13 @@ fn selftest() -> i32 {
     if fs::metadata(CONFIG_FILE).is_err() {
         return fail(&format!("no {CONFIG_FILE}"));
     }
-    let Some((password, _)) = passfile_load(PASS_FILE) else {
-        return fail(&format!("{PASS_FILE} missing or unreadable"));
+    // 2.5.1 reads only the 600k key; a pass file 2.5.0 never got to rewrite
+    // is refused here so the upgrade reports it instead of leaving a bot that
+    // cannot start.
+    let Some(password) = passfile_load(PASS_FILE) else {
+        return fail(&format!(
+            "cannot read {PASS_FILE} (written before 2.5.0? restart once on 2.5.0, or rewrite it with -p)"
+        ));
     };
     let registry = match Poll::new().and_then(|p| p.registry().try_clone()) {
         Ok(r) => r,
@@ -929,12 +859,7 @@ fn identity(password: Zeroizing<String>) -> i32 {
 }
 
 /// Load the config and run the poll loop until `die` or a signal.
-fn run(
-    password: Zeroizing<String>,
-    pid_file: fs::File,
-    self_exe: String,
-    pass_deferred: bool,
-) -> i32 {
+fn run(password: Zeroizing<String>, pid_file: fs::File, self_exe: String) -> i32 {
     let mut poll = match Poll::new() {
         Ok(p) => p,
         Err(e) => {
@@ -969,9 +894,6 @@ fn run(
     }
     state.set_startup_pass(&password);
     drop(password);
-    if pass_deferred {
-        state.pass_rewrite_due = now() + UPGRADE_PASS_REWRITE_SECS;
-    }
 
     let mut events = Events::with_capacity(64);
     while state.status & S_DIE == 0 && !shutdown.load(Ordering::Relaxed) {
@@ -979,7 +901,6 @@ fn run(
         channel::check_joins(&mut state);
         commands::activity_tick(&mut state, now());
         chanenf::tick(&mut state);
-        passfile_upgrade_tick(&mut state);
 
         // Debounced flush of last_seen / last_used (set on every successful
         // admin auth): at most once per CONFIG_WRITE_DEBOUNCE_S, local only.

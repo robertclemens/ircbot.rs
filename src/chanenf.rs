@@ -33,7 +33,7 @@ use crate::cstr::{Tok, eq_ic, now, trunc, trunc_string};
 use crate::sendq::mono_ms;
 use crate::state::FloodKind;
 use crate::state::{BotState, Chan, ChanStatus, CsetId, JobAct, RosterEntry, S_CONNECTED};
-use crate::{auth, chancfg, chanflood, chanlive, channel, hub_client, ircf, logm, sendq, updater};
+use crate::{auth, chancfg, chanflood, chanlive, channel, hub_client, ircf, logm, sendq};
 
 // same kick / deop / reop again: pending until its MODE / KICK echo
 // (recent_ack) or this long
@@ -230,16 +230,6 @@ struct Elig {
     id: String,
 }
 
-fn bot_too_old(state: &BotState, id: &str) -> bool {
-    state.bot_tree.iter().any(|r| {
-        r.kind != 'h'
-            && r.uuid == id
-            // version unknown (empty) = keep it in the deal
-            && !r.version.is_empty()
-            && updater::version_cmp(&r.version, JOB_MIN_VERSION) == Ordering::Less
-    })
-}
-
 /// First 8 bytes (big endian) of SHA-256(lc_chan || id).
 fn deal_hash(lc_chan: &str, id: &str) -> u64 {
     let mut h = Sha256::new();
@@ -308,9 +298,6 @@ pub fn deal_rank(state: &BotState, ci: usize, job: usize) -> i32 {
         } else {
             &tb.uuid
         };
-        if bot_too_old(state, id) {
-            continue;
-        }
         elig_add(&mut el, &lc, id);
     }
     el.sort_by(elig_cmp);

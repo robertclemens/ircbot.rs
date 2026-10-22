@@ -246,25 +246,28 @@ pub fn chanmode(state: &mut BotState, nick: &str, args: Option<&str>) {
     };
     let stored = parsed.stored;
 
+    // An admin's key is c|'s (compared with the key in use, learned or not).
     let mut key_changed = false;
-    let old_key = Zeroizing::new(state.chans[ci].key.clone());
+    let old_key = Zeroizing::new(state.chans[ci].ckey.clone());
     let c = &mut state.chans[ci];
     if let Some(k) = parsed.key.as_deref().filter(|k| c.key != *k) {
-        c.key = k.to_string();
+        c.ckey = k.to_string();
         key_changed = true;
-    } else if parsed.key_clear && !c.key.is_empty() {
-        c.key.clear();
+    } else if parsed.key_clear && !(c.key.is_empty() && c.ckey.is_empty()) {
+        // -k also drops a stored key an operator's -k already made stale
+        c.ckey.clear();
         key_changed = true;
     }
     let settings = state.chans[ci].cfg_settings.clone();
     if !chancfg::local_c(state, ci, &stored, &settings) {
-        state.chans[ci].key = old_key.to_string();
+        state.chans[ci].ckey = old_key.to_string();
         say(state, nick, "Error: could not store the modes.");
         return;
     }
     if key_changed {
         let c = &mut state.chans[ci];
-        c.timestamp = lww_next_ts(c.timestamp);
+        c.timestamp = lww_next_ts(c.timestamp.max(c.l_ts));
+        crate::channel::key_refresh(c);
         hub_client::push_config(state);
     }
     drop(old_key);

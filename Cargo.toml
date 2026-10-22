@@ -1,6 +1,6 @@
 [package]
 name = "ircbot"
-version = "2.5.0"
+version = "2.5.1"
 edition = "2024"
 rust-version = "1.89"
 description = "IRC bot with an encrypted hub mesh (safe-Rust port of ircbot.c)"
@@ -20,6 +20,12 @@ path = "utils/keygen.rs"
 [[bin]]
 name = "bot-auth"
 path = "utils/bot_auth.rs"
+
+[features]
+# Testnet only, never a release: compiles in the env overrides that point the
+# updater at a sandbox release tree and its throwaway signing key.  Without it
+# the binary has no code that reads them (see updater.rs env_root).
+test-hooks = []
 
 [dependencies]
 # Cryptography (RustCrypto + dalek): AES-256-GCM, HKDF/PBKDF2-SHA256,
