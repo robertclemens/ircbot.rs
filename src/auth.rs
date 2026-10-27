@@ -115,6 +115,41 @@ pub fn trusted_bot_by_host(state: &BotState, user_host: &str) -> Option<usize> {
         .position(|tb| wildcard_match(&strip_ident_tilde(&tb.mask), &norm))
 }
 
+/// Log label for another bot or a user named by uuid (C `bot_who`):
+/// "bot bunny_ (<uuid>)", "admin robert (<uuid>)"; a name nobody knows reads
+/// "?".  kind: 'b' bot, 'u' admin/oper.
+pub fn who(state: &BotState, kind: char, uuid: &str) -> String {
+    let mut word = if kind == 'u' { "user" } else { "bot" };
+    let mut name = String::new();
+    if !uuid.is_empty() && kind == 'b' {
+        if let Some(tb) = state.trusted_bots.iter().find(|tb| tb.uuid == uuid) {
+            let n = tb.mask.split('!').next().unwrap_or("");
+            name = crate::cstr::trunc_string(n, MAX_NICK);
+        }
+    } else if !uuid.is_empty()
+        && kind == 'u'
+        && let Some(u) = state.user_records.iter().find(|u| u.uuid == uuid)
+    {
+        word = if u.typ == 'a' { "admin" } else { "oper" };
+        name = u.name.clone();
+    }
+    let s = format!(
+        "{word} {} ({})",
+        crate::cstr::trunc(if name.is_empty() { "?" } else { &name }, 64),
+        crate::cstr::trunc(if uuid.is_empty() { "?" } else { uuid }, 64)
+    );
+    // names come from the hub: no control byte reaches a log line through one
+    s.chars()
+        .map(|q| {
+            if (q as u32) < 0x20 || q as u32 == 0x7f {
+                '_'
+            } else {
+                q
+            }
+        })
+        .collect()
+}
+
 pub fn trusted_bot_by_uuid(state: &BotState, uuid: &str) -> Option<usize> {
     if uuid.is_empty() {
         return None;

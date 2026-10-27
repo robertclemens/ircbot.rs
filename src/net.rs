@@ -4,7 +4,6 @@
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::time::Duration;
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
@@ -48,16 +47,16 @@ pub fn new_socket(addr: &SocketAddr, bind: Option<IpAddr>) -> io::Result<Socket>
     Ok(sock)
 }
 
-/// Blocking connect with a timeout (the C non-blocking connect + select).
-pub fn connect_timeout(sock: Socket, addr: &SocketAddr, secs: u64) -> io::Result<TcpStream> {
-    sock.connect_timeout(&SockAddr::from(*addr), Duration::from_secs(secs))?;
-    Ok(TcpStream::from(sock))
-}
-
-/// Hand a connected std stream to mio (non-blocking from here on).
-pub fn into_mio(s: TcpStream) -> io::Result<mio::net::TcpStream> {
-    s.set_nonblocking(true)?;
-    Ok(mio::net::TcpStream::from_std(s))
+/// Review 16: start a non-blocking connect; the caller registers the stream
+/// with mio and waits for writability (in flight until then).
+pub fn start_connect(sock: Socket, addr: &SocketAddr) -> io::Result<mio::net::TcpStream> {
+    sock.set_nonblocking(true)?;
+    match sock.connect(&SockAddr::from(*addr)) {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(nix::libc::EINPROGRESS) => {}
+        Err(e) => return Err(e),
+    }
+    Ok(mio::net::TcpStream::from_std(TcpStream::from(sock)))
 }
 
 pub const INTEREST: mio::Interest = mio::Interest::READABLE.add(mio::Interest::WRITABLE);

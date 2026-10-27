@@ -19,6 +19,24 @@ pub fn add(state: &mut BotState, name: &str) -> Option<usize> {
     if find(state, name).is_some() {
         return None;
     }
+    // A name that is not one channel ("#a,0" -- 0 parts every channel on most
+    // servers -- or one with a blank) never reaches a JOIN line.
+    if !crate::chancfg::valid_chan_name(name) {
+        logm!(state, L_INFO, "[CHAN] Not a channel name, not added\n");
+        return None;
+    }
+    // The hub holds at most this many channel rows (tombstones included); an
+    // uncapped list let one config frame use up memory.
+    if state.chans.len() >= CFG_MAX_CHANNELS {
+        logm!(
+            state,
+            L_INFO,
+            "[CHAN] Channel table full ({}): {} not added\n",
+            CFG_MAX_CHANNELS,
+            name
+        );
+        return None;
+    }
     state.chans.push(Chan {
         name: trunc_string(name, MAX_CHAN),
         status: ChanStatus::Out,

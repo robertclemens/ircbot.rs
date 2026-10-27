@@ -48,6 +48,9 @@ fn handle_mode_change(state: &mut BotState, channel: &str, modes: &str, args: &s
     // What this MODE shows of the key and +k/+i: learned (K|) at the end.
     let mut seen_key = zeroize::Zeroizing::new(state.chans[ci].key.clone());
     let mut seen_modes = state.chans[ci].modes;
+    // Only a MODE that sets or clears k or i is something seen: anything else
+    // would stamp this bot's own (possibly stale) copy of the key as learned.
+    let mut touched = false;
     // Live modes, key, limit, ban list and halfop/voice flags (chanlive.rs).
     // The C copy of the arguments exists because its tokeniser works in
     // place; here a copy is not needed, but the same 1024-byte bound holds.
@@ -63,61 +66,71 @@ fn handle_mode_change(state: &mut BotState, channel: &str, modes: &str, args: &s
 
     for mode in modes.chars() {
         match mode {
-            '+' => adding = true,
-            '-' => adding = false,
-            'o' | 'v' | 'b' | 'e' | 'I' => {
-                let Some(arg) = current_arg else { continue };
-                if mode == 'o' {
-                    if eq_ic(arg, &state.current_nick) {
-                        let me = state.current_nick.clone();
-                        let c = &mut state.chans[ci];
-                        c.i_am_opped = adding;
-                        if let Some(r) = c.roster.iter_mut().find(|r| eq_ic(&r.nick, &me)) {
-                            r.is_op = adding;
-                        }
-                        if adding {
-                            c.enf_dirty = true; // chanenf.rs sweep
-                            c.enf_ops_check = true;
-                            c.op_request_pending = false;
-                            c.op_request_retry_count = 0;
-                            logm!(state, L_INFO, "[INFO] I am now OP in {}\n", channel);
-                            hub_client::grant_held_ops(state, ci);
-                        } else {
-                            // Deopped: re-read the channel before choosing a
-                            // helper (the roster was not refreshed while we
-                            // held ops); the 315 handler sends the request.
-                            logm!(
-                                state,
-                                L_INFO,
-                                "[INFO] I was DEOPPED in {}. Refreshing roster to find a trusted op.\n",
-                                channel
-                            );
-                            if !state.chans[ci].op_request_pending {
-                                state.chans[ci].roster.clear();
-                                let name = state.chans[ci].name.clone();
-                                ircf!(state, "WHO {}\r\n", name);
-                                if let Some(c) = state.chans.get_mut(ci) {
-                                    c.last_who_request = now();
-                                }
-                            }
-                        }
-                    } else if let Some(r) = state.chans[ci]
-                        .roster
-                        .iter_mut()
-                        .find(|r| eq_ic(&r.nick, arg))
-                    {
+            '+' => {
+                adding = true;
+                continue;
+            }
+            '-' => {
+                adding = false;
+                continue;
+            }
+            _ => {}
+        }
+        // Which modes take an argument is the server's (005 PREFIX +
+        // CHANMODES): a hardcoded list let a server's own modes (+q, +j,
+        // +f...) shift every later argument (review 2026-10-25 #17, as C).
+        let has_arg = mode.is_ascii() && state.isup.mode_has_arg(mode as u8, adding);
+        match mode {
+            'o' if has_arg && current_arg.is_some() => {
+                let arg = current_arg.unwrap_or_default();
+                if eq_ic(arg, &state.current_nick) {
+                    let me = state.current_nick.clone();
+                    let c = &mut state.chans[ci];
+                    c.i_am_opped = adding;
+                    if let Some(r) = c.roster.iter_mut().find(|r| eq_ic(&r.nick, &me)) {
                         r.is_op = adding;
+                    }
+                    if adding {
+                        c.enf_dirty = true; // chanenf.rs sweep
+                        c.enf_ops_check = true;
+                        c.op_request_pending = false;
+                        c.op_request_retry_count = 0;
+                        logm!(state, L_INFO, "[INFO] I am now OP in {}\n", channel);
+                        hub_client::grant_held_ops(state, ci);
+                    } else {
+                        // Deopped: re-read the channel before choosing a
+                        // helper (the roster was not refreshed while we
+                        // held ops); the 315 handler sends the request.
                         logm!(
                             state,
-                            L_DEBUG,
-                            "[DEBUG] Roster update: {} is_op={} in {}\n",
-                            arg,
-                            adding as i32,
+                            L_INFO,
+                            "[INFO] I was DEOPPED in {}. Refreshing roster to find a trusted op.\n",
                             channel
                         );
+                        if !state.chans[ci].op_request_pending {
+                            state.chans[ci].roster.clear();
+                            let name = state.chans[ci].name.clone();
+                            ircf!(state, "WHO {}\r\n", name);
+                            if let Some(c) = state.chans.get_mut(ci) {
+                                c.last_who_request = now();
+                            }
+                        }
                     }
+                } else if let Some(r) = state.chans[ci]
+                    .roster
+                    .iter_mut()
+                    .find(|r| eq_ic(&r.nick, arg))
+                {
+                    r.is_op = adding;
+                    logm!(
+                        state,
+                        L_DEBUG,
+                        "[DEBUG] Roster update: {} is_op={} in {}\n",
+                        arg,
+                        adding as i32,
+                        channel
+                    );
                 }
-                current_arg = toks.next(" ");
             }
             'k' => {
                 if key_managed {
@@ -126,23 +139,17 @@ fn handle_mode_change(state: &mut BotState, channel: &str, modes: &str, args: &s
                     if let Some(arg) = current_arg {
                         *seen_key = trunc_string(arg, MAX_KEY);
                         seen_modes |= M_K;
+                        touched = true;
                     }
                 } else {
                     // -k clears the key regardless of its argument.
                     seen_key.clear();
                     seen_modes &= !M_K;
-                }
-                if current_arg.is_some() {
-                    current_arg = toks.next(" ");
-                }
-            }
-            'l' => {
-                // +l takes an argument (the limit); -l does not.
-                if adding && current_arg.is_some() {
-                    current_arg = toks.next(" ");
+                    touched = true;
                 }
             }
             'i' => {
+                touched = true;
                 if adding {
                     seen_modes |= M_I;
                 } else {
@@ -151,11 +158,14 @@ fn handle_mode_change(state: &mut BotState, channel: &str, modes: &str, args: &s
             }
             _ => {}
         }
+        if has_arg && current_arg.is_some() {
+            current_arg = toks.next(" ");
+        }
     }
     // Learned, never existence: the c| stamp stays, so a delete this MODE
     // races is not undone (an unmanaged channel learns nothing).
     let c = &mut state.chans[ci];
-    c.is_managed && channel::learn(c, &seen_key, seen_modes)
+    touched && c.is_managed && channel::learn(c, &seen_key, seen_modes)
 }
 
 /// Record our own hostmask -- only ever from our 352 entry or our JOIN
@@ -226,6 +236,14 @@ pub fn handle_line(state: &mut BotState, line: &str) {
     let params = &rest[sp + 1..];
 
     if command == "PONG" {
+        state.last_pong_time = now();
+        state.pong_pending = false;
+        return;
+    }
+    // "PING token" (no colon) and ":server PING :token" (a prefix): the fast
+    // path above only knows "PING :token", and an unanswered ping times out.
+    if command == "PING" {
+        ircf!(state, "PONG :{}\r\n", irc_trailing(params));
         state.last_pong_time = now();
         state.pong_pending = false;
         return;
@@ -328,18 +346,15 @@ pub fn handle_line(state: &mut BotState, line: &str) {
         "PART" => {
             if let Some(p) = prefix {
                 let nick = Tok::new(p).next("!");
-                if let Some(n) =
-                    nick.filter(|n| !eq_ic(n, &state.current_nick) && !eq_ic(n, &state.target_nick))
-                {
+                if let Some(n) = nick.filter(|n| !eq_ic(n, &state.current_nick)) {
                     let pc = params.strip_prefix(':').unwrap_or(params);
                     let pc = pc.split(' ').next().unwrap_or("");
                     if !pc.is_empty() && pc.len() < MAX_CHAN {
                         chanenf::on_part(state, pc, n);
                     }
                 }
-                if nick
-                    .is_some_and(|n| eq_ic(n, &state.current_nick) || eq_ic(n, &state.target_nick))
-                {
+                // our own PART only (see JOIN)
+                if nick.is_some_and(|n| eq_ic(n, &state.current_nick)) {
                     let chan_name = params.strip_prefix(':').unwrap_or(params);
                     let chan_name = chan_name.split(' ').next().unwrap_or("");
                     if let Some(ci) = channel::find(state, chan_name) {
@@ -391,6 +406,15 @@ fn on_welcome(state: &mut BotState, params: &str) {
     // when current_nick already says so: a 433 during registration switches
     // current_nick to the fallback without a push, and a hub link that came
     // up before that has only the target.
+    if srv_nick.len() >= MAX_NICK {
+        irc_client::nick_overlong(state, srv_nick);
+        request_own_hostmask(state);
+        return;
+    }
+    if !srv_nick.is_empty() {
+        state.overlong_nick.clear();
+        state.overlong_since = 0;
+    }
     let renamed = state.current_nick != srv_nick;
     if !srv_nick.is_empty()
         && srv_nick.len() < MAX_NICK
@@ -444,8 +468,9 @@ fn on_nick_refused(state: &mut BotState, command: &str, params: &str) {
             irc_trailing(t.remaining())
         );
     }
-    // Not registered yet: without an accepted nick there is no 001.
-    if state.status & S_AUTHED == 0 {
+    // Not registered yet: without an accepted nick there is no 001.  Under a
+    // nick over 9 bytes (10b), the target refused: take an alternate.
+    if state.status & S_AUTHED == 0 || !state.overlong_nick.is_empty() {
         irc_client::generate_new_nick(state);
     }
 }
@@ -831,7 +856,9 @@ fn on_join(state: &mut BotState, prefix: &str, params: &str) {
     {
         update_own_hostmask(state, prefix);
     }
-    if !(eq_ic(nick, &state.current_nick) || eq_ic(nick, &state.target_nick)) {
+    // Our own JOIN: current_nick is what the server knows us as (001, NICK).
+    // Whoever holds target_nick while we run on a fallback is someone else.
+    if !eq_ic(nick, &state.current_nick) {
         // someone else joined: keep the roster (and the enforcement) current
         if join_mask_ok {
             let jc = params.strip_prefix(':').unwrap_or(params);
@@ -877,10 +904,18 @@ fn on_nick(state: &mut BotState, prefix: &str, params: &str) {
     let new_nick = params.strip_prefix(':').unwrap_or(params);
     let Some(old) = old else { return };
     chanenf::on_nick(state, old, new_nick);
-    if !eq_ic(old, &state.current_nick) {
+    let me = eq_ic(old, &state.current_nick)
+        || (!state.overlong_nick.is_empty() && eq_ic(old, &state.overlong_nick));
+    if !me {
         return;
     }
-    state.current_nick = trunc_string(new_nick, MAX_NICK);
+    if new_nick.len() >= MAX_NICK {
+        irc_client::nick_overlong(state, new_nick); // 10b: never clipped
+        return;
+    }
+    state.overlong_nick.clear();
+    state.overlong_since = 0;
+    state.current_nick = new_nick.to_string();
     state.current_nick_ts = now();
     if state.hub_connected && state.hub_authenticated {
         let (n, ts) = (state.current_nick.clone(), state.current_nick_ts);

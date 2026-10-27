@@ -136,7 +136,7 @@ pub fn uflag_put(state: &mut BotState, uuid: &str, flags: &str, ts: i64) -> bool
                     L_INFO,
                     "[ACCESS] Flag table full ({}): uf| for {} dropped\n",
                     MAX_USER_FLAGS,
-                    uuid
+                    crate::auth::who(state, 'u', uuid)
                 );
                 return false;
             }
@@ -174,7 +174,7 @@ pub fn uchan_put(state: &mut BotState, uuid: &str, chan: &str, active: bool, ts:
                     "[ACCESS] Binding table full ({}): uc| {} for {} dropped\n",
                     MAX_CHAN_BINDS,
                     chan,
-                    uuid
+                    crate::auth::who(state, 'u', uuid)
                 );
                 return false;
             }

@@ -125,7 +125,7 @@ fn plain_text(s: &str) -> bool {
     s.bytes().all(|c| c >= 0x20 && c != 0x7f && c != b'|')
 }
 
-fn valid_chan_name(s: &str) -> bool {
+pub fn valid_chan_name(s: &str) -> bool {
     let b = s.as_bytes();
     if b.len() < 2 || b.len() >= MAX_CHAN || (b[0] != b'#' && b[0] != b'&') {
         return false;

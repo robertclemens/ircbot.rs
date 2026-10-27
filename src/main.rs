@@ -63,7 +63,9 @@ fn harden_process() {
 
 /// One line from stdin, without the line ending, cut to `len`-1 bytes.
 fn read_line(len: usize) -> Zeroizing<String> {
-    let mut line = Zeroizing::new(String::new());
+    // Room up front: a read_line that has to grow the String frees the old
+    // allocation unwiped, with the password in it (review 2026-10-25 L1).
+    let mut line = Zeroizing::new(String::with_capacity(4096));
     if io::stdin().lock().read_line(&mut line).unwrap_or(0) == 0 {
         return Zeroizing::new(String::new());
     }
@@ -583,6 +585,7 @@ fn run_config_wizard() -> io::Result<()> {
 
     println!("\n--- Finalizing Configuration ---");
     config::write(&mut state, &config_pass);
+    config::key_forget();
     println!("\nConfiguration saved to {CONFIG_FILE}.");
     println!("You can now start the bot:");
     println!("  Run './ircbot -p' to create a machine-bound password file, then './ircbot'");
@@ -764,10 +767,6 @@ fn main() {
         std::process::exit(identity(password));
     }
 
-    // The pre-2.5.0 pass file 2.5.0 kept for its own rollback: nothing reads
-    // it any more.
-    let _ = fs::remove_file(PASS_PREV_FILE);
-
     println!("{BOT_NAME} {BOT_VERSION}");
     daemonize();
 
@@ -775,6 +774,7 @@ fn main() {
         std::process::exit(1)
     };
     let code = run(password, pid_file, self_exe);
+    config::key_forget();
     std::process::exit(code);
 }
 

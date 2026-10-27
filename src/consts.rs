@@ -12,12 +12,12 @@ pub const BOT_NAME: &str = "ircbot.rs by trojanman";
 /// made against.
 pub const BOT_VERSION: &str = match option_env!("IRCBOT_VERSION") {
     Some(v) => v,
-    None => "2.5.1",
+    None => "2.5.2",
 };
 pub const PASS_FILE: &str = ".ircbot.pass"; // machine-bound password file
 /// PBKDF2-HMAC-SHA256 rounds for the .ircbot.cnf and .ircbot.pass keys
-/// (OWASP's 2023 figure).  2.5.0 moved both files here from 100k; releases
-/// after it carry min_from 2.5.0, so only this count is read.
+/// (OWASP's 2023 figure).  2.5.0 moved both files here from 100k; every
+/// release since carries min_from 2.5.0 or later, so only this count is read.
 pub const PBKDF2_ITERATIONS: u32 = 600_000;
 pub const VERSION_RESPONSE: &str = "A robot may not injure a human being";
 pub const CONFIG_FILE: &str = ".ircbot.cnf";
@@ -42,9 +42,6 @@ pub const UPGRADE_MARKER_FILE: &str = ".ircbot.upgrade";
 /// Retained previous binary/config, kept (not deleted) after a hub-driven
 /// upgrade so CMD_UPGRADE_ABORT can put the node back.
 pub const UPGRADE_PREV_SUFFIX: &str = ".prev";
-/// 2.5.0's rollback copy of the pass file (PASS_FILE + UPGRADE_PREV_SUFFIX):
-/// removed at start.
-pub const PASS_PREV_FILE: &str = ".ircbot.pass.prev";
 /// How long a CMD_UPGRADE_PREPARE stays commitable.
 pub const UPGRADE_PREPARE_TTL: i64 = 900;
 /// Per-transfer budget (seconds) for the manifest read a PREPARE answer
@@ -60,9 +57,10 @@ pub const UPGRADE_WATCH_SECS: u32 = 20;
 /// channel it held ops in before, opped — at most this long (seconds), then
 /// it reports "ok" anyway with what is missing (bot.h UPGRADE_OPS_WAIT).
 pub const UPGRADE_OPS_WAIT: i64 = 180;
-/// The oldest upgrade target: an older build cannot read this config or
+/// The oldest upgrade target: 2.5.0 cannot link with a 2.5.2 hub
+/// (MESH_MIN_VERSION 2.5.1), and anything older cannot read this config or
 /// pass file (PBKDF2 600k since 2.5.0; bot.h UPGRADE_TARGET_MIN).
-pub const UPGRADE_TARGET_MIN: &str = "2.5.0";
+pub const UPGRADE_TARGET_MIN: &str = "2.5.1";
 /// How long a staged build's `-selftest` may run before it is killed.
 pub const SELFTEST_TIMEOUT: u64 = 15;
 /// The release tree ROOT; one variant subdirectory below it holds that build's
@@ -87,8 +85,14 @@ pub const DEAD_SERVER_TIMEOUT: i64 = 120;
 pub const CHECK_LAG_TIMEOUT: i64 = 60;
 /// Connected but no 001 by then: drop, try the next server.
 pub const IRC_REGISTER_TIMEOUT: i64 = 90;
+/// Still under a nick over 9 bytes by then: reconnect (10b).
+pub const NICK_OVERLONG_TIMEOUT: i64 = 60;
 pub const ROSTER_REFRESH_INTERVAL: i64 = 120;
 pub const HUB_RECONNECT_DELAY: i64 = 30;
+/// A hub link not authenticated this long after its connect is dropped: an
+/// endpoint that took the TCP connection and never finished the handshake
+/// kept the bot on it for good (`connect` waits while a link is set).
+pub const HUB_AUTH_TIMEOUT: i64 = 15;
 pub const IRC_RECONNECT_MIN_INTERVAL: i64 = 10;
 pub const IRC_THROTTLE_BACKOFF: i64 = 60;
 pub const IRC_THROTTLE_BACKOFF_MAX: i64 = 1800;
@@ -174,7 +178,11 @@ pub const MAX_HUB_FRAME: usize = MAX_CONFIG_PAYLOAD + 64;
 pub const MAX_ROSTER_SIZE: usize = 500;
 pub const MAX_SEEN_HASHES: usize = 4096;
 pub const NONCE_CACHE_SIZE: usize = 4096;
-pub const NONCE_TTL_SECONDS: i64 = 60;
+/// Entries older than this are treated as empty.  A frame is accepted while
+/// its stamp is within ±B2_TS_SKEW of our clock, so for 2·skew seconds: a
+/// nonce must be remembered at least that long or a frame stamped ahead of us
+/// replays once it is forgotten (it was 60 against a 120 s window).
+pub const NONCE_TTL_SECONDS: i64 = 2 * B2_TS_SKEW + 1;
 pub const CONFIG_WRITE_DEBOUNCE_S: i64 = 5;
 
 // ---- Passwordless transport labels (shared with utils/ and irchub) ---------
@@ -313,6 +321,14 @@ pub const CMD_BOT_RETIRE: u8 = 0x7F;
 pub const CMD_BOT_RETIRE_ACK: u8 = 0x80;
 #[allow(dead_code)]
 pub const CMD_ADMIN_LIST_REVOKED: u8 = 0x81;
+/// Review 6: sequenced link framing (irchub's hub.h has the full contract).
+/// After the ACK each side sends "offer"; seeing the other's, it answers
+/// "go", and every frame it seals after its go carries 13 bytes of AAD:
+/// "LNK1" || direction (B bot->hub, H hub->bot) || 64-bit big-endian counter
+/// from 0, not sent.  A 2.5.1 hub ignores the offer and the link stays as it
+/// was.
+pub const CMD_LINK_SEQ: u8 = 0x83;
+pub const HUB_LINK_AAD_LEN: usize = 13;
 pub const USER_CHAN_RID_MAX: usize = 32;
 pub const USER_CHAN_PENDING: usize = 8;
 pub const USER_CHAN_REPLY_WAIT: i64 = 45; // s: the hub's CHAN_ELECT_TTL (40) + margin

@@ -126,23 +126,41 @@ impl IrcConn {
 
 // ---- TLS -------------------------------------------------------------------
 
-/// Certificates are not verified, as in the C bot (OpenSSL with the default
-/// SSL_VERIFY_NONE): IRC networks commonly use self-signed certificates, and
-/// the transport security that matters here -- admin commands, bot-to-bot
-/// traffic -- is end-to-end sealed on top of IRC.  The handshake signatures
-/// are still checked against the presented certificate.
+/// Review 9: the server's certificate is checked (Mozilla's roots, the name
+/// it was dialled by) but never enforced: IRC networks run self-signed
+/// certificates, and a bot must not lose its server over one.  The outcome
+/// is recorded in LAST_VERIFY for dial_event, which logs it and keeps it for
+/// `status`.  The bot is single-threaded and runs one IRC handshake at a
+/// time, so one slot is enough.  The handshake signatures are still checked
+/// against the presented certificate.
 #[derive(Debug)]
-struct AcceptAnyCert(Arc<CryptoProvider>);
+struct SoftVerify {
+    provider: Arc<CryptoProvider>,
+    inner: Option<Arc<rustls::client::WebPkiServerVerifier>>,
+}
 
-impl ServerCertVerifier for AcceptAnyCert {
+/// The last handshake's certificate check: Ok, or why it failed.
+static LAST_VERIFY: std::sync::Mutex<Option<Result<(), String>>> = std::sync::Mutex::new(None);
+
+impl ServerCertVerifier for SoftVerify {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
+        let r = match &self.inner {
+            Some(v) => v
+                .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            None => Err("no CA certificates".to_string()),
+        };
+        if let Ok(mut slot) = LAST_VERIFY.lock() {
+            *slot = Some(r);
+        }
         Ok(ServerCertVerified::assertion())
     }
 
@@ -156,7 +174,7 @@ impl ServerCertVerifier for AcceptAnyCert {
             message,
             cert,
             dss,
-            &self.0.signature_verification_algorithms,
+            &self.provider.signature_verification_algorithms,
         )
     }
 
@@ -170,12 +188,14 @@ impl ServerCertVerifier for AcceptAnyCert {
             message,
             cert,
             dss,
-            &self.0.signature_verification_algorithms,
+            &self.provider.signature_verification_algorithms,
         )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -196,31 +216,24 @@ fn tls_config() -> Option<Arc<ClientConfig>> {
             .with_safe_default_protocol_versions()
             .ok()?
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
+            .with_custom_certificate_verifier(Arc::new(SoftVerify {
+                inner: {
+                    let roots = rustls::RootCertStore::from_iter(
+                        webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+                    );
+                    rustls::client::WebPkiServerVerifier::builder_with_provider(
+                        Arc::new(roots),
+                        provider.clone(),
+                    )
+                    .build()
+                    .ok()
+                },
+                provider,
+            }))
             .with_no_client_auth();
         Some(Arc::new(cfg))
     })
     .clone()
-}
-
-/// Blocking TLS handshake on a freshly connected socket.
-fn tls_handshake(
-    stream: &mut std::net::TcpStream,
-    host: &str,
-    addr: &std::net::SocketAddr,
-) -> Option<Box<ClientConnection>> {
-    let cfg = tls_config()?;
-    let name = ServerName::try_from(host.to_string())
-        .unwrap_or_else(|_| ServerName::IpAddress(addr.ip().into()));
-    let mut conn = ClientConnection::new(cfg, name).ok()?;
-    stream.set_read_timeout(Some(TLS_HANDSHAKE_TIMEOUT)).ok()?;
-    stream.set_write_timeout(Some(TLS_HANDSHAKE_TIMEOUT)).ok()?;
-    while conn.is_handshaking() {
-        conn.complete_io(stream).ok()?;
-    }
-    stream.set_read_timeout(None).ok()?;
-    stream.set_write_timeout(None).ok()?;
-    Some(Box::new(conn))
 }
 
 // ---- Server refusals ---------------------------------------------------------
@@ -635,6 +648,9 @@ fn pick_server(state: &mut BotState, now: i64) -> Option<usize> {
 // ---- Link lifecycle ------------------------------------------------------------
 
 pub fn disconnect(state: &mut BotState) {
+    dial_abort(state); // a dial in flight goes with it
+    state.overlong_nick.clear();
+    state.overlong_since = 0;
     // Last chance for queued lines (a parting PRIVMSG, a restart notice) to
     // go out on whatever credit is left; a write error here already
     // disconnected.
@@ -703,8 +719,10 @@ pub fn irc_printf(state: &mut BotState, line: &str) -> i32 {
 /// `ircf!(state, "FMT\r\n", args...)` -- irc_printf with format!.
 #[macro_export]
 macro_rules! ircf {
+    // Zeroizing: a ~A2S reply's plaintext is wiped once the line is sent
+    // (sealed or not), as C wipes irc_printf's buffer (review 2026-10-25 L1).
     ($st:expr, $($arg:tt)*) => {
-        $crate::irc_client::irc_printf($st, &format!($($arg)*))
+        $crate::irc_client::irc_printf($st, &zeroize::Zeroizing::new(format!($($arg)*)))
     };
 }
 
@@ -817,7 +835,8 @@ pub fn write_raw(state: &mut BotState, line: &[u8]) -> i32 {
         return -1;
     }
     if !HIDEPINGPONG || !line_is_keepalive(&String::from_utf8_lossy(line)) {
-        logm!(state, L_RAW, "[RAW_SEND] {}", String::from_utf8_lossy(line));
+        let s = zeroize::Zeroizing::new(String::from_utf8_lossy(line).into_owned());
+        state.log.log_raw(&state.isup, "[RAW_SEND] ", &s);
     }
     let res = match state.irc.as_mut() {
         Some(c) => c.queue(line).map(|_| c.is_tls()),
@@ -845,7 +864,7 @@ pub fn write_raw(state: &mut BotState, line: &[u8]) -> i32 {
 /// Dial the next eligible server: its configured port, or 6667 then 6697.
 /// Port 6697 is TLS.
 pub fn connect(state: &mut BotState) {
-    if state.irc.is_some() {
+    if state.irc.is_some() || state.irc_dial.is_some() {
         return;
     }
     let attempt_now = now();
@@ -879,19 +898,69 @@ pub fn connect(state: &mut BotState) {
         None => None,
     };
 
-    let mut established: Option<(std::net::TcpStream, Option<Box<ClientConnection>>)> = None;
-    for port in &ports {
-        logm!(
-            state,
-            L_INFO,
-            "[INFO] Attempting to connect to {}:{}...\n",
-            host,
-            port
-        );
-        let Ok(addrs) = net::resolve(host, port) else {
-            continue;
+    state.irc_dial = Some(IrcDial {
+        host: host.to_string(),
+        ports: ports.iter().map(|p| p.to_string()).collect(),
+        port_idx: None,
+        addrs: Vec::new(),
+        next: 0,
+        vhost,
+        conn: None,
+        tls: None,
+        started: 0,
+    });
+    dial_next(state);
+    state.current_server_index += 1;
+}
+
+/// Review 16: the IRC dial in flight (C irc_client.c `g_dial`).  connect()
+/// picks the server and starts it: each address of each port (the configured
+/// one, else 6667 then 6697 with TLS) gets a non-blocking connect, and a TLS
+/// port then a non-blocking handshake, both driven by poll events on the
+/// dial's token and bounded per step by dial_tick (CONNECT_TIMEOUT_SECS a
+/// connect, TLS_HANDSHAKE_TIMEOUT the handshake).  The blocking connect froze
+/// the bot up to 10 s per dead address.  state.irc stays None until the link
+/// is up, so nothing else sees a half-open one.  (Name resolution still
+/// blocks.)
+pub struct IrcDial {
+    host: String,
+    ports: Vec<String>,
+    /// ports[port_idx] is the port being tried.
+    port_idx: Option<usize>,
+    /// Its addresses; addrs[next..] still to try.
+    addrs: Vec<std::net::SocketAddr>,
+    next: usize,
+    vhost: Option<std::net::IpAddr>,
+    /// The address in flight: its socket (registered) and token.
+    conn: Option<(mio::net::TcpStream, mio::Token, std::net::SocketAddr)>,
+    /// Some: the connect is done and the TLS handshake is running.
+    tls: Option<Box<ClientConnection>>,
+    /// When the current step began.
+    started: i64,
+}
+
+/// Close the address in flight (and its half-done TLS session).
+fn dial_drop(state: &mut BotState) {
+    let Some(d) = state.irc_dial.as_mut() else {
+        return;
+    };
+    d.tls = None;
+    if let Some((mut sock, _, _)) = d.conn.take() {
+        let _ = state.registry.deregister(&mut sock);
+    }
+}
+
+/// Start a connect to the next address that takes one, resolving the next
+/// port when this one's run out; nothing left: the attempt is over.
+fn dial_next(state: &mut BotState) {
+    loop {
+        let Some(d) = state.irc_dial.as_mut() else {
+            return;
         };
-        for addr in addrs {
+        if d.next < d.addrs.len() {
+            let addr = d.addrs[d.next];
+            d.next += 1;
+            let vhost = d.vhost;
             if let Some(v) = vhost
                 && v.is_ipv4() != addr.is_ipv4()
             {
@@ -911,88 +980,286 @@ pub fn connect(state: &mut BotState) {
                 }
                 Err(_) => continue,
             };
-            let mut stream = match net::connect_timeout(sock, &addr, CONNECT_TIMEOUT_SECS) {
-                Ok(s) => s,
-                Err(e) => {
-                    if e.kind() == io::ErrorKind::TimedOut {
-                        logm!(
-                            state,
-                            L_INFO,
-                            "[INFO] Connection timeout after {} seconds.\n",
-                            CONNECT_TIMEOUT_SECS
-                        );
-                    }
-                    continue;
-                }
+            let Ok(mut sock) = net::start_connect(sock, &addr) else {
+                continue;
             };
-            if *port == "6697" {
-                match tls_handshake(&mut stream, host, &addr) {
-                    Some(tls) => {
-                        logm!(state, L_INFO, "[INFO] Secure TLS connection established.\n");
-                        established = Some((stream, Some(tls)));
-                    }
-                    None => match crate::updater::tls_unusable_reason() {
-                        Some(why) => logm!(state, L_INFO, "[INFO] No TLS: {}.\n", why),
-                        None => logm!(
-                            state,
-                            L_INFO,
-                            "[INFO] SSL handshake failed. Trying insecure.\n"
-                        ),
-                    },
-                }
-            } else {
-                logm!(state, L_INFO, "[INFO] Insecure connection established.\n");
-                established = Some((stream, None));
-            }
-            break;
-        }
-        if established.is_some() {
-            break;
-        }
-    }
-
-    if let Some((stream, tls)) = established {
-        let token = state.new_token(net::SLOT_IRC);
-        match net::into_mio(stream).and_then(|mut s| {
-            state
+            let token = state.new_token(net::SLOT_IRC);
+            if state
                 .registry
-                .register(&mut s, token, net::INTEREST)
-                .map(|_| s)
-        }) {
-            Ok(sock) => {
-                state.irc = Some(IrcConn {
-                    sock,
-                    token,
-                    tls,
-                    rbuf: Vec::new(),
-                    wbuf: Vec::new(),
-                });
-                sendq::clear(state); // new link: empty queue, full burst
-                chanlive::isupport_reset(state);
-                let t = now();
-                state.status = S_CONNECTED;
-                state.last_pong_time = t;
-                state.pong_pending = false;
-                state.connection_time = t;
-                state.current_nick = state.target_nick.clone();
-                let nick = state.current_nick.clone();
-                let (user, gecos) = (state.user.clone(), state.gecos.clone());
-                crate::ircf!(state, "NICK {}\r\n", nick);
-                crate::ircf!(state, "USER {} 0 * :{}\r\n", user, gecos);
+                .register(&mut sock, token, net::INTEREST)
+                .is_err()
+            {
+                continue;
             }
-            Err(e) => logm!(
-                state,
-                L_INFO,
-                "[INFO] Could not register IRC socket: {}\n",
-                e
-            ),
+            if let Some(d) = state.irc_dial.as_mut() {
+                d.conn = Some((sock, token, addr));
+                d.tls = None;
+                d.started = now();
+            }
+            return;
+        }
+        let idx = d.port_idx.map_or(0, |i| i + 1);
+        if idx >= d.ports.len() {
+            state.irc_dial = None;
+            return;
+        }
+        d.port_idx = Some(idx);
+        d.addrs.clear();
+        d.next = 0;
+        let (host, port) = (d.host.clone(), d.ports[idx].clone());
+        logm!(
+            state,
+            L_INFO,
+            "[INFO] Attempting to connect to {}:{}...\n",
+            host,
+            port
+        );
+        let addrs = net::resolve(&host, &port).unwrap_or_default();
+        if let Some(d) = state.irc_dial.as_mut() {
+            d.addrs = addrs;
         }
     }
-    state.current_server_index += 1;
+}
+
+/// A failed TLS port is not tried further (as before: the rest of its
+/// addresses are skipped).
+fn dial_skip_port(state: &mut BotState) {
+    if let Some(d) = state.irc_dial.as_mut() {
+        d.next = d.addrs.len();
+    }
+}
+
+/// A poll event on the dial's token.
+fn dial_event(state: &mut BotState) {
+    let Some(d) = state.irc_dial.as_mut() else {
+        return;
+    };
+    if d.tls.is_none() {
+        // The connect: done once the socket has a peer, failed on an error.
+        let Some((sock, _, addr)) = d.conn.as_ref() else {
+            return;
+        };
+        let addr = *addr;
+        match sock.take_error() {
+            Ok(None) => {}
+            _ => {
+                dial_drop(state);
+                dial_next(state);
+                return;
+            }
+        }
+        if sock.peer_addr().is_err() {
+            return; // still in flight
+        }
+        let port_is_tls = d.port_idx.is_some_and(|i| d.ports[i] == "6697");
+        if !port_is_tls {
+            logm!(state, L_INFO, "[INFO] Insecure connection established.\n");
+            dial_up(state);
+            return;
+        }
+        let host = d.host.clone();
+        let conn = tls_config().and_then(|cfg| {
+            let name = ServerName::try_from(host)
+                .unwrap_or_else(|_| ServerName::IpAddress(addr.ip().into()));
+            ClientConnection::new(cfg, name).ok()
+        });
+        let Some(conn) = conn else {
+            dial_tls_failed(state);
+            return;
+        };
+        if let Ok(mut slot) = LAST_VERIFY.lock() {
+            *slot = None;
+        }
+        if let Some(d) = state.irc_dial.as_mut() {
+            d.tls = Some(Box::new(conn));
+            d.started = now();
+        }
+    }
+    // The TLS handshake: as far as the socket lets it go.
+    let Some(d) = state.irc_dial.as_mut() else {
+        return;
+    };
+    let (Some((sock, _, _)), Some(tls)) = (d.conn.as_mut(), d.tls.as_mut()) else {
+        return;
+    };
+    match tls_step(sock, tls) {
+        Ok(true) => {
+            logm!(state, L_INFO, "[INFO] Secure TLS connection established.\n");
+            tls_check_result(state);
+            dial_up(state);
+        }
+        Ok(false) => {}
+        Err(()) => dial_tls_failed(state),
+    }
+}
+
+/// Review 9: the handshake is done; was the certificate good?  Only
+/// recorded: the link stays up, and the log and `status` say so.
+fn tls_check_result(state: &mut BotState) {
+    let r = LAST_VERIFY
+        .lock()
+        .ok()
+        .and_then(|mut s| s.take())
+        .unwrap_or_else(|| Err("no certificate".to_string()));
+    let host = state
+        .irc_dial
+        .as_ref()
+        .map(|d| d.host.clone())
+        .unwrap_or_default();
+    state.irc_tls_verified = r.is_ok();
+    state.irc_tls_why = trunc_string(r.err().as_deref().unwrap_or(""), 96);
+    if state.irc_tls_verified {
+        logm!(
+            state,
+            L_INFO,
+            "[INFO] TLS certificate of {} verified.\n",
+            host
+        );
+    } else {
+        logm!(
+            state,
+            L_INFO,
+            "[WARN] TLS certificate of {} NOT verified ({}): the link is encrypted, but the server's identity is unchecked.\n",
+            host,
+            state.irc_tls_why
+        );
+    }
+}
+
+/// One pass of a non-blocking TLS handshake: Ok(true) done, Ok(false) the
+/// socket would block, Err on a failure or EOF.
+fn tls_step(sock: &mut mio::net::TcpStream, tls: &mut ClientConnection) -> Result<bool, ()> {
+    loop {
+        while tls.wants_write() {
+            match tls.write_tls(sock) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return Err(()),
+            }
+        }
+        if !tls.is_handshaking() {
+            return Ok(true);
+        }
+        match tls.read_tls(sock) {
+            Ok(0) => return Err(()),
+            Ok(_) => {
+                tls.process_new_packets().map_err(|_| ())?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(()),
+        }
+    }
+}
+
+fn dial_tls_failed(state: &mut BotState) {
+    match crate::updater::tls_unusable_reason() {
+        Some(why) => logm!(state, L_INFO, "[INFO] No TLS: {}.\n", why),
+        None => logm!(
+            state,
+            L_INFO,
+            "[INFO] SSL handshake failed. Trying insecure.\n"
+        ),
+    }
+    dial_drop(state);
+    dial_skip_port(state);
+    dial_next(state);
+}
+
+/// Up: the dial's socket becomes the IRC link and the registration goes out.
+fn dial_up(state: &mut BotState) {
+    let Some(mut d) = state.irc_dial.take() else {
+        return;
+    };
+    let Some((sock, token, _)) = d.conn.take() else {
+        return;
+    };
+    if d.tls.is_none() {
+        state.irc_tls_verified = false;
+        state.irc_tls_why.clear();
+    }
+    state.irc = Some(IrcConn {
+        sock,
+        token,
+        tls: d.tls.take(),
+        rbuf: Vec::new(),
+        wbuf: Vec::new(),
+    });
+    sendq::clear(state); // new link: empty queue, full burst
+    chanlive::isupport_reset(state);
+    let t = now();
+    state.status = S_CONNECTED;
+    state.last_pong_time = t;
+    state.pong_pending = false;
+    state.connection_time = t;
+    state.current_nick = state.target_nick.clone();
+    let nick = state.current_nick.clone();
+    let (user, gecos) = (state.user.clone(), state.gecos.clone());
+    crate::ircf!(state, "NICK {}\r\n", nick);
+    crate::ircf!(state, "USER {} 0 * :{}\r\n", user, gecos);
+}
+
+/// A step that has not finished in its bound: on to the next address (a TLS
+/// port that stalls is given up like one that fails).
+pub fn dial_tick(state: &mut BotState) {
+    let Some(d) = state.irc_dial.as_ref() else {
+        return;
+    };
+    if d.conn.is_none() {
+        return;
+    }
+    let tls = d.tls.is_some();
+    let bound = if tls {
+        TLS_HANDSHAKE_TIMEOUT.as_secs() as i64
+    } else {
+        CONNECT_TIMEOUT_SECS as i64
+    };
+    if now() - d.started <= bound {
+        return;
+    }
+    if tls {
+        logm!(
+            state,
+            L_INFO,
+            "[INFO] TLS handshake timeout after {} seconds.\n",
+            bound
+        );
+        dial_drop(state);
+        dial_skip_port(state);
+    } else {
+        logm!(
+            state,
+            L_INFO,
+            "[INFO] Connection timeout after {} seconds.\n",
+            bound
+        );
+        dial_drop(state);
+    }
+    dial_next(state);
+}
+
+pub fn dialing(state: &BotState) -> bool {
+    state.irc_dial.is_some()
+}
+
+/// Give the dial up entirely (a disconnect, a server change, shutdown).
+pub fn dial_abort(state: &mut BotState) {
+    dial_drop(state);
+    state.irc_dial = None;
 }
 
 /// A poll event for the IRC socket.
 pub fn handle_event(state: &mut BotState, token: mio::Token, readable: bool, writable: bool) {
+    if state
+        .irc_dial
+        .as_ref()
+        .and_then(|d| d.conn.as_ref())
+        .is_some_and(|c| c.1 == token)
+    {
+        dial_event(state);
+        return;
+    }
     if state.irc.as_ref().map(|c| c.token) != Some(token) {
         return;
     }
@@ -1040,7 +1307,7 @@ fn handle_read(state: &mut BotState, token: mio::Token) {
             }
             let line = crate::cstr::until_nul(&line).to_string();
             if !HIDEPINGPONG || !line_is_keepalive(&line) {
-                logm!(state, L_RAW, "[RAW_RECV] {}\n", line);
+                state.log.log_raw(&state.isup, "[RAW_RECV] ", &line);
             }
             irc_parser::handle_line(state, &line);
         }
@@ -1082,12 +1349,26 @@ pub fn check_status(state: &mut BotState) {
             "[HUB] Connection timed out (Watchdog). Reconnecting...\n"
         );
         hub_client::drop_link(state);
+    } else if !state.hubs.is_empty()
+        && (state.hub.is_some() || hub_client::dialing(state))
+        && !state.hub_authenticated
+        && now - state.last_hub_connect_attempt > HUB_AUTH_TIMEOUT
+        && !hub_client::data_waiting(state)
+    {
+        logm!(
+            state,
+            L_INFO,
+            "[HUB] Handshake not finished in {} s — dropping the link\n",
+            HUB_AUTH_TIMEOUT
+        );
+        hub_client::disconnect(state);
     }
 
     if state.status & S_CONNECTED == 0 {
         // Floor between attempts: a server that drops us before registration
         // must not be redialled every tick.
-        if now - state.last_irc_attempt >= IRC_RECONNECT_MIN_INTERVAL {
+        dial_tick(state);
+        if !dialing(state) && now - state.last_irc_attempt >= IRC_RECONNECT_MIN_INTERVAL {
             connect(state);
         }
         return;
@@ -1118,6 +1399,21 @@ pub fn check_status(state: &mut BotState) {
         state.pong_pending = true;
     }
 
+    if state.status & S_AUTHED != 0
+        && state.overlong_since != 0
+        && now - state.overlong_since > NICK_OVERLONG_TIMEOUT
+    {
+        logm!(
+            state,
+            L_INFO,
+            "[INFO] Still under {} (over {} characters) after {}s: reconnecting\n",
+            state.overlong_nick,
+            MAX_NICK - 1,
+            NICK_OVERLONG_TIMEOUT
+        );
+        disconnect(state);
+        return;
+    }
     if state.status & S_AUTHED != 0 {
         channel::check_joins(state);
         if !state.nick_change_pending {
@@ -1158,6 +1454,30 @@ pub fn attempt_nick_change(state: &mut BotState, new_nick: &str) {
     logm!(state, L_DEBUG, "[DEBUG] Attemping NICK to {}\n", new_nick);
     crate::ircf!(state, "NICK {}\r\n", new_nick);
     state.last_nick_attempt = now();
+}
+
+/// Review 10b: the server put us under `nick`, over the 9 bytes a bot nick
+/// may be (a long 001, a services rename to Guest123456).  Nothing longer is
+/// stored or sent to the hub: the bot renames itself back to its target now,
+/// and with current_nick empty the reclaim in check_status keeps trying; a
+/// refused target falls back to the 9-byte alternates (on_nick_refused).
+/// Still over 9 after NICK_OVERLONG_TIMEOUT, it reconnects.
+pub fn nick_overlong(state: &mut BotState, nick: &str) {
+    if state.overlong_since == 0 {
+        state.overlong_since = now();
+    }
+    state.overlong_nick = trunc_string(nick, MAX_MEMBER_NICK);
+    state.current_nick.clear();
+    logm!(
+        state,
+        L_INFO,
+        "[INFO] Server put me under {}, over {} characters: renaming back to {}\n",
+        state.overlong_nick,
+        MAX_NICK - 1,
+        state.target_nick
+    );
+    let target = state.target_nick.clone();
+    attempt_nick_change(state, &target);
 }
 
 /// Next alternate nick: the target's RFC characters cut to 8 plus one

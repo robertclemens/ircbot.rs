@@ -143,7 +143,7 @@ fn open_and_dispatch(state: &mut BotState, ti: usize, b64: &str, sender_nick: Op
         state,
         L_DEBUG,
         "[BOT-COMM] ~B2 verified from {} ({})\n",
-        sender.uuid,
+        auth::who(state, 'b', &sender.uuid),
         if sender_nick.is_some() {
             "privmsg"
         } else {
@@ -171,7 +171,7 @@ fn open_and_dispatch(state: &mut BotState, ti: usize, b64: &str, sender_nick: Op
                 state,
                 L_INFO,
                 "[BOT-COMM] SETNICK from {} refused: '{}' is not a valid IRC nick\n",
-                sender.uuid,
+                auth::who(state, 'b', &sender.uuid),
                 arg1
             );
         }
@@ -261,7 +261,7 @@ pub fn process_payload(state: &mut BotState, payload: &str) {
             state,
             L_CMD,
             "[BOT-COMM] Relayed frame from {} is not ~B2; dropped\n",
-            uuid
+            auth::who(state, 'b', uuid)
         );
         return;
     };
@@ -270,8 +270,8 @@ pub fn process_payload(state: &mut BotState, payload: &str) {
         None => logm!(
             state,
             L_CMD,
-            "[BOT-COMM] Relayed ~B2 from unknown bot {}\n",
-            uuid
+            "[BOT-COMM] Relayed ~B2 from unknown {}\n",
+            auth::who(state, 'b', uuid)
         ),
     }
 }

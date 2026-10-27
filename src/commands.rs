@@ -216,7 +216,7 @@ fn bots_tree_row(
     } else if r.has_started {
         if r.started > 0 { t - r.started } else { 0 }
     } else {
-        r.uptime + age
+        r.uptime.saturating_add(age)
     };
     BotsRow {
         name: format!("{prefix}{}", trunc(&label, TREE_NAME_MAX + 32)),
@@ -324,7 +324,6 @@ const LOGGABLE_CMDS: &[(&str, u32)] = &[
     ("status", 0),
     ("givenick", 0),
     ("chnick", 0),
-    ("saveconf", 0),
     ("setlog", 0),
     ("getlog", 0),
     ("admins", 0),
@@ -1032,7 +1031,6 @@ const BOT_CMD_FLAGS: &[(&str, char)] = &[
     ("-bot", 'b'),
     ("givenick", 'b'),
     ("chnick", 'b'),
-    ("saveconf", 'b'),
     ("rekey", 'b'),
     ("+server", 'b'),
     ("-server", 'b'),
@@ -1150,7 +1148,7 @@ fn help_admin_list(state: &mut BotState, nick: &str, who: usize) {
         ],
         &["+bot", "-bot", "+hub", "-hub", "rekey"],
         &["chanmode", "chanset", "+ban", "-ban", "bans"],
-        &["saveconf", "setlog", "getlog", "update", "help"],
+        &["setlog", "getlog", "update", "help"],
     ];
     const HUB_ONLY: &[&str] = &[
         "+admin",
@@ -1476,15 +1474,6 @@ fn admin_command(
             state.nick_release_time = now();
         }
         "chnick" => cmd_chnick(state, nick, a),
-        "saveconf" => {
-            config::write_with_state_pass(state);
-            ircf!(
-                state,
-                "PRIVMSG {} :Configuration state saved to {}.\r\n",
-                nick,
-                CONFIG_FILE
-            );
-        }
         "setlog" => {
             let Some(arg1) = a.a1 else {
                 let cap = state.log.max_size;
@@ -1728,6 +1717,15 @@ fn cmd_join(state: &mut BotState, nick: &str, a: Args<'_>) {
         return;
     };
     let name = chan_arg(arg1, false);
+    if !crate::chancfg::valid_chan_name(&name) {
+        ircf!(
+            state,
+            "PRIVMSG {} :Error: {} is not a channel name.\r\n",
+            nick,
+            name
+        );
+        return;
+    }
     let found = channel::find(state, &name);
     if found.is_some_and(|ci| state.chans[ci].is_managed) {
         ircf!(
@@ -1741,6 +1739,10 @@ fn cmd_join(state: &mut BotState, nick: &str, a: Args<'_>) {
     // Past any stamp this channel had (a part in this same second).
     let prev_ts = found.map_or(0, |ci| state.chans[ci].timestamp);
     let ci = found.or_else(|| channel::add(state, &name));
+    if ci.is_none() {
+        say(state, nick, "Error: no room for another channel.");
+        return;
+    }
     if let Some(ci) = ci {
         let c = &mut state.chans[ci];
         if let Some(k) = a.a2 {
@@ -1758,8 +1760,7 @@ fn cmd_join(state: &mut BotState, nick: &str, a: Args<'_>) {
             ts
         );
     }
-    config::write_with_state_pass(state);
-    hub_client::push_config(state);
+    config::write_with_state_pass(state); // pushes to the hub as well
     ircf!(
         state,
         "PRIVMSG {} :JOIN {} and saving config file.\r\n",
@@ -2041,7 +2042,13 @@ fn cmd_status(state: &mut BotState, nick: &str) {
         nick,
         srv,
         conn,
-        if tls { "YES" } else { "NO" }
+        if !tls {
+            "NO".to_string()
+        } else if state.irc_tls_verified {
+            "YES (verified)".to_string()
+        } else {
+            format!("YES (UNVERIFIED: {})", state.irc_tls_why)
+        }
     );
 
     if state.server_list.len() > 1 {
@@ -3464,8 +3471,7 @@ fn cmd_add_hub(state: &mut BotState, nick: &str, a: Args<'_>) {
         ed_pub,
         ed_pub_set: true,
     });
-    config::write_with_state_pass(state);
-    hub_client::push_config(state); // its hl| list changed
+    config::write_with_state_pass(state); // pushes: its hl| list changed
     ircf!(
         state,
         "PRIVMSG {} :Added Hub: {} (pubkey pinned)\r\n",
@@ -3504,8 +3510,7 @@ fn cmd_del_hub(state: &mut BotState, nick: &str, a: Args<'_>) {
         hub_client::disconnect(state);
     }
     state.hubs.remove(i);
-    config::write_with_state_pass(state);
-    hub_client::push_config(state); // its hl| list changed
+    config::write_with_state_pass(state); // pushes: its hl| list changed
     ircf!(state, "PRIVMSG {} :Removed Hub: {}\r\n", nick, addr);
     if is_current && !state.hubs.is_empty() {
         say(state, nick, "Reconnecting to another hub...");
@@ -3736,7 +3741,6 @@ fn admin_help(state: &mut BotState, nick: &str, who: usize, topic: Option<&str>)
         "-bot" => {
             "Syntax: -bot <nick*!*user@hostmask.com> - Removes a bot from the known bot list as shown in the 'status' command."
         }
-        "saveconf" => "Syntax: saveconf - Immediately save config file.",
         "setlog" => {
             "Syntax: setlog <loglevel> [maxbytes] - Set loglevel for output to a log file, and optionally its size cap. 0=NONE,15=INFO,63=DEBUG."
         }

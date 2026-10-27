@@ -1,6 +1,6 @@
 [package]
 name = "ircbot"
-version = "2.5.1"
+version = "2.5.2"
 edition = "2024"
 rust-version = "1.89"
 description = "IRC bot with an encrypted hub mesh (safe-Rust port of ircbot.c)"
@@ -55,6 +55,10 @@ mio = { version = "1", features = ["os-poll", "net"] }
 socket2 = "0.6"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-graviola = "0.4"
+# The IRC server certificate check (review 9): Mozilla's roots, bundled, as
+# the updater's HTTPS already uses through ureq -- the same on every host and
+# in the static build.
+webpki-roots = "1"
 ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots", "gzip"] }
 
 # OS integration through safe wrappers.

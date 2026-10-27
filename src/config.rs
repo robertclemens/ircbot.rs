@@ -12,8 +12,9 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use zeroize::Zeroizing;
 
 use crate::consts::*;
-use crate::crypto;
+use crate::crypto::{self, Key32};
 use crate::cstr::{Scan, atoll, is_uuid, now, split_fields, strtoll, trunc_string};
+use crate::secret::Locked;
 use crate::state::{
     BotState, ChanStatus, HubEntry, MaskRecord, TrustedBot, UserLine, UserRecord, lww_accepts,
 };
@@ -239,6 +240,7 @@ fn decrypt_file(state: &BotState, password: &str, filename: &str) -> Option<Zero
     }
     let key = crypto::derive_config_key(password.as_bytes(), salt, PBKDF2_ITERATIONS);
     if let Some(pt) = crypto::gcm_decrypt_detached(key.as_ref(), iv, &[], ct, tag) {
+        cfg_key_keep(salt, &key);
         return Some(pt);
     }
     logm!(
@@ -247,6 +249,41 @@ fn decrypt_file(state: &BotState, password: &str, filename: &str) -> Option<Zero
         "[CFG] Decryption failed (wrong password, or a config written before 2.5.0: run 2.5.0 once).\n"
     );
     None
+}
+
+/// Review 23: the config key, derived once per process (the first load or
+/// write) and reused.  A 600k-round PBKDF2 on every write froze the bot for
+/// ~0.5 s, and any chanop toggling +k/-k could trigger one.  The key is bound
+/// to the salt it was derived with (`salt || key`), which every later write
+/// reuses under a fresh IV.  A process has one password (the startup one), so
+/// nothing else invalidates it; mlock'd like that password, wiped by
+/// `key_forget` at shutdown (and on drop).
+static CFG_KEY: std::sync::Mutex<Option<Locked<{ SALT_SIZE + 32 }>>> = std::sync::Mutex::new(None);
+
+fn cfg_key_keep(salt: &[u8], key: &[u8; 32]) {
+    let mut sk = Zeroizing::new([0u8; SALT_SIZE + 32]);
+    sk[..SALT_SIZE].copy_from_slice(salt);
+    sk[SALT_SIZE..].copy_from_slice(key);
+    if let Ok(mut g) = CFG_KEY.lock() {
+        g.get_or_insert_with(Locked::new).set(&sk);
+    }
+}
+
+/// The cached (salt, key), if a load or write has derived one.
+fn cfg_key_cached() -> Option<([u8; SALT_SIZE], Key32)> {
+    let g = CFG_KEY.lock().ok()?;
+    let sk = g.as_ref()?.get();
+    let mut salt = [0u8; SALT_SIZE];
+    salt.copy_from_slice(&sk[..SALT_SIZE]);
+    let mut key = Key32::new([0u8; 32]);
+    key.copy_from_slice(&sk[SALT_SIZE..]);
+    Some((salt, key))
+}
+
+pub fn key_forget() {
+    if let Ok(mut g) = CFG_KEY.lock() {
+        *g = None;
+    }
 }
 
 /// Set by `-selftest`: load() must not rewrite the file the running build
@@ -676,13 +713,24 @@ fn write_file(state: &BotState, password: &str) {
         let _ = fs::remove_file(CONFIG_FILE);
         return;
     }
-    let mut salt = [0u8; SALT_SIZE];
+    let (salt, key) = match cfg_key_cached() {
+        Some(sk) => sk,
+        None => {
+            let mut salt = [0u8; SALT_SIZE];
+            if !crypto::random_bytes(&mut salt) {
+                eprintln!("[CFG] RNG/KDF failure; aborting config write.");
+                return;
+            }
+            let key = crypto::derive_config_key(password.as_bytes(), &salt, PBKDF2_ITERATIONS);
+            cfg_key_keep(&salt, &key);
+            (salt, key)
+        }
+    };
     let mut iv = [0u8; GCM_IV_LEN];
-    if !crypto::random_bytes(&mut salt) || !crypto::random_bytes(&mut iv) {
+    if !crypto::random_bytes(&mut iv) {
         eprintln!("[CFG] RNG/KDF failure; aborting config write.");
         return;
     }
-    let key = crypto::derive_config_key(password.as_bytes(), &salt, PBKDF2_ITERATIONS);
     let Some((ct, tag)) =
         crypto::gcm_encrypt_detached(key.as_ref(), &iv, &[], plaintext.as_bytes())
     else {

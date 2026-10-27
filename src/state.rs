@@ -807,9 +807,25 @@ pub struct BotState {
     pub nick_release_time: i64,
     pub last_nick_attempt: i64,
     pub nick_refused: String,
+    /// Review 10b: a nick over 9 bytes the server put us under (a long 001,
+    /// a services rename).  current_nick cannot hold it, so it is kept here
+    /// only to recognise the NICK that renames us back; overlong_since says
+    /// since when, and a bot still over 9 after NICK_OVERLONG_TIMEOUT
+    /// reconnects.
+    pub overlong_nick: String,
+    pub overlong_since: i64,
     pub pong_pending: bool,
     pub nick_change_pending: bool,
     pub irc: Option<IrcConn>,
+    /// Review 9: the IRC server's certificate checked against the CA roots
+    /// and its name (never enforced: an unverified server is still joined,
+    /// with a warning); why it failed, for the log and `status`.
+    pub irc_tls_verified: bool,
+    pub irc_tls_why: String,
+    /// Review 16: the IRC dial in flight (irc_client::IrcDial).
+    pub irc_dial: Option<crate::irc_client::IrcDial>,
+    /// Review 16: the hub dial in flight (hub_client::HubDial).
+    pub hub_dial: Option<crate::hub_client::HubDial>,
     pub log: Logger,
     pub chans: Vec<Chan>,
 
@@ -865,6 +881,13 @@ pub struct BotState {
     /// config::write_file never writes them again before the bot exits.
     pub retired: bool,
     pub hub_session_key: Locked<32>,
+    /// Review 6 (CMD_LINK_SEQ): the hub's offer seen, our go sent, its go
+    /// seen; counters of the frames sealed / opened since.  Reset per link.
+    pub hub_link_offered: bool,
+    pub hub_link_tx_seq: bool,
+    pub hub_link_rx_seq: bool,
+    pub hub_link_tx_ctr: u64,
+    pub hub_link_rx_ctr: u64,
     pub last_hub_connect_attempt: i64,
     pub last_hub_ping_time: i64,
     pub last_hub_activity: i64,
@@ -983,9 +1006,15 @@ impl BotState {
             nick_release_time: t - NICK_TAKE_TIME,
             last_nick_attempt: 0,
             nick_refused: String::new(),
+            overlong_nick: String::new(),
+            overlong_since: 0,
             pong_pending: false,
             nick_change_pending: false,
             irc: None,
+            irc_dial: None,
+            irc_tls_verified: false,
+            irc_tls_why: String::new(),
+            hub_dial: None,
             log: Logger::new(DEFAULT_LOG_LEVEL),
             chans: Vec::new(),
             startup_password: Locked::new(),
@@ -1025,6 +1054,11 @@ impl BotState {
             hub_authenticated: false,
             retired: false,
             hub_session_key: Locked::new(),
+            hub_link_offered: false,
+            hub_link_tx_seq: false,
+            hub_link_rx_seq: false,
+            hub_link_tx_ctr: 0,
+            hub_link_rx_ctr: 0,
             last_hub_connect_attempt: 0,
             last_hub_ping_time: 0,
             last_hub_activity: 0,
@@ -1109,7 +1143,7 @@ impl BotState {
 /// past its previous stamp (hubs and bots accept only a strictly newer one).
 pub fn lww_next_ts(prev: i64) -> i64 {
     let t = now();
-    if t > prev { t } else { prev + 1 }
+    if t > prev { t } else { prev.saturating_add(1) }
 }
 
 /// LWW acceptance for an add/del record: newer wins; on a tie a delete beats
