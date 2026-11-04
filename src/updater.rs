@@ -228,6 +228,38 @@ fn fetch(url: &str, limit: u64) -> Option<Vec<u8>> {
 }
 
 fn download(url: &str, path: &str) -> bool {
+    download_with(url, path, &mut |_, _| {})
+}
+
+/// `std::io::copy`, telling `tick` as it goes when the size is known.
+fn copy_with(
+    r: &mut dyn std::io::Read,
+    w: &mut dyn std::io::Write,
+    total: u64,
+    tick: &mut dyn FnMut(u64, u64),
+) -> bool {
+    let mut buf = [0u8; 65536];
+    let mut got = 0u64;
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) => return true,
+            Ok(n) => {
+                if w.write_all(&buf[..n]).is_err() {
+                    return false;
+                }
+                got += n as u64;
+                if total > 0 {
+                    tick(got, total);
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+/// As `download`; `tick` hears the bytes so far against the size the server gave.
+fn download_with(url: &str, path: &str, tick: &mut dyn FnMut(u64, u64)) -> bool {
     if let Some(src) = file_url_path(url) {
         return std::fs::metadata(src).is_ok_and(|m| m.len() <= MAX_ARCHIVE)
             && std::fs::copy(src, path).is_ok();
@@ -238,6 +270,12 @@ fn download(url: &str, path: &str) -> bool {
     let Ok(mut resp) = agent().get(url).call() else {
         return false;
     };
+    let total = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
     let Ok(mut f) = OpenOptions::new()
         .write(true)
         .create(true)
@@ -248,7 +286,7 @@ fn download(url: &str, path: &str) -> bool {
         return false;
     };
     let mut reader = resp.body_mut().with_config().limit(MAX_ARCHIVE).reader();
-    std::io::copy(&mut reader, &mut f).is_ok() && f.flush().is_ok()
+    copy_with(&mut reader, &mut f, total, tick) && f.flush().is_ok()
 }
 
 /// Test hook, compiled in only with the `test-hooks` feature (the testnet's
@@ -533,66 +571,6 @@ fn sanitize_filename(input: &str) -> Option<String> {
     (out.len() >= 8 && out.ends_with(".tar.gz")).then_some(out)
 }
 
-fn upgrade_script(pid: u32, archive: &str, backup: &str, exe: &str) -> String {
-    format!(
-        r#"#!/bin/bash
-OLD_PID={pid}
-echo "[UPGRADE] Waiting for old process (PID: $OLD_PID) to exit..."
-for i in {{1..30}}; do
-  if ! kill -0 $OLD_PID 2>/dev/null; then
-    break
-  fi
-  sleep 1
-done
-UPGRADE_DIR="./bot_build_tmp"
-rm -rf "$UPGRADE_DIR"
-mkdir "$UPGRADE_DIR"
-if [ ! -d "$UPGRADE_DIR" ]; then
-  echo "[UPGRADE] FATAL: Could not create build directory."
-  exit 1
-fi
-echo "[UPGRADE] Unpacking archive..."
-if ! tar -xzf "{archive}" --strip-components=1 -C "$UPGRADE_DIR" 2>/dev/null; then
-  echo "[UPGRADE] FATAL: Failed to extract archive."
-  mv "{backup}" "{exe}" 2>/dev/null
-  exit 1
-fi
-echo "[UPGRADE] Entering $UPGRADE_DIR and compiling..."
-cd "$UPGRADE_DIR"
-if [ -f Cargo.toml ]; then
-  cargo build --release --bin ircbot 2>&1 | tee build.log
-  NEW_BIN=target/release/ircbot
-else
-  make clean >/dev/null 2>&1
-  make 2>&1 | tee make.log
-  NEW_BIN=ircbot
-fi
-if [ ! -f "$NEW_BIN" ]; then
-  echo "[UPGRADE] FATAL: Build failed. Binary not found."
-  echo "[UPGRADE] Restoring backup..."
-  cd ..
-  mv "{backup}" "{exe}" 2>/dev/null
-  rm -f "{PID_FILE}"
-  rm -rf "$UPGRADE_DIR"
-  rm -f "{archive}"
-  exit 1
-fi
-echo "[UPGRADE] Moving new binary into place..."
-mv "$NEW_BIN" "{exe}"
-chmod 700 "{exe}"
-cd ..
-echo "[UPGRADE] Removing old PID file..."
-rm -f "{PID_FILE}"
-echo "[UPGRADE] Removing backup..."
-rm -f "{backup}"
-echo "[UPGRADE] Scheduling cleanup..."
-(sleep 5; rm -rf "$UPGRADE_DIR" "{archive}" "./upgrade.sh" 2>/dev/null) &
-echo "[UPGRADE] Restarting bot..."
-exec {exe}
-"#
-    )
-}
-
 /// `update <version>`: download, verify, build and exec the new release.
 pub fn perform_upgrade(state: &mut BotState, nick: &str, version: &str) {
     logm!(
@@ -612,125 +590,42 @@ pub fn perform_upgrade(state: &mut BotState, nick: &str, version: &str) {
         );
         return;
     }
-    let manifest = match fetch_verified_manifest() {
-        Ok(m) => m,
-        Err(e) => {
-            ircf!(state, "PRIVMSG {} :Upgrade aborted: {}.\r\n", nick, e);
-            return;
-        }
-    };
-    let mut release = None;
-    for line in manifest.split('\n').filter(|l| !l.is_empty()) {
-        let Some(f) = parse_release(line) else {
-            continue;
-        };
-        if version_eq(f[0], version) {
-            if !validate_url(f[2]) {
-                ircf!(
-                    state,
-                    "PRIVMSG {} :Error: Invalid or untrusted URL in release file.\r\n",
-                    nick
-                );
-                return;
-            }
-            release = Some((f[2].to_string(), f[3].to_string(), f[4].to_string()));
-            break;
-        }
+    // One install path: the same checks, staging, script and failback as a
+    // hub-driven upgrade, with this id instead of a run's.  On success this does
+    // not return.
+    let id = format!("local-{}", cron_now());
+    ircf!(state, "PRIVMSG {} :Installing {}...\r\n", nick, version);
+    if let Err(err) = hub_commit(state, &id, version, "") {
+        ircf!(state, "PRIVMSG {} :Upgrade aborted: {}.\r\n", nick, err);
     }
-    let Some((url, hash, deps)) = release else {
-        ircf!(
-            state,
-            "PRIVMSG {} :Error: Version '{}' not found in release file.\r\n",
-            nick,
-            version
-        );
-        return;
-    };
-    let failed: Vec<&str> = deps
-        .split(',')
-        .filter(|d| !d.is_empty() && !check_dependency(d))
-        .collect();
-    if !failed.is_empty() {
-        ircf!(
-            state,
-            "PRIVMSG {} :Error: Cannot upgrade. Missing dependencies: {}\r\n",
-            nick,
-            failed.join(", ")
-        );
-        return;
-    }
-    let url_name = url
-        .rsplit('/')
-        .next()
-        .filter(|s| !s.is_empty() && url.contains('/'))
-        .unwrap_or("ircbot.tar.gz");
-    let Some(archive) = sanitize_filename(url_name) else {
-        ircf!(
-            state,
-            "PRIVMSG {} :Error: Invalid filename in URL.\r\n",
-            nick
-        );
-        return;
-    };
-    ircf!(state, "PRIVMSG {} :Downloading {}...\r\n", nick, archive);
-    if !download(&url, &archive) {
-        ircf!(
-            state,
-            "PRIVMSG {} :Error: Failed to download new version.\r\n",
-            nick
-        );
-        return;
-    }
-    ircf!(state, "PRIVMSG {} :Verifying hash...\r\n", nick);
-    if !crypto::sha256_file_hex(&archive).is_some_and(|h| h.eq_ignore_ascii_case(&hash)) {
-        ircf!(
-            state,
-            "PRIVMSG {} :Error: SHA256 hash mismatch! Aborting upgrade.\r\n",
-            nick
-        );
-        let _ = std::fs::remove_file(&archive);
-        return;
-    }
-    config::write_with_state_pass(state);
-    let exe = state.executable_path.clone();
-    let backup = format!("{exe}.backup");
-    let _ = std::fs::rename(&exe, &backup);
-    ircf!(
-        state,
-        "PRIVMSG {} :Hash verified. Creating upgrade script...\r\n",
-        nick
-    );
+}
 
-    // Created 0700 in one step: no writable window on a script we exec.
-    let script = upgrade_script(std::process::id(), &archive, &backup, &exe);
-    let written = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o700)
-        .open("upgrade.sh")
-        .and_then(|mut f| {
-            f.write_all(script.as_bytes())?;
-            f.set_permissions(std::fs::Permissions::from_mode(0o700))
-        });
-    if written.is_err() {
-        ircf!(
-            state,
-            "PRIVMSG {} :Error: Could not create upgrade.sh script.\r\n",
-            nick
-        );
-        let _ = std::fs::remove_file(&archive);
-        let _ = std::fs::rename(&backup, &exe);
+/// A bot with no hub: there is no link to report on, so the first time it is on
+/// IRC it settles its own upgrade.  Once per process.
+pub fn standalone_tick(state: &mut BotState) {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    use std::sync::atomic::Ordering::Relaxed;
+    if DONE.load(Relaxed) || !state.hubs.is_empty() || state.status & crate::state::S_AUTHED == 0 {
         return;
     }
-    ircf!(state, "QUIT :Upgrading to {}...\r\n", version);
-    irc_client::disconnect(state);
-    dcc::close_all(state, "Bot upgrading; closing.");
-    state.pid_file = None;
-    std::thread::sleep(std::time::Duration::from_secs(1));
-    let err = Command::new("./upgrade.sh").exec();
-    eprintln!("execl failed: {err}");
-    std::process::exit(1);
+    DONE.store(true, Relaxed);
+    let Some(p) = take_pending_upgrade() else {
+        return;
+    };
+    if version_cmp(BOT_VERSION, &p.version) == std::cmp::Ordering::Equal {
+        failback_confirm();
+        logm!(state, L_INFO, "[UPGRADE] Now running {}\n", BOT_VERSION);
+        return;
+    }
+    let note = failback_note().unwrap_or_else(|| "reason unknown".to_string());
+    logm!(
+        state,
+        L_INFO,
+        "[UPGRADE] The upgrade to {} did not hold, back on {}: {}\n",
+        p.version,
+        BOT_VERSION,
+        note
+    );
 }
 
 // ======================================================================
@@ -766,6 +661,8 @@ struct ManifestRow {
     min_from: String,
     /// Column 10: the CPU features this artifact needs ("-" = none).
     cpu: String,
+    /// Column 11: archive + unpacked bytes, 0 = unknown.
+    size: u64,
 }
 
 impl ManifestRow {
@@ -787,6 +684,186 @@ impl ManifestRow {
             .filter(|d| !d.is_empty() && !check_dependency(d))
             .collect()
     }
+}
+
+// ---- Preflight (PREPARE) ----------------------------------------------
+//
+// Can this host take the build at all?  Asked before anything changes, so a
+// full disk or a read-only directory is an "unable" with a reason an admin can
+// act on, not a failed restart.  Each reason starts with a fixed code word
+// (disk:, dir:, exe:, exec:, tool:, net:).  Only a probe file is written, and
+// it is gone again before this returns.  The instance dir is the cwd.
+
+fn preflight_tool(name: &str) -> bool {
+    let path = std::env::var("PATH").ok().filter(|p| !p.is_empty());
+    path.as_deref()
+        .unwrap_or("/usr/bin:/bin")
+        .split(':')
+        .filter(|d| !d.is_empty())
+        .any(|d| {
+            let c = format!("{d}/{name}");
+            nix::unistd::access(c.as_str(), nix::unistd::AccessFlags::X_OK).is_ok()
+        })
+}
+
+fn io_text(e: &std::io::Error) -> String {
+    nix::errno::Errno::from_raw(e.raw_os_error().unwrap_or(0))
+        .desc()
+        .to_string()
+}
+
+fn preflight_dir_probe(dir: &str) -> Result<(), String> {
+    let (probe, moved) = (".upgrade.probe", ".upgrade.probe2");
+    let done = (|| -> std::io::Result<()> {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(probe)?;
+        f.write_all(b"x")?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(probe, moved)
+    })();
+    let _ = std::fs::remove_file(probe);
+    let _ = std::fs::remove_file(moved);
+    done.map_err(|e| format!("dir: cannot write {}: {}", clip(dir, 160), io_text(&e)))
+}
+
+/// The binary must be ours, and not immutable: a hard link fails on that where
+/// a rename could not be tried without moving it.  A filesystem with no hard
+/// links at all still passes: it is a different errno.
+fn preflight_exe(exe: &str) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(exe)
+        .map_err(|e| format!("exe: cannot read {}: {}", clip(exe, 160), io_text(&e)))?;
+    if meta.uid() != nix::unistd::geteuid().as_raw() {
+        return Err(format!(
+            "exe: cannot replace {}: owned by another user",
+            clip(exe, 160)
+        ));
+    }
+    let probe = ".upgrade.probe3";
+    let _ = std::fs::remove_file(probe);
+    let linked = std::fs::hard_link(exe, probe);
+    let _ = std::fs::remove_file(probe);
+    if let Err(e) = linked
+        && [nix::errno::Errno::EPERM, nix::errno::Errno::EACCES]
+            .map(|n| n as i32)
+            .contains(&e.raw_os_error().unwrap_or(0))
+    {
+        return Err(format!(
+            "exe: cannot replace {}: {}",
+            clip(exe, 160),
+            io_text(&e)
+        ));
+    }
+    Ok(())
+}
+
+fn clip(s: &str, cap: usize) -> &str {
+    let mut end = s.len().min(cap);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Everything the swap will write, plus a margin.  A manifest row without the
+/// size column gets a fixed allowance; a source build always gets one on top,
+/// for its objects.
+fn preflight_space(
+    dir: &str,
+    exe: &str,
+    cfg: &str,
+    size: u64,
+    is_bin: bool,
+    variant: &str,
+) -> Result<(), String> {
+    use nix::sys::statvfs::{FsFlags, statvfs};
+    let Ok(sv) = statvfs(".") else {
+        return Ok(()); // unknown: the stage will tell
+    };
+    if sv.flags().contains(FsFlags::ST_NOEXEC) {
+        return Err(format!("exec: {} is mounted noexec", clip(dir, 160)));
+    }
+    if sv.files() > 0 && sv.files_available() < UPGRADE_MIN_INODES {
+        return Err(format!("disk: no free inodes in {}", clip(dir, 160)));
+    }
+    let mut need = size;
+    if need == 0 && is_bin {
+        need = UPGRADE_SPACE_BIN_DEFAULT;
+    }
+    if !is_bin {
+        need += if variant == "rs" {
+            UPGRADE_SPACE_BUILD_RS
+        } else {
+            UPGRADE_SPACE_BUILD_C
+        };
+    }
+    need += std::fs::metadata(cfg).map(|m| m.len()).unwrap_or(0);
+    need += std::fs::metadata(exe).map(|m| m.len()).unwrap_or(0);
+    need += UPGRADE_SPACE_MARGIN;
+    let have = sv.blocks_available().saturating_mul(sv.fragment_size());
+    if have < need {
+        return Err(format!(
+            "disk: needs {} MB in {}, has {} MB",
+            need / (1024 * 1024) + 1,
+            clip(dir, 160),
+            have / (1024 * 1024)
+        ));
+    }
+    Ok(())
+}
+
+/// HEAD on the artifact.  A server that does not do HEAD says nothing either
+/// way, so it passes and the download decides.
+fn preflight_artifact(url: &str) -> Result<(), String> {
+    let name = clip(url.rsplit('/').next().unwrap_or(url), 120);
+    if let Some(path) = file_url_path(url) {
+        return std::fs::metadata(path)
+            .map(|_| ())
+            .map_err(|e| format!("net: cannot reach {name}: {}", io_text(&e)));
+    }
+    if !tls_ready() {
+        return Ok(()); // the manifest read has already said why
+    }
+    match agent().head(url).call() {
+        Ok(_) | Err(ureq::Error::StatusCode(405 | 501)) => Ok(()),
+        Err(ureq::Error::StatusCode(code)) => Err(format!("net: {code} from {name}")),
+        Err(e) => Err(format!("net: cannot reach {name}: {e}")),
+    }
+}
+
+fn preflight_host(
+    exe: &str,
+    cfg: &str,
+    url: &str,
+    size: u64,
+    kind: &str,
+    variant: &str,
+) -> Result<(), String> {
+    let dir = std::env::current_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    preflight_space(
+        &dir,
+        exe,
+        cfg,
+        size,
+        kind.eq_ignore_ascii_case("bin"),
+        variant,
+    )?;
+    preflight_dir_probe(&dir)?;
+    preflight_exe(exe)?;
+    if nix::unistd::access("/bin/bash", nix::unistd::AccessFlags::X_OK).is_err() {
+        return Err("tool: /bin/bash not found".to_string());
+    }
+    if !preflight_tool("tar") {
+        return Err("tool: tar not found".to_string());
+    }
+    preflight_artifact(url)
 }
 
 /// Parse one manifest line, tolerating the 5-column legacy form.
@@ -811,6 +888,7 @@ fn parse_row(line: &str) -> Option<(String, ManifestRow)> {
             libc: at(7, "any"),
             min_from: at(8, "*"),
             cpu: at(9, "-"),
+            size: f.get(10).and_then(|v| v.parse().ok()).unwrap_or(0),
         },
     ))
 }
@@ -869,18 +947,992 @@ fn manifest_select(manifest: &str, version: &str, variant: &str) -> Result<Manif
     pick.ok_or(why)
 }
 
+/// One upgrade's failback script, the same text in all four trees.  A node must
+/// recover by itself: its admin may have no shell on the host.  It is called from
+/// the upgrade script's background loop every 10 s and from a temporary crontab
+/// line every minute, which outlives a reboot or a killed loop.  It holds no
+/// secrets, and removes itself and the line once the new build confirms or the
+/// old one is back.
+const FAILBACK_BODY: &str = r##"umask 077
+PATH="${PATH:-}:/usr/bin:/bin"; export PATH
+cd "$D" 2>/dev/null || exit 1
+STATE=.upgrade.state; CONF=.upgrade.confirmed; SELF=${SELF:-.upgrade.failback}
+LOCK=.upgrade.lock; TRIES=.upgrade.tries; PREV="$EXE.prev"
+FAILTAG="# $PRODUCT:failback:$D:"; PRODTAG="# $PRODUCT:production:$D:"
+# A hardened daemon is not dumpable, so its /proc/<pid>/exe cannot be read: the
+# pid file and the process name say whether it is ours.
+COMM=$(basename "$EXE" | cut -c1-15)
+HLOCK="${HOME:-$D}/.irc-cron.lock"
+HELD=""
+
+take_lock() {
+  i=0
+  while :; do
+    if ( set -C; echo $$ >"$1" ) 2>/dev/null; then HELD="$HELD $1"; return 0; fi
+    h=$(cat "$1" 2>/dev/null)
+    if [ -n "$h" ] && kill -0 "$h" 2>/dev/null; then
+      i=$((i + 1)); [ "$i" -ge "$2" ] && return 1
+      sleep 1
+    else
+      rm -f "$1"
+    fi
+  done
+}
+drop_locks() { for l in $HELD; do rm -f "$l"; done; HELD=""; }
+trap drop_locks EXIT
+
+clean() { printf '%s' "$1" | tr -d '|\r\n' | cut -c1-160; }
+set_state() { # phase pid note
+  printf '%s|%s|%s|%s|%s\n' "$ID" "$1" "$(date +%s)" "$2" "$(clean "$3")" >"$STATE.tmp" &&
+    mv -f "$STATE.tmp" "$STATE"
+}
+read_state() {
+  rid=""; phase=""; since=0; spid=""; note=""
+  [ -f "$STATE" ] || return 1
+  IFS='|' read -r rid phase since spid note <"$STATE" || return 1
+  [ "$rid" = "$ID" ]
+}
+pid_now() { [ -f "$PIDF" ] && tr -dc 0-9 <"$PIDF"; }
+alive() {
+  p=$(pid_now)
+  [ -n "$p" ] && kill -0 "$p" 2>/dev/null && [ "$(cat "/proc/$p/comm" 2>/dev/null)" = "$COMM" ]
+}
+start_exe() { "$EXE" </dev/null >/dev/null 2>&1 & }
+
+# Read, change, write, read back, compare.  Only an answer that says there is
+# no crontab counts as empty: any other read error writes nothing, so a bad read
+# can never wipe an admin's jobs.  Only a line holding this tag changes, along with
+# tagged lines whose directory is gone; every other line stays as it was.
+cron_read() { # file
+  if ! crontab -l >"$1" 2>"$1.err"; then
+    grep -Eqi 'no crontab|no such file|does not exist' "$1.err" || return 1
+    : >"$1"
+  fi
+}
+cron_sweep() { # in out
+  sed -nE 's/.*# (ircbot|irchub):(production|failback):(\/[^:]*):$/\3/p' "$1" |
+    while read -r dd; do [ -d "$dd" ] || printf ':%s:\n' "$dd"; done >"$2.dead"
+  if [ -s "$2.dead" ]; then grep -vF -f "$2.dead" "$1" >"$2"; else cp "$1" "$2"; fi
+}
+cron_edit() { # add|remove tag line
+  command -v crontab >/dev/null 2>&1 || return 3
+  take_lock "$HLOCK" 15 || return 1
+  T=".upgrade.cron.$$"; rc=1; n=0
+  while [ "$n" -lt 3 ]; do
+    n=$((n + 1))
+    cron_read "$T.cur" || break
+    if [ "$1" = remove ] && ! grep -qF "$2" "$T.cur"; then rc=0; break; fi
+    if [ "$1" = add ] && grep -qF "$2" "$T.cur"; then rc=0; break; fi
+    cron_sweep "$T.cur" "$T.swept"
+    grep -vF "$2" "$T.swept" >"$T.rest"
+    cp "$T.rest" "$T.new"
+    [ "$1" = add ] && printf '%s\n' "$3" >>"$T.new"
+    crontab "$T.new" >/dev/null 2>&1 || { sleep 1; continue; }
+    crontab -l >"$T.chk" 2>/dev/null
+    grep -vF "$2" "$T.chk" | grep -v '^# \(DO NOT EDIT\|(\)' >"$T.a"
+    grep -v '^# \(DO NOT EDIT\|(\)' "$T.rest" >"$T.b"
+    if cmp -s "$T.a" "$T.b"; then
+      if [ "$1" = add ]; then grep -qF "$2" "$T.chk" && { rc=0; break; }
+      else grep -qF "$2" "$T.chk" || { rc=0; break; }; fi
+    fi
+    sleep 1
+  done
+  rm -f "$T".*
+  rm -f "$HLOCK"; HELD=$(printf '%s' "$HELD" | sed "s| $HLOCK||")
+  return "$rc"
+}
+fail_line() {
+  printf "* * * * * [ -x '%s/%s' ] && '%s/%s' tick >/dev/null 2>&1 %s\n" \
+    "$D" "$SELF" "$D" "$SELF" "$FAILTAG"
+}
+prod_line() {
+  printf "*/5 * * * * touch '%s/.cron.seen'; [ -x '%s' ] && '%s' >/dev/null 2>&1 %s\n" \
+    "$D" "$EXE" "$EXE" "$PRODTAG"
+}
+# What this instance's production line is: 0 ours, 10 a hand-written line runs
+# this binary, 11 none, 3 no crontab tool, 1 it cannot be read.
+cron_status() {
+  command -v crontab >/dev/null 2>&1 || return 3
+  T=".upgrade.cron.$$"
+  cron_read "$T.st" || { rm -f "$T".*; return 1; }
+  rc=11
+  if grep -qF "$PRODTAG" "$T.st"; then rc=0
+  elif grep -vE '^[[:space:]]*#' "$T.st" | grep -qF "$EXE"; then rc=10
+  fi
+  rm -f "$T".*
+  return "$rc"
+}
+safe_path() { case "$D" in *[!A-Za-z0-9._/-]*) return 1 ;; esac; }
+
+# keep = leave the state file, for the build that has to report it
+finish() {
+  cron_edit remove "$FAILTAG"
+  [ "${1:-}" = keep ] || rm -f "$STATE"
+  rm -f "$CONF" "$TRIES" "$SELF" "./$SCRIPT"
+  drop_locks
+  exit 1
+}
+
+restore() { # reason
+  read_state
+  [ -n "$spid" ] && [ "$spid" != "$PPID" ] && [ "$spid" != "$$" ] && kill "$spid" 2>/dev/null
+  if alive; then
+    p=$(pid_now); kill "$p" 2>/dev/null
+    i=0
+    while kill -0 "$p" 2>/dev/null && [ "$i" -lt 5 ]; do sleep 1; i=$((i + 1)); done
+    kill -9 "$p" 2>/dev/null
+  fi
+  if [ ! -f "$PREV" ]; then
+    [ -x "$EXE" ] && ! alive && start_exe
+    set_state failback-gave-up "" "$1; no previous build retained"
+    return
+  fi
+  mv -f "$EXE" "$EXE.failed" 2>/dev/null
+  if ! mv -f "$PREV" "$EXE"; then
+    mv -f "$EXE.failed" "$EXE" 2>/dev/null
+    set_state failback-gave-up "" "$1; could not restore the previous build"
+    return
+  fi
+  [ -f "$CFG.prev" ] && cp -f "$CFG.prev" "$CFG"
+  rm -f "$PIDF"
+  set_state restored "" "$1"
+  start_exe
+}
+
+tick() {
+  read_state || finish
+  now=$(date +%s); age=$((now - since))
+  if [ "$now" -ge "$HARD" ]; then
+    case "$phase" in
+      restored|failback-gave-up) ;;
+      *) set_state failback-gave-up "" "the upgrade never finished" ;;
+    esac
+    finish keep
+  fi
+  case "$phase" in
+    installing)
+      if ! kill -0 "$spid" 2>/dev/null; then restore "the install was interrupted"
+      elif [ "$age" -ge "$INSTALL_LIMIT" ]; then restore "the install took over $INSTALL_LIMIT s"
+      fi ;;
+    started)
+      if [ -f "$CONF" ] && [ "$(cat "$CONF" 2>/dev/null)" = "$ID" ] && alive; then finish
+      elif ! alive; then
+        [ "$age" -ge "$WATCH" ] && restore "the new build did not stay up"
+      elif [ "$age" -ge "$CONFIRM_LIMIT" ]; then restore "$NOTE within $CONFIRM_LIMIT s"
+      fi ;;
+    restored)
+      alive && finish keep
+      t=$(cat "$TRIES" 2>/dev/null); t=$((${t:-0} + 1)); echo "$t" >"$TRIES"
+      if [ "$t" -ge 5 ]; then
+        set_state failback-gave-up "" "$note; the previous build will not start"
+        finish keep
+      fi
+      start_exe ;;
+    failback-gave-up) finish keep ;;
+    *) finish ;;
+  esac
+  return 0
+}
+
+# The cron-* arguments are a one-shot helper's: it runs once and removes itself.
+case "${1:-tick}" in
+  install)
+    safe_path || exit 3
+    cron_edit add "$FAILTAG" "$(fail_line)"; exit $? ;;
+  phase) take_lock "$LOCK" 20 && set_state "$2" "$3" "" ;;
+  restore) take_lock "$LOCK" 20 && restore "$2" ;;
+  done) take_lock "$LOCK" 20; finish ;;
+  tick) take_lock "$LOCK" 2 || exit 0; tick ;;
+  cron-status) cron_status; rc=$?; rm -f "$SELF"; exit "$rc" ;;
+  cron-on)
+    cron_status; rc=$?
+    if [ "$rc" = 11 ]; then
+      if safe_path; then
+        touch .cron.seen
+        cron_edit add "$PRODTAG" "$(prod_line)" && cron_status; rc=$?
+      else
+        rc=4
+      fi
+    fi
+    rm -f "$SELF"; exit "$rc" ;;
+  cron-off)
+    rc=0
+    cron_edit remove "$PRODTAG" || rc=$?
+    if [ "$rc" = 0 ]; then rm -f .cron.seen; cron_status; rc=$?; fi
+    rm -f "$SELF"; exit "$rc" ;;
+  cron-drop)
+    rc=0
+    cron_edit remove "$PRODTAG" || rc=$?
+    cron_edit remove "$FAILTAG" || rc=$?
+    if [ "$rc" = 0 ]; then
+      cron_status; [ $? = 10 ] && rc=10
+    fi
+    rm -f "$SELF" .cron.seen; exit "$rc" ;;
+esac
+exit 0
+"##;
+const FAILBACK_FILE: &str = ".upgrade.failback";
+const FAILBACK_STATE: &str = ".upgrade.state";
+const FAILBACK_CONFIRM: &str = ".upgrade.confirmed";
+
+fn failback_quoted(name: &str, value: &str) -> String {
+    format!("{name}='{}'\n", value.replace('\'', "'\\''"))
+}
+
+/// Run the script with one argument; its exit status, -1 if it could not run.
+fn failback_run(arg: &str) -> i32 {
+    Command::new(format!("./{FAILBACK_FILE}"))
+        .arg(arg)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()
+        .and_then(|s| s.code())
+        .unwrap_or(-1)
+}
+
+/// Takes the upgrade back out of cron and off the disk.
+fn failback_clear() {
+    if std::path::Path::new(FAILBACK_FILE).exists() {
+        let _ = failback_run("done");
+    }
+    let _ = std::fs::remove_file(FAILBACK_STATE);
+    let _ = std::fs::remove_file(FAILBACK_CONFIRM);
+}
+
+/// The new build is up and has proved it can do its job.
+pub fn failback_confirm() {
+    let Ok(line) = std::fs::read_to_string(FAILBACK_STATE) else {
+        return;
+    };
+    let Some((id, rest)) = line.split_once('|') else {
+        return;
+    };
+    if !rest.starts_with("started|") {
+        return;
+    }
+    let tmp = format!("{FAILBACK_CONFIRM}.tmp");
+    if std::fs::write(&tmp, format!("{id}\n")).is_ok() {
+        let _ = std::fs::rename(&tmp, FAILBACK_CONFIRM);
+    }
+}
+
+/// Why this build is running instead of the one asked for: the note the script
+/// wrote when it restored it.  Taken once.
+pub fn failback_note() -> Option<String> {
+    let line = std::fs::read_to_string(FAILBACK_STATE).ok()?;
+    let line = line.lines().next()?;
+    let (_, rest) = line.split_once('|')?;
+    if !rest.starts_with("restored|") && !rest.starts_with("failback-gave-up|") {
+        return None;
+    }
+    let note = rest.rsplit('|').next()?;
+    if note.is_empty() {
+        return None;
+    }
+    let out = note.to_string();
+    let _ = std::fs::remove_file(FAILBACK_STATE);
+    Some(out)
+}
+
+// ---- Production crontab line ---------------------------------------------
+//
+// An instance's keepalive line, tagged "# <product>:production:<dir>:".  Off
+// unless a hub says otherwise, and only ever this one tagged line: everything
+// else in the crontab is read and left alone.  The script runs as a child, so a
+// slow crontab never holds up the event loop.
+const CRON_HELPER: &str = ".cron.helper";
+
+struct CronState {
+    child: Option<std::process::Child>,
+    started: u64,
+    next: u64,
+    stat: u64,
+    wanted: i8, // -1 no hub has said, 0 off, 1 on
+    status: String,
+    ours: bool,
+}
+
+static CRON: std::sync::Mutex<CronState> = std::sync::Mutex::new(CronState {
+    child: None,
+    started: 0,
+    next: 0,
+    stat: 0,
+    wanted: -1,
+    status: String::new(),
+    ours: false,
+});
+
+fn cron_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn cron_note(c: &mut CronState, rc: i32, now: u64) {
+    c.ours = rc == 0;
+    c.status = match rc {
+        0 => "yes",
+        10 => "manual",
+        _ if rc == 11 || c.wanted != 1 => "no",
+        3 => "failed:no crontab tool",
+        4 => "failed:unsafe path",
+        _ => "failed:cannot read crontab",
+    }
+    .to_string();
+    c.stat = now;
+}
+
+/// What `cron_tick` last found: yes, silent, manual, no or failed:<why>.
+pub fn cron_status() -> String {
+    CRON.lock().map(|c| c.status.clone()).unwrap_or_default()
+}
+
+/// A hub's order.
+pub fn cron_set(on: bool) {
+    if let Ok(mut c) = CRON.lock() {
+        let want = i8::from(on);
+        if want != c.wanted {
+            c.next = 0;
+        }
+        c.wanted = want;
+    }
+}
+
+/// True when the status changed, so the hub should hear it.
+pub fn cron_tick(exe: &str) -> bool {
+    let Ok(mut c) = CRON.lock() else {
+        return false;
+    };
+    let now = cron_now();
+    let before = c.status.clone();
+    if let Some(child) = c.child.as_mut() {
+        match child.try_wait() {
+            Ok(None) => {
+                if now.saturating_sub(c.started) > CRON_HELPER_TIMEOUT {
+                    let _ = c.child.as_mut().map(std::process::Child::kill);
+                }
+                return false;
+            }
+            Ok(Some(st)) => {
+                let rc = st.code().unwrap_or(1);
+                c.child = None;
+                let _ = std::fs::remove_file(CRON_HELPER);
+                cron_note(&mut c, rc, now);
+            }
+            Err(_) => {
+                c.child = None;
+                let _ = std::fs::remove_file(CRON_HELPER);
+                cron_note(&mut c, 1, now);
+            }
+        }
+    }
+    if now >= c.next && !exe.is_empty() {
+        let mut fail = None;
+        if c.wanted == 1 && !std::path::Path::new(PASS_FILE).exists() {
+            fail = Some(format!("no {}", PASS_FILE));
+        } else if !failback_write(
+            CRON_HELPER,
+            exe,
+            "",
+            true,
+            CONFIG_FILE,
+            PID_FILE,
+            "upgrade.sh",
+            "",
+            CRON_HELPER,
+        ) {
+            fail = Some("cannot write here".to_string());
+        }
+        if let Some(why) = fail {
+            c.status = format!("failed:{why}");
+            c.next = now + CRON_CHECK_SECS;
+        } else {
+            let arg = match c.wanted {
+                1 => "cron-on",
+                0 => "cron-off",
+                _ => "cron-status",
+            };
+            if let Ok(child) = Command::new(format!("./{CRON_HELPER}"))
+                .arg(arg)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                c.child = Some(child);
+                c.started = now;
+            }
+            // Set before it finishes: an order that arrives meanwhile clears this,
+            // and must not be overwritten when this child ends.
+            c.next = now + CRON_CHECK_SECS;
+        }
+    }
+    // The line stamps .cron.seen each time it runs: no stamp, no cron daemon.
+    if c.ours && now.saturating_sub(c.stat) >= 60 {
+        c.stat = now;
+        let seen = std::fs::metadata(".cron.seen")
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+        let quiet = seen.is_none_or(|s| now.saturating_sub(s) > CRON_SILENT_SECS);
+        c.status = if quiet { "silent" } else { "yes" }.to_string();
+    }
+    before != c.status
+}
+
+/// The node is being deleted: both tagged lines go.  0 gone, 10 gone but a
+/// hand-written line still runs this binary, anything else could not.
+pub fn cron_drop(exe: &str) -> i32 {
+    if let Ok(mut c) = CRON.lock()
+        && let Some(mut child) = c.child.take()
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    if !failback_write(
+        CRON_HELPER,
+        exe,
+        "",
+        true,
+        CONFIG_FILE,
+        PID_FILE,
+        "upgrade.sh",
+        "",
+        CRON_HELPER,
+    ) {
+        return 1;
+    }
+    let rc = Command::new(format!("./{CRON_HELPER}"))
+        .arg("cron-drop")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()
+        .and_then(|s| s.code())
+        .unwrap_or(1);
+    let _ = std::fs::remove_file(CRON_HELPER);
+    rc
+}
+
+/// A keepalive line can fire while an upgrade installs, when no daemon holds the
+/// pid lock.  Starting the old build then would make the new one refuse to start,
+/// so a start waits that out.  A stale file past its limits stops nothing.
+pub fn install_in_progress() -> bool {
+    let Ok(line) = std::fs::read_to_string(FAILBACK_STATE) else {
+        return false;
+    };
+    let f: Vec<&str> = line.trim_end().split('|').collect();
+    if f.get(1) != Some(&"installing") {
+        return false;
+    }
+    let (Some(since), Some(pid)) = (
+        f.get(2).and_then(|v| v.parse::<u64>().ok()),
+        f.get(3).and_then(|v| v.parse::<i32>().ok()),
+    ) else {
+        return false;
+    };
+    if pid <= 0 || cron_now().saturating_sub(since) > UPGRADE_BUILD_SECS + 60 {
+        return false;
+    }
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Lay the script down, before anything changes.  The state goes first: a tick
+/// that finds none takes the script away again, and exec keeps this pid, so it
+/// already names the upgrade script.
+/// The script, for one upgrade (FAILBACK_FILE) or one crontab change (CRON_HELPER).
+#[allow(clippy::too_many_arguments)]
+fn failback_write(
+    path: &str,
+    exe: &str,
+    id: &str,
+    is_bin: bool,
+    cfg: &str,
+    pidf: &str,
+    script: &str,
+    note: &str,
+    self_name: &str,
+) -> bool {
+    let Some(slash) = exe.rfind('/') else {
+        return false;
+    };
+    let dir = &exe[..slash];
+    let install = if is_bin {
+        UPGRADE_INSTALL_SECS
+    } else {
+        UPGRADE_BUILD_SECS
+    };
+    let now = cron_now();
+    let mut text =
+        String::from("#!/bin/sh\n# Written by ircbot: removes itself.  See its README.\n");
+    for (name, value) in [
+        ("PRODUCT", "ircbot"),
+        ("SELF", self_name),
+        ("D", dir),
+        ("EXE", exe),
+        ("ID", id),
+        ("CFG", cfg),
+        ("PIDF", pidf),
+        ("SCRIPT", script),
+        ("NOTE", note),
+    ] {
+        text.push_str(&failback_quoted(name, value));
+    }
+    text.push_str(&format!(
+        "INSTALL_LIMIT={install}\nCONFIRM_LIMIT={UPGRADE_CONFIRM_SECS}\nWATCH={UPGRADE_WATCH_SECS}\nHARD={}\n",
+        now + install + UPGRADE_CONFIRM_SECS + UPGRADE_FAILBACK_EXPIRY
+    ));
+    text.push_str(FAILBACK_BODY);
+    let wrote = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o700)
+        .open(path)
+        .and_then(|mut f| {
+            f.write_all(text.as_bytes())?;
+            f.set_permissions(std::fs::Permissions::from_mode(0o700))
+        })
+        .is_ok();
+    if !wrote {
+        let _ = std::fs::remove_file(path);
+    }
+    wrote
+}
+
+fn failback_stage(
+    exe: &str,
+    id: &str,
+    is_bin: bool,
+    cfg: &str,
+    pidf: &str,
+    script: &str,
+    note: &str,
+) -> bool {
+    let wrote = failback_write(
+        FAILBACK_FILE,
+        exe,
+        id,
+        is_bin,
+        cfg,
+        pidf,
+        script,
+        note,
+        FAILBACK_FILE,
+    );
+    let now = cron_now();
+    let _ = std::fs::remove_file(FAILBACK_CONFIRM);
+    let tmp = format!("{FAILBACK_STATE}.tmp");
+    let state = format!("{id}|installing|{now}|{}|\n", std::process::id());
+    if !wrote
+        || std::fs::write(&tmp, state).is_err()
+        || std::fs::rename(&tmp, FAILBACK_STATE).is_err()
+    {
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(FAILBACK_FILE);
+        return false;
+    }
+    true
+}
+
+// ---- Staging -------------------------------------------------------------
+//
+// Get the new build ready and proven while the old one keeps running.  A thread
+// does the work under STAGE_DIR and notes each phase; the event loop reads that
+// and tells the hub.  COMMIT then only swaps a file.  Nothing here touches <exe>,
+// and everything here is gone again if no COMMIT comes.
+const STAGE_DIR: &str = ".upgrade.stage";
+
+#[derive(Default)]
+struct StageState {
+    gen_id: u64,
+    id: String,
+    ver: String,
+    phase: String,
+    code: String,
+    note: String,
+    started: u64,
+    said: u64,
+    done: u64,
+    ready: bool,
+    running: bool,
+    changed: bool,
+}
+
+static STAGE: std::sync::Mutex<Option<StageState>> = std::sync::Mutex::new(None);
+static STAGE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn stage_rm() {
+    let _ = std::fs::remove_dir_all(STAGE_DIR);
+}
+
+/// In the thread: one note, unless a newer stage has replaced this one.
+fn stage_say(id: u64, phase: &str, code: &str, note: &str) {
+    if let Ok(mut g) = STAGE.lock()
+        && let Some(s) = g.as_mut()
+        && s.gen_id == id
+    {
+        if s.phase != phase {
+            s.changed = true;
+        }
+        s.phase = phase.to_string();
+        s.code = code.to_string();
+        s.note = note.replace(['|', '\r', '\n'], " ");
+    }
+}
+
+fn stage_cancelled(id: u64) -> bool {
+    STAGE_GEN.load(std::sync::atomic::Ordering::Relaxed) != id
+}
+
+/// A child with a limit, and a way out if the stage is called off.  Err is the
+/// first line it wrote, or that it ran out of time.
+fn stage_run(id: u64, cmd: &mut Command, limit: u64) -> Result<(), String> {
+    let log = format!("{STAGE_DIR}/run.log");
+    let out = std::fs::File::create(&log).map_err(|e| e.to_string())?;
+    let err = out.try_clone().map_err(|e| e.to_string())?;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err))
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(limit);
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) if st.success() => return Ok(()),
+            Ok(Some(_)) => {
+                let text = std::fs::read_to_string(&log).unwrap_or_default();
+                return Err(text
+                    .lines()
+                    .next()
+                    .unwrap_or("it exited with an error")
+                    .to_string());
+            }
+            Ok(None) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        if stage_cancelled(id) || std::time::Instant::now() > end {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("ran past its limit".to_string());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// One stage's download, in the stage's own thread, saying how far it has got.
+fn download_said(id: u64, url: &str, path: &str) -> bool {
+    let mut last = -1i64;
+    let mut said = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    download_with(url, path, &mut |got, total| {
+        let pct = (got * 100 / total.max(1)) as i64;
+        if pct != last && said.elapsed().as_secs() >= 2 {
+            last = pct;
+            said = std::time::Instant::now();
+            stage_say(id, "fetching", "", &format!("{pct}%"));
+        }
+    })
+}
+
+/// Files make has compiled so far: a top-level .c with its object in place.
+fn stage_count_c(dir: &str) -> (usize, usize) {
+    let (mut total, mut done) = (0, 0);
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(base) = name.to_str().and_then(|n| n.strip_suffix(".c")) else {
+            continue;
+        };
+        if base.is_empty() || base.len() > 198 {
+            continue;
+        }
+        total += 1;
+        if ["", "build/", "build/obj/", "obj/"]
+            .iter()
+            .any(|w| std::path::Path::new(&format!("{dir}/{w}{base}.o")).exists())
+        {
+            done += 1;
+        }
+    }
+    (total, done)
+}
+
+/// Crates cargo has got to, against the packages its lock file names.
+fn stage_count_crates(dir: &str) -> (usize, usize) {
+    let total = std::fs::read_to_string(format!("{dir}/Cargo.lock"))
+        .map(|t| t.lines().filter(|l| l.starts_with("[[package]]")).count())
+        .unwrap_or(0);
+    let done = std::fs::read_dir(format!("{dir}/target/release/.fingerprint"))
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+                .count()
+        })
+        .unwrap_or(0);
+    (total, done)
+}
+
+/// How far a build has got, in the words of the note: "40% 18 of 45 files", or
+/// "~60% 120 of 200 crates", whose sizes differ too much for more than an estimate.
+fn stage_build_note(dir: &str) -> Option<String> {
+    let crates = std::path::Path::new(&format!("{dir}/Cargo.toml")).exists();
+    let (total, done) = if crates {
+        stage_count_crates(dir)
+    } else {
+        stage_count_c(dir)
+    };
+    if total == 0 {
+        return None;
+    }
+    let done = done.min(total);
+    let pct = (done * 100 / total).min(99);
+    Some(if crates {
+        format!("~{pct}% {done} of {total} crates")
+    } else {
+        format!("{pct}% {done} of {total} files")
+    })
+}
+
+/// `stage_run` for a build: at most one look every 5 s, and a word only on a change.
+fn stage_run_build(id: u64, dir: &str, cmd: &mut Command, limit: u64) -> Result<(), String> {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher = {
+        let (stop, dir) = (stop.clone(), dir.to_string());
+        std::thread::spawn(move || {
+            let mut last = String::new();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(note) = stage_build_note(&dir)
+                    && note != last
+                {
+                    stage_say(id, "building", "src", &note);
+                    last = note;
+                }
+                for _ in 0..25 {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+        })
+    };
+    let r = stage_run(id, cmd, limit);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = watcher.join();
+    r
+}
+
+/// The whole job, on its own thread.
+fn stage_job(id: u64, ver: &str, variant: &str) -> Result<(), (&'static str, String)> {
+    // A run names no variant unless the admin chose one: this host's own, as at PREPARE.
+    let variant = if variant.is_empty() {
+        host_variant()
+    } else {
+        variant
+    };
+    stage_say(id, "fetching", "", "");
+    hub_set_tree(variant).map_err(|e| ("net", e))?;
+    let manifest = fetch_verified_manifest().map_err(|e| {
+        let t = e.to_string();
+        (
+            if t.contains("signature") {
+                "sig"
+            } else {
+                "net"
+            },
+            t,
+        )
+    })?;
+    let row = manifest_select(&manifest, ver, variant).map_err(|e| ("build", e))?;
+    let is_bin = row.kind.eq_ignore_ascii_case("bin");
+    let word = if is_bin { "bin" } else { "src" };
+    let archive = format!("{STAGE_DIR}/archive.tar.gz");
+    if !download_said(id, &row.url, &archive) {
+        return Err(("net", "artifact download failed".to_string()));
+    }
+    stage_say(id, "verifying", word, "");
+    if !crypto::sha256_file_hex(&archive).is_some_and(|h| h.eq_ignore_ascii_case(&row.hash)) {
+        return Err(("hash", "artifact SHA-256 mismatch".to_string()));
+    }
+    let bdir = format!("{STAGE_DIR}/build");
+    std::fs::create_dir(&bdir)
+        .map_err(|_| ("dir", "could not make the build directory".to_string()))?;
+    stage_run(
+        id,
+        Command::new("tar").args(["-xzf", &archive, "--strip-components=1", "-C", &bdir]),
+        120,
+    )
+    .map_err(|_| ("archive", "could not unpack the artifact".to_string()))?;
+    let mut bin = format!("{bdir}/ircbot");
+    if !is_bin {
+        stage_say(id, "building", "src", "");
+        let cargo = format!("{bdir}/Cargo.toml");
+        let limit = UPGRADE_BUILD_SECS - 60;
+        let ran = if std::path::Path::new(&cargo).exists() {
+            bin = format!("{bdir}/target/release/ircbot");
+            stage_run_build(
+                id,
+                &bdir,
+                Command::new("cargo").args(["build", "--release", "--manifest-path", &cargo]),
+                limit,
+            )
+        } else {
+            stage_run_build(id, &bdir, Command::new("make").args(["-C", &bdir]), limit)
+        };
+        match ran {
+            Err(e) if e.contains("past its limit") => {
+                return Err(("build", "the build ran past its limit".to_string()));
+            }
+            Err(e) => return Err(("build", format!("the build failed: {}", clip(&e, 200)))),
+            Ok(()) => {}
+        }
+    }
+    if !std::path::Path::new(&bin).exists() {
+        return Err(("archive", "the artifact holds no ircbot binary".to_string()));
+    }
+    let _ = std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700));
+    stage_say(id, "testing", word, "");
+    stage_run(id, Command::new(&bin).arg("-selftest"), SELFTEST_TIMEOUT).map_err(|e| {
+        (
+            "selftest",
+            format!("new build failed its selftest: {}", clip(&e, 200)),
+        )
+    })?;
+    std::fs::rename(&bin, format!("{STAGE_DIR}/new"))
+        .map_err(|_| ("dir", "could not keep the staged build".to_string()))?;
+    let _ = std::fs::remove_dir_all(&bdir);
+    let _ = std::fs::remove_file(&archive);
+    stage_say(id, "staged", word, "");
+    Ok(())
+}
+
+/// A hub's STAGE.  Starting again for the same build is a no-op, so a repeat costs
+/// nothing.
+pub fn stage_start(id: &str, ver: &str, variant: &str) {
+    if let Ok(g) = STAGE.lock()
+        && let Some(s) = g.as_ref()
+        && s.id == id
+        && (s.running || s.ready)
+    {
+        return;
+    }
+    stage_clear();
+    stage_rm();
+    let gen_id = STAGE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let mut s = StageState {
+        gen_id,
+        id: id.to_string(),
+        ver: ver.to_string(),
+        phase: "fetching".to_string(),
+        started: cron_now(),
+        running: true,
+        ..Default::default()
+    };
+    if std::fs::create_dir(STAGE_DIR).is_err() {
+        s.phase = "failed".to_string();
+        s.code = "dir".to_string();
+        s.note = format!("could not make {STAGE_DIR}");
+        s.running = false;
+    }
+    let go = s.running;
+    if let Ok(mut g) = STAGE.lock() {
+        *g = Some(s);
+    }
+    if !go {
+        return;
+    }
+    let (ver, variant) = (ver.to_string(), variant.to_string());
+    std::thread::spawn(move || {
+        let done = stage_job(gen_id, &ver, &variant);
+        if let Err((code, note)) = &done {
+            stage_say(gen_id, "failed", code, note);
+        }
+        if let Ok(mut g) = STAGE.lock()
+            && let Some(s) = g.as_mut()
+            && s.gen_id == gen_id
+        {
+            s.running = false;
+            s.changed = true;
+            s.ready = done.is_ok();
+            s.done = cron_now();
+        }
+    });
+}
+
+pub fn stage_clear() {
+    STAGE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let had = STAGE.lock().ok().and_then(|mut g| g.take()).is_some();
+    if had {
+        stage_rm();
+    }
+}
+
+/// When the hub should hear: the run's id and "phase|code|note".
+pub fn stage_tick() -> Option<(String, String)> {
+    let now = cron_now();
+    let mut expired = false;
+    let out = {
+        let mut g = STAGE.lock().ok()?;
+        let s = g.as_mut()?;
+        if s.running && now.saturating_sub(s.started) > UPGRADE_BUILD_SECS {
+            s.running = false;
+            s.phase = "failed".to_string();
+            s.code = "limit".to_string();
+            s.note = "the stage ran past its limit".to_string();
+            s.changed = true;
+            STAGE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        // A failed stage holds nothing worth keeping, and the run may not come back to say so.
+        if s.changed && !s.running && s.phase == "failed" {
+            stage_rm();
+        }
+        if s.ready && now.saturating_sub(s.done) > UPGRADE_STAGE_KEEP {
+            expired = true;
+            None
+        } else if s.changed
+            || s.said == 0
+            || (s.running && now.saturating_sub(s.said) >= UPGRADE_STAGE_BEAT)
+        {
+            // A beat while it works: silence is how the driver tells a stage has died.
+            s.changed = false;
+            s.said = now;
+            Some((s.id.clone(), format!("{}|{}|{}", s.phase, s.code, s.note)))
+        } else {
+            None
+        }
+    };
+    if expired {
+        stage_clear();
+    }
+    out
+}
+
+/// A stage belongs to one process: whatever a dead one left is rubbish.
+pub fn stage_boot_clean() {
+    stage_rm();
+}
+
+/// The staged build for this run, ready to swap in.
+fn stage_ready_for(id: &str, ver: &str) -> bool {
+    STAGE.lock().ok().is_some_and(|g| {
+        g.as_ref()
+            .is_some_and(|s| s.ready && s.id == id && s.ver == ver)
+    }) && std::path::Path::new(&format!("{STAGE_DIR}/new")).exists()
+}
+
 /// The upgrade script for a hub-driven commit.  `kind` decides the middle of
 /// it: a prebuilt binary is unpacked and moved into place, a source tarball
 /// is compiled first.  Either way the previous binary stays at <exe>.prev —
 /// the hub, not the script, decides whether to keep it.
-fn hub_upgrade_script(
-    pid: u32,
-    kind: &str,
-    archive: &str,
-    prev: &str,
-    exe: &str,
-    selftest: bool,
-) -> String {
+fn hub_upgrade_script(pid: u32, kind: &str, archive: &str, exe: &str, selftest: bool) -> String {
     // One rollback path for every failure: put <exe>.prev back and run it, so
     // a bot that cannot upgrade still comes back on the old build.  The marker
     // is kept, so the old build reports "version-mismatch" to its hub at once.
@@ -891,7 +1943,20 @@ fn hub_upgrade_script(
     // build that cannot come up on this host costs one restart, not a dead
     // node only an admin can revive.  The bot execs this script, so OLD_PID
     // is normally the script itself: no point waiting 30 s on it.
-    let build = if eq_ic(kind, "bin") {
+    let staged = kind.eq_ignore_ascii_case("staged");
+    let tar = if staged {
+        String::new()
+    } else {
+        format!(
+            "tar -xzf \"{archive}\" --strip-components=1 -C \"$UPGRADE_DIR\" 2>/dev/null || rollback \"could not extract artifact\"\n"
+        )
+    };
+    let build = if staged {
+        // Fetched, built and selftested while the old build ran: only the swap is left.
+        format!(
+            "NEW_BIN=\"{STAGE_DIR}/new\"\n[ -x \"$NEW_BIN\" ] || rollback \"the staged build is gone\""
+        )
+    } else if eq_ic(kind, "bin") {
         // Prebuilt: the tarball holds the binary itself, no toolchain needed.
         // No "run it once" probe — ircbot has no --version flag and starting a
         // second instance would fight the one we are replacing.  The hub is
@@ -937,34 +2002,26 @@ rm -rf "$UPGRADE_DIR"
 mkdir "$UPGRADE_DIR" || exit 1
 rollback() {{
   echo "[UPGRADE] FAILED: $1 — restoring previous build"
-  mv -f "{prev}" "{exe}" 2>/dev/null
-  rm -f "{PID_FILE}"
+  ./{FAILBACK_FILE} restore "$1"
   rm -rf "$UPGRADE_DIR" "{archive}"
-  exec "{exe}"
+  wait
+  rm -f "./upgrade.sh"
+  exit 0
 }}
-tar -xzf "{archive}" --strip-components=1 -C "$UPGRADE_DIR" 2>/dev/null || rollback "could not extract artifact"
-{build}
+./{FAILBACK_FILE} phase installing $$
+( while ./{FAILBACK_FILE} tick; do sleep 10; done ) </dev/null >/dev/null 2>&1 &
+{tar}{build}
 mv -f "$NEW_BIN" "{exe}" || rollback "could not install new binary"
 chmod 700 "{exe}"
 rm -f "{PID_FILE}"
 rm -rf "$UPGRADE_DIR" "{archive}" 2>/dev/null
+rm -rf {STAGE_DIR} 2>/dev/null
+./{FAILBACK_FILE} phase started $$
 "{exe}" </dev/null >/dev/null 2>&1
-sleep {watch}
-P=$(cat "{PID_FILE}" 2>/dev/null | tr -dc 0-9)
-if [ -z "$P" ] || ! kill -0 "$P" 2>/dev/null; then
-  [ -f "{prev}" ] || exit 1
-  echo "[UPGRADE] new build did not stay up — restoring previous build"
-  mv -f "{exe}" "{exe}.failed" 2>/dev/null
-  mv -f "{prev}" "{exe}" || {{ mv -f "{exe}.failed" "{exe}"; exit 1; }}
-  [ -f "{cfg_prev}" ] && cp -f "{cfg_prev}" "{CONFIG_FILE}"
-  rm -f "{PID_FILE}" ./upgrade.sh
-  exec "{exe}"
-fi
-rm -f ./upgrade.sh
+wait
+rm -f "./upgrade.sh"
 exit 0
 "#,
-        watch = UPGRADE_WATCH_SECS,
-        cfg_prev = format!("{CONFIG_FILE}{UPGRADE_PREV_SUFFIX}"),
     )
 }
 
@@ -1214,6 +2271,7 @@ pub fn hub_rollback(state: &mut BotState, reason: &str) -> bool {
         return false;
     }
     let _ = std::fs::remove_file(UPGRADE_MARKER_FILE);
+    failback_clear();
 
     ircf!(
         state,
@@ -1331,7 +2389,14 @@ pub fn hub_prepare_check(
     if !name.starts_with("ircbot-") {
         return Err("manifest artifact is not a ircbot release".to_string());
     }
-    Ok(())
+    preflight_host(
+        &state.executable_path,
+        CONFIG_FILE,
+        &row.url,
+        row.size,
+        &row.kind,
+        want_variant,
+    )
 }
 
 /// Run the upgrade the hub just committed us to.  `Err` means nothing was
@@ -1366,65 +2431,85 @@ pub fn hub_commit(
         want_variant
     );
 
-    let manifest = fetch_verified_manifest().map_err(|e| e.to_string())?;
-    let row = manifest_select(&manifest, target_ver, want_variant)?;
-
-    let url_name = row
-        .url
-        .rsplit('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("ircbot.tar.gz");
-    let archive =
-        sanitize_filename(url_name).ok_or("artifact filename in manifest is not acceptable")?;
-
-    // Every release artifact is named "<product>-…tar.gz" (see the releases
-    // repo README).  A base override that names the OTHER product's tree
-    // would otherwise hand this daemon the wrong binary and install it over
-    // itself — fail closed here, where nothing has been downloaded yet.
-    if !archive.starts_with("ircbot-") {
-        return Err("manifest artifact is not a ircbot release".to_string());
-    }
-
-    logm!(
-        state,
-        L_INFO,
-        "[UPGRADE] Fetching {} artifact {}\n",
-        row.kind,
-        archive
-    );
-    if !download(&row.url, &archive) {
-        return Err("artifact download failed".to_string());
-    }
-    if !crypto::sha256_file_hex(&archive).is_some_and(|h| h.eq_ignore_ascii_case(&row.hash)) {
-        let _ = std::fs::remove_file(&archive);
-        return Err("artifact SHA-256 mismatch".to_string());
-    }
-    // Run the new build's own -selftest BEFORE anything is renamed: a build
-    // that cannot run here (a CPU it needs, a library, a config it cannot
-    // read) is refused with nothing touched.
-    if version_cmp(target_ver, UPGRADE_TARGET_MIN) == std::cmp::Ordering::Less {
-        let _ = std::fs::remove_file(&archive);
-        return Err(format!(
-            "target predates {UPGRADE_TARGET_MIN}, the oldest the mesh links with"
-        ));
-    }
-    if eq_ic(&row.kind, "bin") {
+    let (row_kind, archive) = if stage_ready_for(upgrade_id, target_ver) {
         logm!(
             state,
             L_INFO,
-            "[UPGRADE] Running the new build's selftest\n"
+            "[UPGRADE] Using the build staged for {}\n",
+            target_ver
         );
-        if let Err(e) = staged_selftest(&archive) {
-            let _ = std::fs::remove_file(&archive);
-            return Err(format!("new build failed its selftest: {e}"));
+        ("staged".to_string(), String::new())
+    } else {
+        stage_clear();
+        let manifest = fetch_verified_manifest().map_err(|e| e.to_string())?;
+        let row = manifest_select(&manifest, target_ver, want_variant)?;
+
+        let url_name = row
+            .url
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("ircbot.tar.gz");
+        let archive =
+            sanitize_filename(url_name).ok_or("artifact filename in manifest is not acceptable")?;
+
+        // Every release artifact is named "<product>-…tar.gz" (see the releases
+        // repo README).  A base override that names the OTHER product's tree
+        // would otherwise hand this daemon the wrong binary and install it over
+        // itself — fail closed here, where nothing has been downloaded yet.
+        if !archive.starts_with("ircbot-") {
+            return Err("manifest artifact is not a ircbot release".to_string());
         }
-    }
+
+        logm!(
+            state,
+            L_INFO,
+            "[UPGRADE] Fetching {} artifact {}\n",
+            row.kind,
+            archive
+        );
+        if !download(&row.url, &archive) {
+            return Err("artifact download failed".to_string());
+        }
+        if !crypto::sha256_file_hex(&archive).is_some_and(|h| h.eq_ignore_ascii_case(&row.hash)) {
+            let _ = std::fs::remove_file(&archive);
+            return Err("artifact SHA-256 mismatch".to_string());
+        }
+        // Run the new build's own -selftest BEFORE anything is renamed: a build
+        // that cannot run here (a CPU it needs, a library, a config it cannot
+        // read) is refused with nothing touched.
+        if version_cmp(target_ver, UPGRADE_TARGET_MIN) == std::cmp::Ordering::Less {
+            let _ = std::fs::remove_file(&archive);
+            return Err(format!(
+                "target predates {UPGRADE_TARGET_MIN}, the oldest the mesh links with"
+            ));
+        }
+        if eq_ic(&row.kind, "bin") {
+            logm!(
+                state,
+                L_INFO,
+                "[UPGRADE] Running the new build's selftest\n"
+            );
+            if let Err(e) = staged_selftest(&archive) {
+                let _ = std::fs::remove_file(&archive);
+                return Err(format!("new build failed its selftest: {e}"));
+            }
+        }
+
+        (row.kind.clone(), archive)
+    };
 
     // Flush the live config, then snapshot the pair we may have to restore.
     // The config is copied (the running bot still needs it); the binary is
     // renamed, which is atomic and leaves <exe>.prev ready for a rollback.
+    let saves = config::saves();
     config::write_with_state_pass(state);
+    if config::saves() == saves {
+        if !archive.is_empty() {
+            let _ = std::fs::remove_file(&archive);
+        }
+        return Err("could not save the config before the swap".to_string());
+    }
     let exe = state.executable_path.clone();
     let prev_exe = format!("{exe}{UPGRADE_PREV_SUFFIX}");
     let prev_cfg = format!("{CONFIG_FILE}{UPGRADE_PREV_SUFFIX}");
@@ -1432,7 +2517,11 @@ pub fn hub_commit(
         let _ = std::fs::remove_file(&archive);
         return Err("could not snapshot config for rollback".to_string());
     }
-    if std::fs::rename(&exe, &prev_exe).is_err() {
+    // Both are copied: <exe> stays in place until the new one is renamed over
+    // it, so there is never a moment with no binary there.
+    let prev_tmp = format!("{prev_exe}.tmp");
+    if std::fs::copy(&exe, &prev_tmp).is_err() || std::fs::rename(&prev_tmp, &prev_exe).is_err() {
+        let _ = std::fs::remove_file(&prev_tmp);
         let _ = std::fs::remove_file(&prev_cfg);
         let _ = std::fs::remove_file(&archive);
         return Err("could not retain previous binary".to_string());
@@ -1440,14 +2529,7 @@ pub fn hub_commit(
 
     // From here a failure is the script's to handle: it restores <exe>.prev
     // and restarts the old build rather than leaving the node with no binary.
-    let script = hub_upgrade_script(
-        std::process::id(),
-        &row.kind,
-        &archive,
-        &prev_exe,
-        &exe,
-        true,
-    );
+    let script = hub_upgrade_script(std::process::id(), &row_kind, &archive, &exe, true);
     // The channels we hold ops in now: after the restart the "ok" is held
     // until we are back in each of them, opped (hub_client::upgrade_ready_tick).
     let ops: Vec<String> = state
@@ -1467,15 +2549,38 @@ pub fn hub_commit(
                 f.write_all(script.as_bytes())?;
                 f.set_permissions(std::fs::Permissions::from_mode(0o700))
             })
-            .is_ok();
+            .is_ok()
+        && failback_stage(
+            &exe,
+            upgrade_id,
+            !row_kind.eq_ignore_ascii_case("src"),
+            CONFIG_FILE,
+            PID_FILE,
+            "upgrade.sh",
+            if !state.hubs.is_empty() {
+                "no hub link and IRC"
+            } else {
+                "no IRC"
+            },
+        );
     if !staged {
+        failback_clear();
         let _ = std::fs::remove_file(UPGRADE_MARKER_FILE);
-        let _ = std::fs::rename(&prev_exe, &exe);
+        let _ = std::fs::remove_file(&prev_exe);
         let _ = std::fs::remove_file(&prev_cfg);
         let _ = std::fs::remove_file(&archive);
         return Err("could not stage the upgrade script".to_string());
     }
 
+    let cron = failback_run("install");
+    if cron != 0 {
+        logm!(
+            state,
+            L_INFO,
+            "[UPGRADE] No cron failback on this host ({}): it will not survive a reboot during this upgrade\n",
+            cron
+        );
+    }
     logm!(
         state,
         L_INFO,
@@ -1493,8 +2598,9 @@ pub fn hub_commit(
     state.pid_file = None;
     std::thread::sleep(std::time::Duration::from_secs(1));
     let err = Command::new("./upgrade.sh").exec();
-    // exec failed: put the old binary back so the node is not left dead.
-    let _ = std::fs::rename(&prev_exe, &exe);
+    // exec failed: <exe> was never moved, so this node is still whole.
+    failback_clear();
+    let _ = std::fs::remove_file(&prev_exe);
     let _ = std::fs::remove_file(UPGRADE_MARKER_FILE);
     eprintln!("exec upgrade.sh failed: {err}");
     std::process::exit(1);
@@ -1572,17 +2678,13 @@ mod tests {
     /// rollback, and holds the new build to the startup watchdog.
     #[test]
     fn hub_script_has_watchdog() {
-        let sc = hub_upgrade_script(42, "bin", "a.tar.gz", "/x/ircbot.prev", "/x/ircbot", true);
+        let sc = hub_upgrade_script(42, "bin", "a.tar.gz", "/x/ircbot", true);
         assert!(!sc.contains("-selftest"));
-        let src = hub_upgrade_script(42, "src", "a.tar.gz", "/x/ircbot.prev", "/x/ircbot", true);
+        let src = hub_upgrade_script(42, "src", "a.tar.gz", "/x/ircbot", true);
         assert!(src.contains(r#""$NEW_BIN" -selftest"#));
         assert!(sc.contains(r#"[ "$OLD_PID" = "$$" ] && break"#));
-        assert!(sc.contains(&format!("sleep {UPGRADE_WATCH_SECS}")));
+        assert!(sc.contains("phase started $$"));
         // Nothing retained: the binary in place is never moved aside.
-        assert!(sc.contains(r#"[ -f "/x/ircbot.prev" ] || exit 1"#));
-        assert!(sc.contains(
-            r#"mv -f "/x/ircbot.prev" "/x/ircbot" || { mv -f "/x/ircbot.failed" "/x/ircbot"; exit 1; }"#
-        ));
         let rollback = sc.split("rollback() {").nth(1).unwrap();
         let rollback = rollback.split('}').next().unwrap();
         assert!(!rollback.contains(UPGRADE_MARKER_FILE));

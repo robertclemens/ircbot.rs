@@ -50,6 +50,10 @@ There are no admin, oper or bot passwords: bots, admins and opers are each ident
         ```
         This creates `.ircbot.pass` (mode 0600, encrypted and bound to this machine). The bot will load it automatically on every start with no interaction required, at the cost of storing the encrypted password on disk. This is required if you want to use crontab or any other automated restart mechanism.
 
+During a hub-driven upgrade, the node adds one temporary line to its own user's crontab, tagged `# ircbot:failback:<dir>:`, where `<dir>` is the directory holding the binary. It restores the previous build if the new one never proves itself, even after a reboot, and is removed along with its script (`.upgrade.failback`) once the upgrade settles, at most about 40 minutes later (about 65 for a source build). If `crontab` is missing or unreadable, the upgrade goes ahead without this cover and logs that it did.
+
+A node can also keep a permanent keepalive line, tagged `# ircbot:production:<dir>:`. This is off unless an admin turns it on from a hub with `bot set cron` or `hub set cron`, for every node (`global`) or one; the last command wins. It needs the `.pass` file. The node only ever changes its own tagged lines, and `bot del` removes a bot's. An upgrade leaves the line in place: a start while an upgrade installs exits quietly.
+
         From 2.5.1 only files keyed with PBKDF2-HMAC-SHA256 at 600,000 rounds are read (`.ircbot.cnf` and `.ircbot.pass`). A node must run 2.5.0 once first, which rewrites them; a pass file 2.5.0 never rewrote makes `-selftest` refuse the upgrade. A pre-2.5.0 binary cannot read the migrated files, so do not copy one over a bot.
 
         Example crontab line (optional):

@@ -767,7 +767,16 @@ fn write_file(state: &BotState, password: &str) {
     if let Err(e) = fs::rename(&temp_file, CONFIG_FILE) {
         eprintln!("[CFG] Failed to rename {temp_file} to {CONFIG_FILE}: {e}");
         let _ = fs::remove_file(&temp_file);
+        return;
     }
+    CONFIG_SAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many writes have reached the disk.  A write that fails keeps the old file
+/// and says nothing else, so an upgrade counts these to know its flush landed.
+static CONFIG_SAVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn saves() -> u64 {
+    CONFIG_SAVES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// config_write(): save, then push to the hub when authenticated.

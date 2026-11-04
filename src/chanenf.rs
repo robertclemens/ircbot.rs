@@ -694,53 +694,78 @@ fn act_kick(state: &mut BotState, ci: usize, nick: &str, reason: &str) {
     hub_client::chan_event(state, &name, "kick", &enick, &why);
 }
 
-fn act_ban(state: &mut BotState, ci: usize, mask: &str, why: &str) {
+/// What `ban_set` did; the job path ignores it, the hub's ban election
+/// reports it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BanSet {
+    Sent,
+    Live,
+    Noop,
+    Full,
+    Recent,
+    Hits,
+    Overlap,
+}
+
+/// `who`: the member or record a refused mask would hit (Hits / Overlap).
+fn ban_set(state: &mut BotState, ci: usize, mask: &str, why: &str, who: &mut String) -> BanSet {
     let c = &state.chans[ci];
-    if !c.i_am_opped || !safe_token(mask, BAN_MASK_MAX) || live_has_ban(c, mask) {
-        return;
+    if !c.i_am_opped || !safe_token(mask, BAN_MASK_MAX) {
+        return BanSet::Noop;
+    }
+    if live_has_ban(c, mask) {
+        return BanSet::Live;
     }
     if c.ban_list_known && c.bans.len() >= state.isup.ban_cap() {
-        return; // the server's list is full
+        return BanSet::Full; // the server's list is full
     }
     let name = c.name.clone();
     let t = now();
     let ti = track_get(state, &name, mask, t);
     if t - state.ban_track[ti].set_at < RECENT_BAN_MS / 1000 {
-        return;
+        return BanSet::Recent;
     }
     // section 6.2: step 1 every time (who is in the channel), step 2 cached 60 s
-    if let Some(who) = allowed_members(state, ci, mask) {
+    if let Some(w) = allowed_members(state, ci, mask) {
         logm!(
             state,
             L_INFO,
             "[BAN] Not setting {} in {}: it would hit {}\n",
             mask,
             name,
-            trunc(&who, 80)
+            trunc(&w, 80)
         );
-        return;
+        *who = w;
+        return BanSet::Hits;
     }
     if t - state.ban_track[ti].checked_at >= 60 {
         let ov = auth::mask_overlaps_authorised(state, mask, Some(&state.chans[ci].name));
         state.ban_track[ti].overlap_ok = ov.is_none();
         state.ban_track[ti].checked_at = t;
-        if let Some(who) = ov {
+        if let Some(w) = ov {
             logm!(
                 state,
                 L_INFO,
                 "[BAN] Not setting {} in {}: it overlaps {}\n",
                 mask,
                 name,
-                trunc(&who, 80)
+                trunc(&w, 80)
             );
+            *who = w;
         }
     }
     if !state.ban_track[ti].overlap_ok {
-        return;
+        return BanSet::Overlap;
     }
     state.ban_track[ti].set_at = t;
     ircf!(state, "MODE {} +b {}\r\n", name, mask);
     hub_client::chan_event(state, &name, "ban", mask, why);
+    BanSet::Sent
+}
+
+fn act_ban(state: &mut BotState, ci: usize, mask: &str, why: &str) {
+    let mut who = String::new();
+    ban_set(state, ci, mask, why, &mut who);
 }
 
 fn act_unban(state: &mut BotState, ci: usize, mask: &str, why: &str) {
@@ -1019,6 +1044,102 @@ pub fn request_ban(
         job_submit(state, ci, JobAct::Kick, nick, reason);
     }
     ok
+}
+
+// ---- the hub's channel kick / ban election (CMD_CHAN_DO) --------------------------
+
+/// The hub picked this bot for an admin's channel kick.  Acts now, not through
+/// the job deal: (true, "KICK sent"), or (false, why not); "absent" /
+/// "protected" mean no other bot can do better.
+pub fn admin_kick(state: &mut BotState, chan: &str, nick: &str, reason: &str) -> (bool, String) {
+    let fail = |s: &str| (false, s.to_string());
+    let Some(ci) = in_chan(state, chan) else {
+        return fail("not in channel");
+    };
+    let c = &state.chans[ci];
+    if !c.i_am_opped {
+        return fail("not opped");
+    }
+    if !valid_nick(state, nick) {
+        return fail("not a valid nick");
+    }
+    let Some(e) = rfind(c, nick).map(|i| &c.roster[i]) else {
+        return fail("absent");
+    };
+    if entry_authorised(state, &c.name, e) {
+        return fail("protected"); // a bot (this one too) or an authorised user
+    }
+    let (name, nk) = (c.name.clone(), e.nick.clone());
+    logm!(
+        state,
+        L_INFO,
+        "[CHANREQ] Kicking {} from {} (picked by the hub)\n",
+        nk,
+        name
+    );
+    act_kick(
+        state,
+        ci,
+        &nk,
+        if reason.is_empty() { "kicked" } else { reason },
+    );
+    (true, "KICK sent".to_string())
+}
+
+/// The same for an admin's channel ban: (true, detail) when sent, already on
+/// the channel or just set; (false, why not) otherwise.
+pub fn admin_ban(state: &mut BotState, chan: &str, mask: &str) -> (bool, String) {
+    let Some(ci) = in_chan(state, chan) else {
+        return (false, "not in channel".to_string());
+    };
+    if !state.chans[ci].i_am_opped {
+        return (false, "not opped".to_string());
+    }
+    // the listed record's reason and sticky flag, as the sweep uses them
+    let name = state.chans[ci].name.clone();
+    let rec = state
+        .cfg_bans
+        .iter()
+        .find(|b| b.active && eq_ic(&b.mask, mask) && (b.chan == "*" || eq_ic(&b.chan, &name)));
+    let reason = rec
+        .filter(|b| !b.reason.is_empty())
+        .map_or_else(|| "banned".to_string(), |b| b.reason.clone());
+    let sticky = rec.is_some_and(|b| b.flags.contains('s'));
+    // +dynamicbans: a listed ban that is not sticky goes on only while an
+    // unauthorised member it matches is there (ban_sweep (b)); "dynamic" is
+    // about the ban, not this bot, so the hub tries no other
+    if !sticky
+        && cset(state, ci, CsetId::DynamicBans) != 0
+        && !live_has_ban(&state.chans[ci], mask)
+        && unauth_match(state, ci, mask).0.is_empty()
+    {
+        return (false, "dynamic".to_string());
+    }
+    let mut who = String::new();
+    let r = ban_set(state, ci, mask, &reason, &mut who);
+    let detail = match r {
+        BanSet::Sent => "MODE +b sent".to_string(),
+        BanSet::Live => "already set".to_string(),
+        BanSet::Recent => "just set".to_string(),
+        BanSet::Noop => "not a valid mask".to_string(),
+        BanSet::Full => "the channel ban list is full".to_string(),
+        BanSet::Hits => format!("it would hit {}", trunc(&who, 61)),
+        // who is empty when the refusal was cached
+        BanSet::Overlap if who.is_empty() => "it overlaps a bot or an authorised user".to_string(),
+        BanSet::Overlap => format!("it overlaps {}", trunc(&who, 61)),
+    };
+    let ok = matches!(r, BanSet::Sent | BanSet::Live | BanSet::Recent);
+    if ok {
+        logm!(
+            state,
+            L_INFO,
+            "[CHANREQ] Ban {} in {} (picked by the hub): {}\n",
+            mask,
+            name,
+            detail
+        );
+    }
+    (ok, detail)
 }
 
 /// +revenge: the unauthorised `prefix` hurt an authorised member.  First time

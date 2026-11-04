@@ -178,6 +178,13 @@ work on a chat too: paste the line into the chat window.
     /botunlock               enter the passphrase /botlock                forget the unlocked key
     /set bot_auth_passwd_expire 1h                   (passphrase keys, see above)
 
+  Passphrase keys use CryptX's scrypt when it has one (0.088+).  Older CryptX
+  (Ubuntu 26.04 ships 0.087, and its AppArmor profile keeps irssi from
+  loading one installed without root) gets the script's built-in scrypt:
+  about 90 s per unlock for keygen's default settings, run in the background
+  so irssi stays usable; /botcmds typed meanwhile wait for it.  A longer
+  bot_auth_passwd_expire means fewer unlocks.
+
 
 
 /* ircbot_hexchat_auth.py  (HexChat, requires python3-cryptography) */

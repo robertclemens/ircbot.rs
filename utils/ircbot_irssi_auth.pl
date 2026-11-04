@@ -15,6 +15,7 @@ our $CRYPTX_OK = eval {
     require Crypt::AuthEnc::GCM;    # gcm_encrypt_authenticate / gcm_decrypt_verify
     require Crypt::PRNG;            # random_bytes
     require Crypt::Digest::SHA256;  # sha256 (fingerprints)
+    require Time::HiRes;            # built-in scrypt time slices (core)
     1;
 };
 our $CRYPTX_ERR = $CRYPTX_OK ? '' : "$@";
@@ -129,6 +130,147 @@ sub fingerprint {
     return join(':', $hex =~ /(....)/g);
 }
 
+# --- built-in scrypt --------------------------------------------------------
+# CryptX gained scrypt_pbkdf in 0.088; distro packages can be older (Ubuntu
+# 26.04 ships 0.087), and Ubuntu's AppArmor profile keeps irssi from loading
+# a newer CryptX installed without root.  So this script carries its own
+# scrypt (RFC 7914) on CryptX's PBKDF2-HMAC-SHA256.  Pure Perl is ~20 µs per
+# Salsa20/8 core, about a minute and a half for keygen's N=2^17: the job runs
+# in slices (scrypt_job_step) so irssi stays usable while it works.
+use constant M32 => 0xffffffff;
+
+# True if CryptX has a native scrypt_pbkdf (instant unlocks).
+sub scrypt_ok { return $CRYPTX_OK && Crypt::KeyDerivation->can('scrypt_pbkdf') }
+
+# Salsa20/8 core on one 64-byte block (RFC 7914 §3), unrolled: this loop is
+# where the built-in scrypt spends its time.
+sub _salsa8 {
+    my @in = unpack('V16', $_[0]);
+    my ($x0, $x1, $x2, $x3, $x4, $x5, $x6, $x7, $x8, $x9, $x10, $x11, $x12, $x13, $x14, $x15) = @in;
+    my $t;
+    for (1 .. 4) {
+        $t = ($x0 + $x12) & M32; $x4 ^= (($t << 7) & M32) | ($t >> 25);
+        $t = ($x4 + $x0) & M32; $x8 ^= (($t << 9) & M32) | ($t >> 23);
+        $t = ($x8 + $x4) & M32; $x12 ^= (($t << 13) & M32) | ($t >> 19);
+        $t = ($x12 + $x8) & M32; $x0 ^= (($t << 18) & M32) | ($t >> 14);
+        $t = ($x5 + $x1) & M32; $x9 ^= (($t << 7) & M32) | ($t >> 25);
+        $t = ($x9 + $x5) & M32; $x13 ^= (($t << 9) & M32) | ($t >> 23);
+        $t = ($x13 + $x9) & M32; $x1 ^= (($t << 13) & M32) | ($t >> 19);
+        $t = ($x1 + $x13) & M32; $x5 ^= (($t << 18) & M32) | ($t >> 14);
+        $t = ($x10 + $x6) & M32; $x14 ^= (($t << 7) & M32) | ($t >> 25);
+        $t = ($x14 + $x10) & M32; $x2 ^= (($t << 9) & M32) | ($t >> 23);
+        $t = ($x2 + $x14) & M32; $x6 ^= (($t << 13) & M32) | ($t >> 19);
+        $t = ($x6 + $x2) & M32; $x10 ^= (($t << 18) & M32) | ($t >> 14);
+        $t = ($x15 + $x11) & M32; $x3 ^= (($t << 7) & M32) | ($t >> 25);
+        $t = ($x3 + $x15) & M32; $x7 ^= (($t << 9) & M32) | ($t >> 23);
+        $t = ($x7 + $x3) & M32; $x11 ^= (($t << 13) & M32) | ($t >> 19);
+        $t = ($x11 + $x7) & M32; $x15 ^= (($t << 18) & M32) | ($t >> 14);
+        $t = ($x0 + $x3) & M32; $x1 ^= (($t << 7) & M32) | ($t >> 25);
+        $t = ($x1 + $x0) & M32; $x2 ^= (($t << 9) & M32) | ($t >> 23);
+        $t = ($x2 + $x1) & M32; $x3 ^= (($t << 13) & M32) | ($t >> 19);
+        $t = ($x3 + $x2) & M32; $x0 ^= (($t << 18) & M32) | ($t >> 14);
+        $t = ($x5 + $x4) & M32; $x6 ^= (($t << 7) & M32) | ($t >> 25);
+        $t = ($x6 + $x5) & M32; $x7 ^= (($t << 9) & M32) | ($t >> 23);
+        $t = ($x7 + $x6) & M32; $x4 ^= (($t << 13) & M32) | ($t >> 19);
+        $t = ($x4 + $x7) & M32; $x5 ^= (($t << 18) & M32) | ($t >> 14);
+        $t = ($x10 + $x9) & M32; $x11 ^= (($t << 7) & M32) | ($t >> 25);
+        $t = ($x11 + $x10) & M32; $x8 ^= (($t << 9) & M32) | ($t >> 23);
+        $t = ($x8 + $x11) & M32; $x9 ^= (($t << 13) & M32) | ($t >> 19);
+        $t = ($x9 + $x8) & M32; $x10 ^= (($t << 18) & M32) | ($t >> 14);
+        $t = ($x15 + $x14) & M32; $x12 ^= (($t << 7) & M32) | ($t >> 25);
+        $t = ($x12 + $x15) & M32; $x13 ^= (($t << 9) & M32) | ($t >> 23);
+        $t = ($x13 + $x12) & M32; $x14 ^= (($t << 13) & M32) | ($t >> 19);
+        $t = ($x14 + $x13) & M32; $x15 ^= (($t << 18) & M32) | ($t >> 14);
+    }
+    return pack('V16', ($x0 + $in[0]) & M32, ($x1 + $in[1]) & M32, ($x2 + $in[2]) & M32, ($x3 + $in[3]) & M32, ($x4 + $in[4]) & M32, ($x5 + $in[5]) & M32, ($x6 + $in[6]) & M32, ($x7 + $in[7]) & M32, ($x8 + $in[8]) & M32, ($x9 + $in[9]) & M32, ($x10 + $in[10]) & M32, ($x11 + $in[11]) & M32, ($x12 + $in[12]) & M32, ($x13 + $in[13]) & M32, ($x14 + $in[14]) & M32, ($x15 + $in[15]) & M32);
+}
+
+# BlockMix (RFC 7914 §4) on 2r 64-byte blocks.
+sub _blockmix {
+    my ($b, $r) = @_;
+    my $x = substr($b, (2 * $r - 1) * 64, 64);
+    my (@even, @odd);
+    for my $i (0 .. 2 * $r - 1) {
+        $x = _salsa8($x ^ substr($b, $i * 64, 64));
+        push @{ $i % 2 ? \@odd : \@even }, $x;
+    }
+    return join('', @even, @odd);
+}
+
+sub _wipe_str { $_[0] =~ tr/\x00-\xff/\x00/ if defined $_[0] }
+
+# A resumable scrypt(pass, salt, 2^log2n, r, p, 32).  The job owns a copy of
+# the passphrase until it finishes or is wiped.
+sub scrypt_job_new {
+    my ($pass, $salt, $log2n, $r, $p) = @_;
+    my $blen = 128 * $r;
+    my $b = Crypt::KeyDerivation::pbkdf2($pass, $salt, 1, 'SHA256', $p * $blen);
+    return { pass => "$pass", n => 1 << $log2n, r => $r, p => $p, blen => $blen,
+             b => $b, part => 0, i => 0, x => substr($b, 0, $blen),
+             v => "\0" x ((1 << $log2n) * $blen) };
+}
+
+# Done share of the work, 0..1.
+sub scrypt_job_progress {
+    my ($j) = @_;
+    return ($j->{part} * 2 * $j->{n} + $j->{i}) / (2 * $j->{n} * $j->{p});
+}
+
+# Run for about $secs seconds.  Returns the 32-byte key once done (the job is
+# then wiped), else undef.
+sub scrypt_job_step {
+    my ($j, $secs) = @_;
+    my ($n, $r, $blen) = @{$j}{qw(n r blen)};
+    my $last = (2 * $r - 1) * 64;
+    my $stop = Time::HiRes::time() + $secs;
+    while ($j->{part} < $j->{p}) {
+        my $i = $j->{i};
+        my $end = $i + 64;                              # BlockMixes between clock reads
+        if ($i < $n) {                                   # ROMix pass 1: fill V
+            $end = $n if $end > $n;
+            for (; $i < $end; $i++) {
+                substr($j->{v}, $i * $blen, $blen, $j->{x});
+                $j->{x} = _blockmix($j->{x}, $r);
+            }
+        } else {                                         # pass 2: pseudo-random reads
+            $end = 2 * $n if $end > 2 * $n;
+            for (; $i < $end; $i++) {
+                my $k = unpack('V', substr($j->{x}, $last, 4)) & ($n - 1);
+                $j->{x} = _blockmix($j->{x} ^ substr($j->{v}, $k * $blen, $blen), $r);
+            }
+        }
+        $j->{i} = $i;
+        if ($i == 2 * $n) {
+            substr($j->{b}, $j->{part} * $blen, $blen, $j->{x});
+            $j->{part}++;
+            $j->{i} = 0;
+            $j->{x} = substr($j->{b}, $j->{part} * $blen, $blen) if $j->{part} < $j->{p};
+        }
+        last if Time::HiRes::time() >= $stop;
+    }
+    return undef if $j->{part} < $j->{p};
+    my $key = Crypt::KeyDerivation::pbkdf2($j->{pass}, $j->{b}, 1, 'SHA256', 32);
+    scrypt_job_wipe($j);
+    return $key;
+}
+
+sub scrypt_job_wipe {
+    my ($j) = @_;
+    _wipe_str($j->{$_}) for qw(pass b x v);
+    %$j = ();
+}
+
+# scrypt in one go: CryptX's when it has one, else the built-in job.
+sub scrypt_key {
+    my ($pass, $salt, $log2n, $r, $p) = @_;
+    return Crypt::KeyDerivation::scrypt_pbkdf($pass, $salt, 1 << $log2n, $r, $p, 32)
+        if scrypt_ok();
+    my $j = scrypt_job_new($pass, $salt, $log2n, $r, $p);
+    my $key;
+    $key = scrypt_job_step($j, 3600) until defined $key;
+    return $key;
+}
+
 # irckey-v2 (a passphrase-protected .private.b64, irchub/docs/console.md §9):
 # "irckey-v2 scrypt <log2N> <r> <p> <salt> <nonce> <ct>".  Reader bounds as in
 # keygen: a hostile file costs at most 128 * r * N = 256 MB.
@@ -143,11 +285,10 @@ sub _b64_exact {
     return $raw;
 }
 
-# The 64-byte private key inside an irckey-v2 line; dies on a malformed line,
-# out-of-range scrypt settings (checked before any work), a wrong passphrase
-# or any edit to the line.
-sub irckey_open {
-    my ($line, $pass) = @_;
+# An irckey-v2 line's fields; dies on a malformed line or out-of-range scrypt
+# settings (checked before any work).
+sub irckey_parse {
+    my ($line) = @_;
     die "malformed irckey-v2 line\n"
         if length($line) >= 512 || $line =~ /  / || $line =~ / \z/;
     my @f = split / /, $line, -1;
@@ -159,18 +300,30 @@ sub irckey_open {
         die "irckey-v2 scrypt settings out of range\n"
             if $v !~ /\A\d{1,3}\z/ || $v < $lim[$i][0] || $v > $lim[$i][1];
     }
-    my ($log2n, $r, $p) = @f[2 .. 4];
-    my $salt  = _b64_exact($f[5], 16);
-    my $nonce = _b64_exact($f[6], 12);
-    my $ct    = _b64_exact($f[7], 80);
-    my $aad   = substr($line, 0, rindex($line, ' '));
-    my $key = Crypt::KeyDerivation::scrypt_pbkdf($pass, $salt, 1 << $log2n, $r, $p, 32);
-    my ($body, $tag) = (substr($ct, 0, 64), substr($ct, 64));   # plain scalars for the XS
-    my $pt = eval { Crypt::AuthEnc::GCM::gcm_decrypt_verify('AES', $key, $nonce, $aad,
-                                                             $body, $tag) };
+    return { log2n => $f[2], r => $f[3], p => $f[4],
+             salt  => _b64_exact($f[5], 16),
+             nonce => _b64_exact($f[6], 12),
+             ct    => _b64_exact($f[7], 80),
+             aad   => substr($line, 0, rindex($line, ' ')) };
+}
+
+# The 64-byte private key sealed in a parsed line under the scrypt output
+# $key (wiped here); dies on a wrong passphrase or any edit to the line.
+sub irckey_decrypt {
+    my ($k, $key) = @_;
+    my ($body, $tag) = (substr($k->{ct}, 0, 64), substr($k->{ct}, 64));   # plain scalars for the XS
+    my $pt = eval { Crypt::AuthEnc::GCM::gcm_decrypt_verify('AES', $key, $k->{nonce},
+                                                             $k->{aad}, $body, $tag) };
     substr($key, 0, 32, "\0" x 32);
     die "wrong passphrase (or a damaged key file)\n" if !defined $pt || length($pt) != 64;
     return $pt;
+}
+
+# The 64-byte private key inside an irckey-v2 line, in one blocking call.
+sub irckey_open {
+    my ($line, $pass) = @_;
+    my $k = irckey_parse($line);
+    return irckey_decrypt($k, scrypt_key($pass, $k->{salt}, $k->{log2n}, $k->{r}, $k->{p}));
 }
 
 # True if the keyfile at $path is an irckey-v2 (passphrase) key.
@@ -219,6 +372,12 @@ sub load_key {
         $line =~ s/[\r\n]+\z//;
         $raw = irckey_open($line, $pass);
     }
+    return key_from_raw($raw, $path, $plain);
+}
+
+# The key hashref from the 64 raw bytes ($raw is wiped).
+sub key_from_raw {
+    my ($raw, $path, $plain) = @_;
     die "keyfile '$path': decoded key must be 64 bytes, got " . length($raw) . "\n"
         if length($raw) != 64;
 
@@ -492,6 +651,7 @@ our %UNLOCKED;
 # The passphrase prompt while it waits: { path, t, typed => [chars], esc
 # (inside an escape sequence), pending => [...] }.
 our %CAPTURE;
+our %UNLOCKING;   # built-in scrypt running: job, k (parsed line), path, pending, t0
 our %FAILS = (n => 0, until => 0);
 our %WARNED;      # keyfiles already warned about having no passphrase
 our %SETTINGS_SEEN;
@@ -510,12 +670,20 @@ sub _wipe_key {
     }
 }
 
+# Passphrase-flow messages go to the window the user is typing in (the
+# prompt is easy to miss in the status window).
+sub _say {
+    my ($msg) = @_;
+    my $win = defined &Irssi::active_win ? Irssi::active_win() : undef;
+    return $win ? $win->print($msg, Irssi::MSGLEVEL_CLIENTCRAP()) : Irssi::print($msg);
+}
+
 sub _lock {
     my ($why) = @_;
     my $had = %UNLOCKED ? 1 : 0;
     _wipe_key($UNLOCKED{key});
     %UNLOCKED = ();
-    Irssi::print("bot_auth: $why") if $had && defined $why;
+    _say("bot_auth: $why") if $had && defined $why;
 }
 
 sub _expire_secs {
@@ -559,7 +727,7 @@ sub _load_key {
 
 # passwd_expire 0: lock once nothing more is waiting for the key.
 sub _used_once {
-    _lock() if $UNLOCKED{once} && !%PENDING && !%CAPTURE;
+    _lock() if $UNLOCKED{once} && !%PENDING && !%CAPTURE && !%UNLOCKING;
 }
 
 # Arm the passphrase prompt; $pending (a /botcmd's server tag, bot and
@@ -568,19 +736,26 @@ sub _ask_passphrase {
     my ($pending) = @_;
     my $path = Irssi::settings_get_str('bot_auth_keyfile');
     my $now  = time();
+    if (%UNLOCKING) {
+        push @{ $UNLOCKING{pending} }, $pending
+            if $pending && @{ $UNLOCKING{pending} } < MAX_QUEUE;
+        return _say(sprintf('bot_auth: still unlocking the key (%d%%)%s', 
+                            100 * scrypt_job_progress($UNLOCKING{job}),
+                            $pending ? '; the command runs once it is done.' : '.'));
+    }
     if ($now < $FAILS{until}) {
-        return Irssi::print('bot_auth: too many wrong passphrases; try again in '
+        return _say('bot_auth: too many wrong passphrases; try again in '
                           . ($FAILS{until} - $now + 1) . ' s.');
     }
     if (%CAPTURE) {
         push @{ $CAPTURE{pending} }, $pending
             if $pending && @{ $CAPTURE{pending} } < MAX_QUEUE;
-        return Irssi::print('bot_auth: still waiting for the passphrase (an empty line cancels).');
+        return _say('bot_auth: still waiting for the passphrase (an empty line cancels).');
     }
     %CAPTURE = (path => $path, t => $now, typed => [], esc => 0,
                 pending => [$pending ? $pending : ()]);
     _input_set('');
-    Irssi::print("bot_auth: passphrase for $path: type it and press Enter — it never "
+    _say("bot_auth: passphrase for $path: type it and press Enter — it never "
                . 'reaches the input line or its history and is never sent (an empty '
                . 'line cancels).');
 }
@@ -599,7 +774,7 @@ sub _cancel_capture {
     my $cap = _end_capture();
     my $n = @{ $cap->{pending} };
     $_ = "\0" for @{ $cap->{typed} };
-    Irssi::print("bot_auth: $why" . ($n ? "; dropped $n command(s)" : ''));
+    _say("bot_auth: $why" . ($n ? "; dropped $n command(s)" : ''));
 }
 
 sub _try_unlock {
@@ -608,45 +783,124 @@ sub _try_unlock {
     $_ = "\0" for @{ $cap->{typed} };
     my $n = @{ $cap->{pending} };
     if (!length $pass) {
-        return Irssi::print('bot_auth: passphrase prompt cancelled'
-                          . ($n ? "; dropped $n command(s)" : ''));
+        return _say('bot_auth: passphrase prompt cancelled'
+                  . ($n ? "; dropped $n command(s)" : ''));
     }
     utf8::encode($pass) if utf8::is_utf8($pass);
-    my $key = length($pass) <= PASS_MAX ? eval { load_key($cap->{path}, $pass) } : undef;
-    my $err = $@ || (length($pass) > PASS_MAX ? "passphrase too long\n" : '');
-    substr($pass, 0, length $pass, "\0" x length $pass);
-    if (!$key) {
-        $err =~ s/\n\z//;
-        if (++$FAILS{n} >= FAIL_LIMIT) {
-            %FAILS = (n => 0, until => time() + FAIL_PAUSE);
-        }
-        return Irssi::print("bot_auth: $err" . ($n ? "; dropped $n command(s)" : ''));
+    my ($key, $err);
+    if (length($pass) > PASS_MAX) {
+        $err = "passphrase too long\n";
+    } elsif (scrypt_ok()) {
+        $key = eval { load_key($cap->{path}, $pass) };
+        $err = $@;
+    } else {
+        $err = _start_unlocking($cap, $pass);
     }
+    substr($pass, 0, length $pass, "\0" x length $pass);
+    return if !$key && !$err;                       # the built-in scrypt is running
+    return _unlock_failed($err, $cap->{pending}) if !$key;
+    _unlocked($key, $cap->{path}, $cap->{pending});
+}
+
+sub _unlock_failed {
+    my ($err, $pending) = @_;
+    my $n = @$pending;
+    $err =~ s/\n\z//;
+    if (++$FAILS{n} >= FAIL_LIMIT) {
+        %FAILS = (n => 0, until => time() + FAIL_PAUSE);
+    }
+    _say("bot_auth: $err" . ($n ? "; dropped $n command(s)" : ''));
+}
+
+sub _unlocked {
+    my ($key, $path, $pending) = @_;
     %FAILS = (n => 0, until => 0);
     my $secs = _expire_secs();
     my $now  = time();
     _lock();
-    %UNLOCKED = (key => $key, path => $cap->{path}, once => $secs == 0,
+    %UNLOCKED = (key => $key, path => $path, once => $secs == 0,
                  until => $secs < 0 ? undef
                         : $now + ($secs == 0 ? AUTH_TIMEOUT : $secs));
     if ($secs < 0) {
-        Irssi::print('bot_auth: key unlocked until /botlock.');
+        _say('bot_auth: key unlocked until /botlock.');
     } elsif ($secs == 0) {
-        Irssi::print('bot_auth: key unlocked for this command.');
+        _say('bot_auth: key unlocked for this command.');
     } else {
         my @t = localtime($now + $secs);
-        Irssi::print(sprintf('bot_auth: key unlocked until %02d:%02d:%02d (passwd_expire).',
-                             @t[2, 1, 0]));
+        _say(sprintf('bot_auth: key unlocked until %02d:%02d:%02d (passwd_expire).',
+                     @t[2, 1, 0]));
     }
-    for my $p (@{ $cap->{pending} }) {
+    for my $p (@$pending) {
         my $server = Irssi::server_find_tag($p->[0]);
         if (!$server || !$server->{connected}) {
-            Irssi::print("bot_auth: not connected to $p->[0] any more; dropped a command.");
+            _say("bot_auth: not connected to $p->[0] any more; dropped a command.");
             next;
         }
         _handle_botcmd($server, $p->[1], $p->[2]);
     }
     _used_once();
+}
+
+# This CryptX has no scrypt: run the built-in one in slices off a timer.
+# Returns an error for a key that cannot be opened at all, else '' (started).
+sub _start_unlocking {
+    my ($cap, $pass) = @_;
+    my $k = eval {
+        open(my $fh, '<', $cap->{path}) or die "keyfile '$cap->{path}': $!\n";
+        my $line = <$fh>;
+        close($fh);
+        die "keyfile '$cap->{path}' is empty\n" if !defined $line;
+        $line =~ s/[\r\n]+\z//;
+        irckey_parse($line);
+    };
+    return $@ if !$k;
+    my $job = eval { scrypt_job_new($pass, $k->{salt}, $k->{log2n}, $k->{r}, $k->{p}) };
+    return $@ if !$job;
+    %UNLOCKING = (job => $job, k => $k, path => $cap->{path}, pending => $cap->{pending},
+                  t0 => Time::HiRes::time(), told => 0);
+    _say('bot_auth: unlocking the key with the built-in scrypt (CryptX '
+       . ($CryptX::VERSION // '?') . ' has none); this takes a while and irssi '
+       . 'stays usable.');
+    Irssi::timeout_add_once(10, \&_unlock_tick, undef);
+    return '';
+}
+
+sub _unlock_tick {
+    return if !%UNLOCKING;
+    my $u = \%UNLOCKING;
+    my $key = eval { scrypt_job_step($u->{job}, 0.08) };
+    if (!defined $key && !$@) {
+        my $spent = Time::HiRes::time() - $u->{t0};
+        my $done  = scrypt_job_progress($u->{job});
+        if (!$u->{told} && $spent >= 3 && $done > 0) {
+            $u->{told} = 1;
+            _say(sprintf('bot_auth: unlocking: about %d s to go.',
+                         $spent * (1 - $done) / $done + 1));
+        }
+        return Irssi::timeout_add_once(10, \&_unlock_tick, undef);
+    }
+    my %done = %UNLOCKING;
+    %UNLOCKING = ();
+    my $err = $@;
+    if (defined $key) {
+        my $raw = eval { irckey_decrypt($done{k}, $key) };
+        $key = $raw ? eval { key_from_raw($raw, $done{path}, 0) } : undef;
+        $err = $@;
+    } else {
+        scrypt_job_wipe($done{job});
+    }
+    return _unlock_failed($err, $done{pending}) if !$key;
+    _unlocked($key, $done{path}, $done{pending});
+}
+
+sub _cancel_unlocking {
+    my ($why) = @_;
+    return 0 if !%UNLOCKING;
+    my $n = @{ $UNLOCKING{pending} };
+    scrypt_job_wipe($UNLOCKING{job});
+    %UNLOCKING = ();
+    _say("bot_auth: $why" . ($n ? "; dropped $n command(s)" : ''));
+    return 1;
 }
 
 # While the passphrase prompt waits, every key goes to it: the input line only
@@ -1032,16 +1286,16 @@ sub sig_send_text {
 }
 
 sub cmd_botunlock {
-    return Irssi::print(cryptx_hint()) if !$CRYPTX_OK;
+    return _say(cryptx_hint()) if !$CRYPTX_OK;
     my ($key, $err) = _load_key();
     if ($err && $err eq LOCKED) {
         _ask_passphrase();
     } elsif ($err) {
-        Irssi::print("bot_auth: $err");
+        _say("bot_auth: $err");
     } elsif ($key->{plain}) {
-        Irssi::print('bot_auth: the keyfile has no passphrase; nothing to unlock.');
+        _say('bot_auth: the keyfile has no passphrase; nothing to unlock.');
     } else {
-        Irssi::print('bot_auth: already unlocked' . (defined $UNLOCKED{until}
+        _say('bot_auth: already unlocked' . (defined $UNLOCKED{until}
             ? ' for ' . ($UNLOCKED{until} > time() ? $UNLOCKED{until} - time() : 0) . ' more s'
             : ' until /botlock') . '.');
     }
@@ -1049,9 +1303,11 @@ sub cmd_botunlock {
 
 sub cmd_botlock {
     _cancel_capture('passphrase prompt cancelled');
+    my $cancelled = _cancel_unlocking('unlock cancelled');
     my $had = %UNLOCKED ? 1 : 0;
     _lock();
-    Irssi::print($had ? 'bot_auth: key locked.' : 'bot_auth: key was not unlocked.');
+    _say($had ? 'bot_auth: key locked.' : 'bot_auth: key was not unlocked.')
+        if $had || !$cancelled;
 }
 
 # Changing bot_auth_keyfile or bot_auth_passwd_expire locks the key.
@@ -1062,6 +1318,7 @@ sub sig_setup_changed {
     $SETTINGS_SEEN{v} = $now;
     return if !defined $was || $was eq $now;
     _cancel_capture('keyfile/passwd_expire changed: passphrase prompt cancelled');
+    _cancel_unlocking('keyfile/passwd_expire changed: unlock cancelled');
     _lock('keyfile/passwd_expire changed: key locked.');
 }
 

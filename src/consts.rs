@@ -264,6 +264,12 @@ pub const CMD_BOT_RELAY: u8 = 0x50;
 pub const CMD_BOT_MSG: u8 = 0x51;
 pub const CMD_BOT_PRESENCE: u8 = 0x56;
 pub const CMD_BOT_TREE: u8 = 0x58;
+/// Hub -> Bot: on|off, this bot's production crontab line.
+pub const CMD_CRON_SET: u8 = 0x8B;
+/// Hub -> Bot: id, get the build ready while the old one runs.
+pub const CMD_UPGRADE_STAGE: u8 = 0x88;
+/// Bot -> Hub: id|uuid|phase|code|note.
+pub const CMD_UPGRADE_PROGRESS: u8 = 0x89;
 pub const CMD_CHAN_REQUEST: u8 = 0x59;
 pub const CMD_CHAN_ACTION: u8 = 0x5A;
 pub const CMD_CHAN_REPLY: u8 = 0x5B;
@@ -449,3 +455,25 @@ pub const BOT_TREE_STALE_AFTER: i64 = 660;
 pub const BOT_PRESENCE_REPORT_INTERVAL: i64 = 120;
 
 pub const IRC_REFUSAL_LEN: usize = 256;
+
+/// What preflight asks of the disk, in bytes.  A build's own needs come from
+/// the manifest's size column; these cover what it cannot say.
+pub const UPGRADE_SPACE_MARGIN: u64 = 16 * 1024 * 1024;
+pub const UPGRADE_SPACE_BIN_DEFAULT: u64 = 64 * 1024 * 1024; // no size column
+pub const UPGRADE_SPACE_BUILD_C: u64 = 256 * 1024 * 1024; // objects, make
+pub const UPGRADE_SPACE_BUILD_RS: u64 = 1536 * 1024 * 1024; // cargo's target dir
+pub const UPGRADE_MIN_INODES: u64 = 64;
+
+/// The failback's limits, in seconds (see FAILBACK_BODY).  A source build's limit
+/// and the confirm window are the reliability plan's agreed values.
+pub const UPGRADE_INSTALL_SECS: u64 = 120;
+pub const UPGRADE_BUILD_SECS: u64 = 1800;
+pub const UPGRADE_CONFIRM_SECS: u64 = 300;
+pub const UPGRADE_FAILBACK_EXPIRY: u64 = 1800;
+pub const CRON_HELPER_TIMEOUT: u64 = 60; // a crontab edit that takes longer is killed
+pub const CRON_CHECK_SECS: u64 = 3600; // how often a node looks at its line
+pub const CRON_SILENT_SECS: u64 = 900; // no stamp for this long: no cron daemon
+/// A node says it is staging this often.
+pub const UPGRADE_STAGE_BEAT: u64 = 20;
+/// A stage no COMMIT came for is removed.
+pub const UPGRADE_STAGE_KEEP: u64 = 900;

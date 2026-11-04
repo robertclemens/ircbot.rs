@@ -768,6 +768,11 @@ fn main() {
     }
 
     println!("{BOT_NAME} {BOT_VERSION}");
+    if updater::install_in_progress() {
+        eprintln!("An upgrade is installing here; not starting");
+        return;
+    }
+    updater::stage_boot_clean();
     daemonize();
 
     let Some(pid_file) = lock_pid_file() else {
@@ -918,8 +923,14 @@ fn run(password: Zeroizing<String>, pid_file: fs::File, self_exe: String) -> i32
             hub_client::connect(&mut state);
             hub_client::heartbeat(&mut state);
             hub_client::user_chan_tick(&mut state); // unanswered person requests -> ~B2
-            hub_client::upgrade_ready_tick(&mut state);
         }
+        hub_client::upgrade_ready_tick(&mut state);
+        let exe = state.executable_path.clone();
+        if updater::cron_tick(&exe) {
+            hub_client::send_presence(&mut state, true);
+        }
+        updater::standalone_tick(&mut state);
+        hub_client::stage_tick(&mut state);
 
         // Lines wait in the send queue and pacing will allow one: wake as soon
         // as it may go.  Otherwise the 1 s timeout is the tick.

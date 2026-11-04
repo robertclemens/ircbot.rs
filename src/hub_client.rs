@@ -23,7 +23,7 @@ use crate::state::{
     BotState, BotTreeRow, ChanReq, ChanStatus, HubAuthState, MaskRecord, S_AUTHED, S_CONNECTED,
     UchanRecord, UflagRecord, UserRecord, lww_accepts, opt_accepts,
 };
-use crate::{access, bot_comms, chancfg, chanlive, channel, config, ircf, logm, updater};
+use crate::{access, bot_comms, chancfg, chanenf, chanlive, channel, config, ircf, logm, updater};
 
 /// Unsent bytes past which a hub that stopped reading is dropped.
 const HUB_WBUF_MAX: usize = 4 * 1024 * 1024;
@@ -362,8 +362,12 @@ pub fn send_presence(state: &mut BotState, force: bool) {
     // The variant rides last: a hub that predates it reads the start time
     // with atoll(), which stops at the '|', so older hubs are unaffected.
     let payload = format!(
-        "{}|{}|{}|{}",
-        BOT_VERSION, server, state.bot_start_time, BOT_UPDATE_VARIANT
+        "{}|{}|{}|{}|{}",
+        BOT_VERSION,
+        server,
+        state.bot_start_time,
+        BOT_UPDATE_VARIANT,
+        updater::cron_status()
     );
     if send_frame(state, CMD_BOT_PRESENCE, payload.as_bytes()) {
         state.presence_server = server.clone();
@@ -406,6 +410,31 @@ fn upgrade_field(src: &str) -> String {
 }
 
 /// id|uuid|cur_ver|variant|arch|libc|ready|reason
+/// id|uuid|phase|code|note
+fn send_upgrade_progress(state: &mut BotState, id: &str, status: &str) {
+    let payload = format!("{id}|{}|{status}", state.bot_uuid);
+    send_frame(state, CMD_UPGRADE_PROGRESS, payload.as_bytes());
+}
+
+pub fn stage_tick(state: &mut BotState) {
+    let Some((id, status)) = updater::stage_tick() else {
+        return;
+    };
+    logm!(state, L_DEBUG, "[UPGRADE] Stage of {}: {}\n", id, status);
+    if state.hub_authenticated {
+        send_upgrade_progress(state, &id, &status);
+    }
+}
+
+/// id: get the build ready.  Only a run we said ready to.
+fn handle_upgrade_stage(state: &mut BotState, payload: &str) {
+    let id = payload.split('|').next().unwrap_or("");
+    if id.is_empty() || state.upgrade_id != id {
+        return;
+    }
+    updater::stage_start(id, &state.upgrade_target, &state.upgrade_variant);
+}
+
 fn send_upgrade_ready(state: &mut BotState, id: &str, ready: bool, reason: &str) {
     let clean = upgrade_field(reason);
     let payload = format!(
@@ -477,7 +506,7 @@ pub fn report_upgrade_result(state: &mut BotState) {
         wanted
     );
     if !ok {
-        let detail = format!("wanted {wanted}");
+        let detail = updater::failback_note().unwrap_or_else(|| format!("wanted {wanted}"));
         send_upgrade_result(state, &p.id, "version-mismatch", &detail);
         return;
     }
@@ -540,6 +569,9 @@ pub fn upgrade_ready_tick(state: &mut BotState) {
     };
     if !state.hub_authenticated {
         return;
+    }
+    if state.status & S_AUTHED != 0 {
+        updater::failback_confirm();
     }
     let chans: Vec<(&str, bool, bool)> = state
         .chans
@@ -604,6 +636,10 @@ fn handle_upgrade_prepare(state: &mut BotState, payload: &str) {
     // read for the wire format's sake and not used here.
     let id = id.to_string();
     send_upgrade_ready(state, &id, ready, &reason);
+    // A frame an older hub drops: this bot can get a build ready before COMMIT.
+    if ready {
+        send_upgrade_progress(state, &id, "ready|");
+    }
 }
 
 /// A COMMIT refused because the RELEASE is bad — tampered, corrupt, the
@@ -689,6 +725,7 @@ fn handle_upgrade_abort(state: &mut BotState, payload: &str) {
         upgrade_field(reason)
     };
     logm!(state, L_INFO, "[UPGRADE] Abort {}: {}\n", id, reason);
+    updater::stage_clear();
     state.upgrade_id.clear();
     state.upgrade_prepared = 0;
     // Only the run that installed the build we are running may take it back.
@@ -2100,8 +2137,8 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
 // ---- Channel-request election (CMD_CHAN_PROBE / CMD_CHAN_DO) -----------
 
 /// None when we could do `kind` in `channel` right now, else why not.  Only
-/// our own state: in the channel and opped (op/invite/unban), or in it and
-/// holding its key (key).
+/// our own state: in the channel and opped (op/invite/unban/mode/kick/ban), or
+/// in it and holding its key (key).
 fn chan_elect_cannot(state: &BotState, kind: &str, channel: &str) -> Option<&'static str> {
     let ci = match channel::find(state, channel) {
         Some(ci) if state.chans[ci].status == ChanStatus::In => ci,
@@ -2110,7 +2147,9 @@ fn chan_elect_cannot(state: &BotState, kind: &str, channel: &str) -> Option<&'st
     let c = &state.chans[ci];
     match kind {
         "key" => (c.key.is_empty()).then_some("no key"),
-        "op" | "invite" | "unban" | "mode" => (!c.i_am_opped).then_some("not opped"),
+        "op" | "invite" | "unban" | "mode" | "kick" | "ban" => {
+            (!c.i_am_opped).then_some("not opped")
+        }
         _ => Some("unknown request"),
     }
 }
@@ -2190,6 +2229,19 @@ fn chan_elect_do(state: &mut BotState, payload: &str) {
         );
         let me = state.current_nick.clone();
         chan_done_send(state, id, true, &me);
+        return;
+    }
+    if kind == "kick" || kind == "ban" {
+        // an admin's channel kick (nick, the reason in the hostmask slot) or
+        // ban (the mask in the hostmask slot): sent now, not dealt
+        let (ok, detail) = if kind == "kick" {
+            chanenf::admin_kick(state, chan, nick, mask)
+        } else if mask.is_empty() {
+            (false, "no mask".to_string())
+        } else {
+            chanenf::admin_ban(state, chan, mask)
+        };
+        chan_done_send(state, id, ok, &detail);
         return;
     }
     if kind == "op" {
@@ -2391,6 +2443,8 @@ fn handle_response(state: &mut BotState, cmd: u8, payload: &str) {
             }
         }
         CMD_BOT_TREE => process_tree(state, payload),
+        CMD_CRON_SET => updater::cron_set(payload == "on"),
+        CMD_UPGRADE_STAGE => handle_upgrade_stage(state, payload),
         CMD_ACTIVITY_REPLY => crate::commands::activity_reply(state, payload),
         CMD_USER_CHAN_RESULT => user_chan_result(state, payload),
         CMD_CONFIG_PULL => logm!(state, L_INFO, "[HUB] Hub requested config sync\n"),
@@ -3177,6 +3231,20 @@ fn retire(state: &mut BotState) {
         "[HUB] This bot was deleted on the hub: wiping its config and exiting\n"
     );
     state.retired = true;
+    let exe = state.executable_path.clone();
+    match updater::cron_drop(&exe) {
+        0 => {}
+        10 => logm!(
+            state,
+            L_INFO,
+            "[HUB] A hand-written crontab line still runs this binary\n"
+        ),
+        _ => logm!(
+            state,
+            L_INFO,
+            "[HUB] Could not remove this bot's crontab lines\n"
+        ),
+    }
     let mut ok = retire_wipe_file(CONFIG_FILE);
     ok = retire_wipe_file(&format!("{CONFIG_FILE}.tmp")) && ok;
     ok = retire_wipe_file(&format!("{CONFIG_FILE}{UPGRADE_PREV_SUFFIX}")) && ok;
