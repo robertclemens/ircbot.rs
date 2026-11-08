@@ -12,7 +12,7 @@ pub const BOT_NAME: &str = "ircbot.rs by trojanman";
 /// made against.
 pub const BOT_VERSION: &str = match option_env!("IRCBOT_VERSION") {
     Some(v) => v,
-    None => "2.5.2",
+    None => "2.5.3",
 };
 pub const PASS_FILE: &str = ".ircbot.pass"; // machine-bound password file
 /// PBKDF2-HMAC-SHA256 rounds for the .ircbot.cnf and .ircbot.pass keys
