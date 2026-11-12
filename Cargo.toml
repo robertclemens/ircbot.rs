@@ -62,7 +62,7 @@ webpki-roots = "1"
 ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots", "gzip"] }
 
 # OS integration through safe wrappers.
-nix = { version = "0.31", features = ["user", "fs", "process", "term", "resource", "feature", "socket"] }
+nix = { version = "0.31", features = ["user", "fs", "process", "signal", "term", "resource", "feature", "socket"] }
 region = "4"
 signal-hook = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

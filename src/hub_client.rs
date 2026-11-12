@@ -420,10 +420,13 @@ pub fn stage_tick(state: &mut BotState) {
     let Some((id, status)) = updater::stage_tick() else {
         return;
     };
-    logm!(state, L_DEBUG, "[UPGRADE] Stage of {}: {}\n", id, status);
-    if state.hub_authenticated {
-        send_upgrade_progress(state, &id, &status);
+    // No link: keep it owed, so the hub hears it once the link is back.
+    if !state.hub_authenticated {
+        updater::stage_unsaid();
+        return;
     }
+    logm!(state, L_DEBUG, "[UPGRADE] Stage of {}: {}\n", id, status);
+    send_upgrade_progress(state, &id, &status);
 }
 
 /// id: get the build ready.  Only a run we said ready to.

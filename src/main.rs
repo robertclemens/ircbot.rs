@@ -970,6 +970,7 @@ fn run(password: Zeroizing<String>, pid_file: fs::File, self_exe: String) -> i32
 
     // Cleanup.  The pid file is unlinked while its flock is still held, then
     // released: a replacement that starts in between is refused.
+    updater::stage_kill_build(); // a stage's build does not outlive the daemon
     dcc::close_all(&mut state, "Bot shutting down.");
     config::write_with_state_pass(&mut state);
     irc_client::disconnect(&mut state);
