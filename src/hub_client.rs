@@ -335,6 +335,63 @@ pub fn sync_hostmask(state: &mut BotState) {
     push_delta(state, "h", &h, ts);
 }
 
+/// Phase 4 (presence v2 J): read the persisted link-order counter (C
+/// `hub_client_link_ord_read`): its first line, 0 when absent or unreadable.
+fn link_ord_read(state: &mut BotState) -> u64 {
+    let Ok(s) = std::fs::read_to_string(LINK_ORD_FILE) else {
+        return 0;
+    };
+    match s.lines().next().unwrap_or("").parse::<u64>() {
+        Ok(v) => v,
+        Err(_) => {
+            // Restarting from 1 loses moved-bot ordering until it climbs past
+            // the old value; the hubs' clocks decide meanwhile.
+            logm!(
+                state,
+                L_INFO,
+                "[HUB] {} unreadable: link-order counter restarts\n",
+                LINK_ORD_FILE
+            );
+            0
+        }
+    }
+}
+
+/// Bump and persist the counter on a new hub link, then hold it in state.  A
+/// persisted counter keeps climbing across restarts, so a restart never loses
+/// to a sighting that predates it.  Above both the file and this process's own
+/// value, so a counter that could not be saved still rises for this process;
+/// a write failure only risks reusing a value on a restart, which the clock
+/// fallback then settles.
+fn link_ord_bump(state: &mut BotState) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let v = link_ord_read(state).max(state.link_ord) + 1;
+    let tmp = format!("{LINK_ORD_FILE}.tmp");
+    let res = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut f| {
+            f.write_all(format!("{v}\n").as_bytes())?;
+            f.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&tmp, LINK_ORD_FILE));
+    if let Err(e) = res {
+        logm!(
+            state,
+            L_INFO,
+            "[HUB] cannot write {}: {}\n",
+            LINK_ORD_FILE,
+            e
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+    state.link_ord = v;
+}
+
 /// Report version / IRC server / start time for the 'bots' tree: when it
 /// changes, on a slow refresh timer, or when forced.
 pub fn send_presence(state: &mut BotState, force: bool) {
@@ -362,12 +419,13 @@ pub fn send_presence(state: &mut BotState, force: bool) {
     // The variant rides last: a hub that predates it reads the start time
     // with atoll(), which stops at the '|', so older hubs are unaffected.
     let payload = format!(
-        "{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}",
         BOT_VERSION,
         server,
         state.bot_start_time,
         BOT_UPDATE_VARIANT,
-        updater::cron_status()
+        updater::cron_status(),
+        state.link_ord
     );
     if send_frame(state, CMD_BOT_PRESENCE, payload.as_bytes()) {
         state.presence_server = server.clone();
@@ -754,6 +812,16 @@ fn handle_upgrade_abort(state: &mut BotState, payload: &str) {
 /// Ingest a CMD_BOT_TREE push.  A malformed row is skipped, never partially
 /// applied.
 fn process_tree(state: &mut BotState, payload: &str) {
+    // Phase 5: keep the raw bytes so a later CMD_BOT_TREE_DELTA edits and
+    // re-hashes exactly what the hub hashed.  Too large to hold means the delta
+    // fast-path is off: a delta pulls the whole tree, and the keepalive hash is
+    // not checked (it could only pull the same tree again every PING).
+    state.bot_tree_raw_big = payload.len() > TREE_RAW_MAX;
+    state.bot_tree_raw = if state.bot_tree_raw_big {
+        String::new()
+    } else {
+        payload.to_string()
+    };
     let mut rows = Vec::new();
     for line in payload.split('\n').filter(|l| !l.is_empty()) {
         if rows.len() >= MAX_BOT_TREE_ROWS {
@@ -825,6 +893,141 @@ fn process_tree(state: &mut BotState, payload: &str) {
     }
     state.bot_tree = rows;
     state.bot_tree_ts = now();
+}
+
+/// Phase 5: FNV-1a 64 over the raw tree, matching the hub's tree_fnv64.
+fn tree_fnv64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// uuid of a tree row, "" if malformed: field 3 of "KIND|depth|name|uuid|...",
+/// field 2 of an offline row "D|nick|uuid|last_seen".  Must match the hubs'
+/// tree_row_uuid, which keys the delta ops.
+fn tree_row_uuid(line: &str) -> &str {
+    let idx = if line.starts_with('D') { 2 } else { 3 };
+    line.split('|').nth(idx).unwrap_or("")
+}
+
+/// A pull should be rare (a delta always hashes right in order); log why at
+/// debug so a pull rate in the hub stats can be traced to its cause.
+fn request_tree_pull(state: &mut BotState, why: &str) {
+    logm!(
+        state,
+        L_DEBUG,
+        "[HUB] Tree delta not applied ({}); pulling the whole tree\n",
+        why
+    );
+    send_frame(state, CMD_BOT_TREE_PULL, b"");
+}
+
+/// A hub keepalive's "t|<fnv64hex>": our tree hashing to it is a refresh (the
+/// stale clock restarts, nothing is sent); anything else pulls the whole tree.
+/// An empty or other payload (an older hub) is ignored.  As C
+/// `hub_client_check_tree_hash`.
+fn check_tree_hash(state: &mut BotState, p: &str) {
+    let Some(hex) = p.strip_prefix("t|") else {
+        return;
+    };
+    let Ok(want) = u64::from_str_radix(hex, 16) else {
+        return;
+    };
+    if state.bot_tree_raw_big {
+        return; // too large to hold: nothing to compare
+    }
+    if state.bot_tree_raw.is_empty() {
+        request_tree_pull(state, "keepalive: no tree yet");
+        return;
+    }
+    if tree_fnv64(&state.bot_tree_raw) != want {
+        request_tree_pull(state, "keepalive hash mismatch");
+        return;
+    }
+    state.bot_tree_ts = now();
+}
+
+/// Ingest a CMD_BOT_TREE_DELTA: `<fnvhex>\n` then `-|uuid` / `+|anchor|row` ops.
+/// Apply them to our raw tree and accept only if the result hashes to <fnvhex>;
+/// any divergence (missed/mis-ordered row, no base tree, overflow) pulls the
+/// whole tree.  Correctness is the hash's job, the pull the fallback.
+fn process_tree_delta(state: &mut BotState, payload: &str) {
+    if state.bot_tree_raw.is_empty() {
+        let why = if state.bot_tree_raw_big {
+            "tree too large to hold"
+        } else {
+            "no base tree"
+        };
+        request_tree_pull(state, why);
+        return;
+    }
+    let mut lines = payload.split('\n');
+    let want = lines
+        .next()
+        .and_then(|h| u64::from_str_radix(h.trim(), 16).ok());
+    let Some(want) = want else {
+        request_tree_pull(state, "bad header");
+        return;
+    };
+    // The rows as the hub keys them; every key is unique and non-empty, or the
+    // hub sends the whole tree instead of a delta.
+    let rows: Vec<&str> = state
+        .bot_tree_raw
+        .split('\n')
+        .filter(|l| !l.is_empty())
+        .collect();
+    if rows.len() > TREE_DELTA_ROWS_MAX {
+        // more rows than we track: pull rather than drop some
+        request_tree_pull(state, "hash mismatch");
+        return;
+    }
+    let mut rows: Vec<String> = rows.into_iter().map(str::to_string).collect();
+    for op in lines.filter(|l| !l.is_empty()) {
+        if let Some(u) = op.strip_prefix("-|") {
+            if let Some(i) = rows.iter().position(|r| tree_row_uuid(r) == u) {
+                rows.remove(i);
+            }
+        } else if let Some(rest) = op.strip_prefix("+|") {
+            let Some((anchor, row)) = rest.split_once('|') else {
+                continue;
+            };
+            let u = tree_row_uuid(row);
+            if u.is_empty() {
+                // a row with no key cannot be one the hub sent
+                request_tree_pull(state, "hash mismatch");
+                return;
+            }
+            if let Some(i) = rows.iter().position(|r| tree_row_uuid(r) == u) {
+                rows.remove(i);
+            }
+            if rows.len() >= TREE_DELTA_ROWS_MAX {
+                request_tree_pull(state, "hash mismatch");
+                return;
+            }
+            // `+` replaces the row after its anchor (`^` = head).
+            let pos = if anchor == "^" {
+                0
+            } else {
+                rows.iter()
+                    .position(|r| tree_row_uuid(r) == anchor)
+                    .map_or(rows.len(), |i| i + 1)
+            };
+            rows.insert(pos, row.to_string());
+        }
+    }
+    let mut nraw = String::new();
+    for r in &rows {
+        nraw.push_str(r);
+        nraw.push('\n');
+    }
+    if tree_fnv64(&nraw) != want {
+        request_tree_pull(state, "hash mismatch");
+        return;
+    }
+    process_tree(state, &nraw);
 }
 
 /// One key=value change as CMD_BOT_DELTA (the hub fans it out as one delta
@@ -2446,6 +2649,7 @@ fn handle_response(state: &mut BotState, cmd: u8, payload: &str) {
             }
         }
         CMD_BOT_TREE => process_tree(state, payload),
+        CMD_BOT_TREE_DELTA => process_tree_delta(state, payload),
         CMD_CRON_SET => updater::cron_set(payload == "on"),
         CMD_UPGRADE_STAGE => handle_upgrade_stage(state, payload),
         CMD_ACTIVITY_REPLY => crate::commands::activity_reply(state, payload),
@@ -2544,34 +2748,6 @@ fn handle_response(state: &mut BotState, cmd: u8, payload: &str) {
             for c in state.chans.iter_mut().filter(|c| c.op_request_pending) {
                 c.op_request_pending = false;
                 c.last_op_request_time = t;
-            }
-        }
-        CMD_INVITE_REQUEST => {
-            let r = sscanf(
-                payload,
-                // a nick that does not fit is refused, never cut to someone
-                // else's (Set(31) then the literal fails)
-                &[
-                    Fmt::Set(MAX_MEMBER_NICK - 1, P),
-                    Fmt::Lit("|"),
-                    Fmt::Set(64, b"\n"),
-                ],
-            );
-            if r.len() == 2 {
-                let (nick, chan) = (r[0].s(), r[1].s());
-                if let Some(ci) = channel::find(state, chan)
-                    && state.chans[ci].status == ChanStatus::In
-                    && state.chans[ci].i_am_opped
-                {
-                    logm!(
-                        state,
-                        L_INFO,
-                        "[INVITE] Inviting {} into {} (hub request)\n",
-                        nick,
-                        chan
-                    );
-                    ircf!(state, "INVITE {} {}\r\n", nick, chan);
-                }
             }
         }
         CMD_CHAN_PROBE => {
@@ -3094,6 +3270,15 @@ fn process_packet(state: &mut BotState, body: &[u8]) {
         return;
     }
     if cmd == CMD_PING {
+        // A hub keepalive may carry "t|<fnv64hex>", the tree we should hold:
+        // the check that replaced the periodic whole-tree push.
+        if plain.len() > 5 {
+            let pl = u32::from_be_bytes([plain[1], plain[2], plain[3], plain[4]]) as usize;
+            if pl > 0 && pl < 64 && pl <= plain.len() - 5 {
+                let tp = String::from_utf8_lossy(&plain[5..5 + pl]).into_owned();
+                check_tree_hash(state, &tp);
+            }
+        }
         // Answer at most once per 5 s.
         let now = now();
         if now - state.last_hub_pong_sent >= 5 {
@@ -3302,6 +3487,9 @@ fn handle_ack(state: &mut BotState, body: &[u8]) {
     state.hub_auth_state = HubAuthState::Complete;
     state.last_hub_activity = t;
     state.hub_connect_time = t;
+    // Phase 4: a new hub link — bump the persisted link-order counter before
+    // the first presence carries it.
+    link_ord_bump(state);
     logm!(state, L_INFO, "[HUB] Authenticated (Curve25519 v2)!\n");
     // Review 6: first frame on the link; a 2.5.1 hub ignores it.
     send_frame(state, CMD_LINK_SEQ, b"offer");

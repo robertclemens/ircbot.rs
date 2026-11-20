@@ -22,6 +22,10 @@ pub const PBKDF2_ITERATIONS: u32 = 600_000;
 pub const VERSION_RESPONSE: &str = "A robot may not injure a human being";
 pub const CONFIG_FILE: &str = ".ircbot.cnf";
 pub const PID_FILE: &str = ".ircbot.pid";
+/// Phase 4 (presence v2 J): a monotonic counter bumped and persisted each time
+/// the bot links to a hub, reported in CMD_BOT_PRESENCE so a moved bot's two
+/// sightings are ordered by this, not the hubs' clocks (fallback for old bots).
+pub const LINK_ORD_FILE: &str = ".ircbot.linkord";
 pub const SALT_SIZE: usize = 16;
 /// The log FILE is off by default: a production bot writes nothing to disk
 /// until `setlog` (l| in the config) turns it on.  The in-memory ring that
@@ -254,7 +258,8 @@ pub const CMD_CONFIG_PUSH: u8 = 0x02;
 pub const CMD_CONFIG_PULL: u8 = 0x03;
 pub const CMD_CONFIG_DATA: u8 = 0x04;
 pub const CMD_UPDATE_PUBKEY: u8 = 0x05;
-pub const CMD_INVITE_REQUEST: u8 = 0x09;
+// 0x09 was CMD_INVITE_REQUEST (a hub asking every bot to invite a nick); removed
+// in 2.5.3, the channel-request election does invites.  Never reuse the value.
 pub const CMD_BOT_KEY_UPDATE: u8 = 0x40;
 pub const CMD_BOT_DELTA: u8 = 0x45;
 pub const CMD_OP_REQUEST: u8 = 0x28;
@@ -266,6 +271,10 @@ pub const CMD_BOT_PRESENCE: u8 = 0x56;
 pub const CMD_BOT_TREE: u8 = 0x58;
 /// Hub -> Bot: on|off, this bot's production crontab line.
 pub const CMD_CRON_SET: u8 = 0x8B;
+/// Phase 5 (presence v2 K): the bots tree arrives as row deltas with the new
+/// tree's hash; a bot whose hash mismatches pulls the whole tree.
+pub const CMD_BOT_TREE_DELTA: u8 = 0x8F;
+pub const CMD_BOT_TREE_PULL: u8 = 0x90;
 /// Hub -> Bot: id, get the build ready while the old one runs.
 pub const CMD_UPGRADE_STAGE: u8 = 0x88;
 /// Bot -> Hub: id|uuid|phase|code|note.
@@ -442,6 +451,11 @@ pub const UNBAN_MAX_REMOVALS: i32 = 6;
 
 // ---- Bot tree ('bots') ------------------------------------------------------------
 pub const MAX_BOT_TREE_ROWS: usize = 256;
+/// Phase 5: the raw tree kept for deltas, as C's bot_tree_raw[TREE_RAW_MAX].  A
+/// larger tree still renders; only the delta fast-path turns off for it.
+pub const TREE_RAW_MAX: usize = MAX_BOT_TREE_ROWS * 288;
+/// Rows a delta is applied over (C DROWS_MAX).
+pub const TREE_DELTA_ROWS_MAX: usize = MAX_BOT_TREE_ROWS + 8;
 /// Deepest row we draw.  A hub hangs every hub further out beneath the hub
 /// that links to it, so a chain of N hubs is N levels deep (plus its bots);
 /// a deeper row is drawn at this depth rather than dropped.
@@ -450,6 +464,8 @@ pub const TREE_VERSION_MAX: usize = 15;
 /// "c" / "rs" -- the code base a node runs (bot_tree_row_t.variant).
 pub const TREE_VARIANT_MAX: usize = 7;
 pub const TREE_SERVER_MAX: usize = 63;
+/// yes, silent, manual, no, failed:<why>: the cap irchub reads (hub.h).
+pub const CRON_STATUS_MAX: usize = 31;
 pub const TREE_NAME_MAX: usize = 64;
 pub const BOT_TREE_STALE_AFTER: i64 = 660;
 pub const BOT_PRESENCE_REPORT_INTERVAL: i64 = 120;
@@ -473,6 +489,12 @@ pub const UPGRADE_FAILBACK_EXPIRY: u64 = 1800;
 pub const CRON_HELPER_TIMEOUT: u64 = 60; // a crontab edit that takes longer is killed
 pub const CRON_CHECK_SECS: u64 = 3600; // how often a node looks at its line
 pub const CRON_SILENT_SECS: u64 = 900; // no stamp for this long: no cron daemon
+/// Every node of one account edits its one crontab under one lock: a helper that
+/// cannot get it exits `CRON_RC_BUSY` and is run again this soon, spread by pid so
+/// a queue of nodes does not meet again at the same second.
+pub const CRON_RC_BUSY: i32 = 5;
+pub const CRON_BUSY_RETRY_MIN: u64 = 10;
+pub const CRON_BUSY_RETRY_SPAN: u64 = 21; // 10..30 s
 /// A node says it is staging this often.
 pub const UPGRADE_STAGE_BEAT: u64 = 20;
 /// A stage no COMMIT came for is removed.

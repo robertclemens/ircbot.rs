@@ -9,34 +9,6 @@ use crate::{
     irc_client, ircf, logm,
 };
 
-/// Hub UUID for a roster entry whose nick may carry collision '_'s: exact
-/// hostmask, then "nick!" prefix, then base nick with trailing '_' stripped
-/// on both sides.
-fn find_uuid_for_helper(state: &BotState, helper: &RosterEntry) -> Option<String> {
-    let base = |s: &str| s.trim_end_matches('_').to_string();
-    for tb in &state.trusted_bots {
-        if tb.uuid.is_empty() {
-            continue;
-        }
-        if eq_ic(&tb.mask, &helper.hostmask) {
-            return Some(tb.uuid.clone());
-        }
-        let pfx = format!("{}!", helper.nick);
-        if starts_with_ic(&tb.mask, &pfx) {
-            return Some(tb.uuid.clone());
-        }
-        let stored_nick = match tb.mask.find('!') {
-            Some(b) => trunc(&tb.mask[..b], MAX_NICK),
-            None => "",
-        };
-        let bs = base(stored_nick);
-        if !bs.is_empty() && eq_ic(&bs, &base(&helper.nick)) {
-            return Some(tb.uuid.clone());
-        }
-    }
-    None
-}
-
 /// MODE on a channel: our own op state (with immediate re-read on deop),
 /// roster op flags, the key and +i.
 /// True when a managed channel's learned key / +k+i changed (K|, to be
@@ -704,7 +676,12 @@ fn on_end_of_who(state: &mut BotState, params: &str) {
             chosen.nick,
             chosen.hostmask
         );
-        if let Some(uuid) = find_uuid_for_helper(state, &chosen) {
+        // The trusted entry that matched this helper (auth: an exact mask
+        // before a wildcard) names the bot to ask.
+        let uuid = auth::trusted_bot_by_host(state, &chosen.hostmask)
+            .map(|i| state.trusted_bots[i].uuid.clone())
+            .filter(|u| !u.is_empty());
+        if let Some(uuid) = uuid {
             logm!(state, L_DEBUG, "[OP-REQ] Found UUID, trying hub request\n");
             sent_via_hub = hub_client::request_op(state, &uuid, &name);
             logm!(
@@ -869,7 +846,9 @@ fn on_join(state: &mut BotState, prefix: &str, params: &str) {
         }
         return;
     }
+    // The channel is the first word (extended-join adds account and realname).
     let chan_name = params.strip_prefix(':').unwrap_or(params);
+    let chan_name = chan_name.split(' ').next().unwrap_or("");
     let Some(ci) = channel::find(state, chan_name) else {
         return;
     };
@@ -926,31 +905,5 @@ fn on_nick(state: &mut BotState, prefix: &str, params: &str) {
     state.nick_change_pending = false;
     if eq_ic(&state.current_nick, &state.target_nick) {
         state.nick_generation_attempt = 0;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::state::TrustedBot;
-
-    #[test]
-    fn helper_uuid_matches_a_long_nick() {
-        let mut st = BotState::for_test();
-        let long = "h".repeat(30);
-        st.trusted_bots.push(TrustedBot {
-            mask: format!("{long}!u@other.host"),
-            uuid: "44444444-4444-4444-8444-444444444444".into(),
-            ..TrustedBot::default()
-        });
-        let helper = RosterEntry {
-            nick: long.clone(),
-            hostmask: format!("{long}!v@new.host"),
-            ..RosterEntry::default()
-        };
-        assert_eq!(
-            find_uuid_for_helper(&st, &helper).as_deref(),
-            Some("44444444-4444-4444-8444-444444444444")
-        );
     }
 }

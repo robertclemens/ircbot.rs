@@ -1027,7 +1027,7 @@ cron_sweep() { # in out
 }
 cron_edit() { # add|remove tag line
   command -v crontab >/dev/null 2>&1 || return 3
-  take_lock "$HLOCK" 15 || return 1
+  take_lock "$HLOCK" 15 || return 5  # busy: the binary runs it again soon
   T=".upgrade.cron.$$"; rc=1; n=0
   while [ "$n" -lt 3 ]; do
     n=$((n + 1))
@@ -1293,12 +1293,22 @@ fn cron_note(c: &mut CronState, rc: i32, now: u64) {
         _ if rc == 11 || (rc == 3 && c.wanted != 1) => "no",
         3 => "failed:no crontab tool",
         4 => "failed:unsafe path",
+        CRON_RC_BUSY => "busy",
         _ => "failed:cannot read crontab",
     }
     .to_string();
     // Ours: look at the stamp in this same pass, so a host whose cron is dead
     // stays "silent" instead of reading "yes" for a minute after every check.
     c.stat = if c.ours { 0 } else { now };
+    // Another node held the lock: soon, not in an hour, and never later than an
+    // order that arrived meanwhile has already asked for.
+    if rc == CRON_RC_BUSY {
+        let spread = u64::from(std::process::id())
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add(now)
+            % CRON_BUSY_RETRY_SPAN;
+        c.next = c.next.min(now + CRON_BUSY_RETRY_MIN + spread);
+    }
 }
 
 /// The helper's work files are `.upgrade.cron.<its pid>.*`: a helper that was
@@ -1314,7 +1324,7 @@ fn cron_work_rm(pid: u32) {
     }
 }
 
-/// What `cron_tick` last found: yes, silent, manual, no or failed:<why>.
+/// What `cron_tick` last found: yes, silent, manual, no, busy or failed:<why>.
 pub fn cron_status() -> String {
     CRON.lock().map(|c| c.status.clone()).unwrap_or_default()
 }
@@ -1381,7 +1391,8 @@ pub fn cron_tick(exe: &str) -> bool {
             fail = Some("cannot write here".to_string());
         }
         if let Some(why) = fail {
-            c.status = format!("failed:{why}");
+            // C: snprintf into g_cron_status[CRON_STATUS_MAX + 1]
+            c.status = crate::cstr::trunc_string(&format!("failed:{why}"), CRON_STATUS_MAX + 1);
             c.next = now + CRON_CHECK_SECS;
         } else {
             let arg = match c.wanted {

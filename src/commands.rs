@@ -59,9 +59,9 @@ const RULE: &str = "+-----------------------------------------------------------
 const FOOT: &str = "`----------------------------------------------------------------------------";
 
 fn gm_time(ts: i64, fmt: &str) -> String {
-    match chrono::DateTime::from_timestamp(ts, 0) {
-        Some(t) => t.format(fmt).to_string(),
-        None => "invalid".into(),
+    match jiff::Timestamp::from_second(ts) {
+        Ok(t) => t.strftime(fmt).to_string(),
+        Err(_) => "invalid".into(),
     }
 }
 

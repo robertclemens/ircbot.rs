@@ -235,7 +235,7 @@ fn context(
 }
 
 fn now() -> i64 {
-    chrono::Utc::now().timestamp()
+    jiff::Timestamp::now().as_second()
 }
 
 // ---- passphrase-protected keys (irckey-v2) -----------------------------------
@@ -1336,11 +1336,12 @@ fn cmd_hold(name: &[u8], deadline: &[u8]) -> Res {
 }
 
 fn local_time(t: i64) -> String {
-    use chrono::TimeZone;
-    chrono::Local
-        .timestamp_opt(t, 0)
-        .single()
-        .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+    jiff::Timestamp::from_second(t)
+        .map(|ts| {
+            ts.to_zoned_datetime(jiff::tz::TimeZone::system())
+                .strftime("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
         .unwrap_or_default()
 }
 

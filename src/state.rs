@@ -902,8 +902,17 @@ pub struct BotState {
 
     pub bot_tree: Vec<BotTreeRow>,
     pub bot_tree_ts: i64,
+    /// Phase 5: the raw tree text exactly as the hub serialized it — what a
+    /// CMD_BOT_TREE_DELTA edits (by row) and re-hashes; a mismatch pulls.
+    pub bot_tree_raw: String,
+    /// The last tree was larger than TREE_RAW_MAX (C bot_tree_raw_len -1): a
+    /// delta pulls, and the keepalive hash is not checked.
+    pub bot_tree_raw_big: bool,
     pub presence_server: String,
     pub last_presence_sent: i64,
+    /// Phase 4: this bot's link-order counter (LINK_ORD_FILE), bumped once per
+    /// hub link and sent in CMD_BOT_PRESENCE.  0 until the first link.
+    pub link_ord: u64,
     /// The hub-driven upgrade this bot has acknowledged (CMD_UPGRADE_PREPARE).
     /// COMMIT carries only the id and the version, so the release base the hub
     /// named at PREPARE time is remembered here; an id that never went through
@@ -1071,8 +1080,11 @@ impl BotState {
             hub_connect_time: 0,
             bot_tree: Vec::new(),
             bot_tree_ts: 0,
+            bot_tree_raw: String::new(),
+            bot_tree_raw_big: false,
             presence_server: String::new(),
             last_presence_sent: 0,
+            link_ord: 0,
             upgrade_id: String::new(),
             upgrade_target: String::new(),
             upgrade_variant: String::new(),

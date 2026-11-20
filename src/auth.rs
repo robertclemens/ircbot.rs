@@ -109,10 +109,20 @@ pub fn trusted_bot_by_host(state: &BotState, user_host: &str) -> Option<usize> {
         return None;
     }
     let norm = strip_ident_tilde(crate::cstr::trunc(user_host, MAX_MASK_LEN));
-    state
-        .trusted_bots
-        .iter()
-        .position(|tb| wildcard_match(&strip_ident_tilde(&tb.mask), &norm))
+    // The entry whose mask IS this host wins over an earlier wildcard that
+    // also matches it: the index picks the uuid and key, and two bots on one
+    // host must not answer for each other.
+    let mut first = None;
+    for (i, tb) in state.trusted_bots.iter().enumerate() {
+        let m = strip_ident_tilde(&tb.mask);
+        if m.eq_ignore_ascii_case(&norm) {
+            return Some(i);
+        }
+        if first.is_none() && wildcard_match(&m, &norm) {
+            first = Some(i);
+        }
+    }
+    first
 }
 
 /// Log label for another bot or a user named by uuid (C `bot_who`):
@@ -259,5 +269,27 @@ mod tests {
         assert!(m("a*b*c", "aXXbYYc"));
         assert!(!m("a*b*c", "aXXbYY"));
         assert!(!m("", "x"));
+    }
+
+    #[test]
+    fn exact_mask_beats_an_earlier_wildcard() {
+        use crate::state::{BotState, TrustedBot};
+        let mut st = BotState::for_test();
+        for (mask, uuid) in [("*!*@shared.host", "a"), ("bot6!~b@shared.host", "b")] {
+            st.trusted_bots.push(TrustedBot {
+                mask: mask.into(),
+                uuid: uuid.into(),
+                ..TrustedBot::default()
+            });
+        }
+        assert_eq!(
+            super::trusted_bot_by_host(&st, "BOT6!b@shared.host"),
+            Some(1)
+        );
+        assert_eq!(
+            super::trusted_bot_by_host(&st, "bot7!c@shared.host"),
+            Some(0)
+        );
+        assert_eq!(super::trusted_bot_by_host(&st, "bot7!c@other.host"), None);
     }
 }

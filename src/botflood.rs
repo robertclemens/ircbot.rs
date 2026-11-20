@@ -226,12 +226,6 @@ fn ignore_add(state: &mut BotState, key: &str, now: i64) -> bool {
     }
 }
 
-/// Quiet mode: unauthorised sources get no reply at all.
-#[allow(dead_code)] // declared in C as well, with no caller there either
-pub fn quiet(state: &mut BotState) -> bool {
-    state.flood.quiet_at(now_ms())
-}
-
 /// Shared body of msg / ctcp.
 fn host_flood_at(
     state: &mut BotState,

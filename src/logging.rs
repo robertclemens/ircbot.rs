@@ -136,7 +136,9 @@ fn mask_line(isup: &Isupport, line: &str, depth: u32) -> String {
 }
 
 fn local_time_str() -> String {
-    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+    jiff::ZonedDateTime::now()
+        .strftime("%Y-%m-%d %H:%M:%S")
+        .to_string()
 }
 
 impl Logger {

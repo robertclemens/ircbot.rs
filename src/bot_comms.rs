@@ -156,8 +156,15 @@ fn open_and_dispatch(state: &mut BotState, ti: usize, b64: &str, sender_nick: Op
         return;
     };
     if eq_ic(verb, "OPME") {
-        if let Some(n) = sender_nick {
-            ircf!(state, "MODE {} +o {}\r\n", arg1, n);
+        // Only where we can: in the channel and opped (as OPUSER).  The sender
+        // is a trusted bot, so +bitch does not apply to it.
+        if let Some(n) = sender_nick
+            && let Some(ci) = channel::find(state, arg1)
+            && state.chans[ci].status == ChanStatus::In
+            && state.chans[ci].i_am_opped
+        {
+            let name = state.chans[ci].name.clone();
+            ircf!(state, "MODE {} +o {}\r\n", name, n);
         }
     } else if eq_ic(verb, "SETNICK") {
         if is_rfc_nick(arg1) {
