@@ -97,13 +97,25 @@ try:
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
     from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
     CRYPTO_OK = True
-except ImportError:
+    CRYPTO_ERR = None
+except Exception as _e:  # noqa: BLE001 — a broken install raises more than ImportError
     CRYPTO_OK = False
+    CRYPTO_ERR = _e
 
 CRYPTO_HINT = ("bot_auth: the 'cryptography' module is not installed — this "
                "script cannot do the Curve25519/AES-GCM handshake without it. "
                "Install one of:  sudo apt install python3-cryptography  |  "
                "pip install cryptography")
+# Only a missing 'cryptography' package means "not installed".  Anything else
+# is a copy that was found and failed to load (a pip copy shadowing the distro
+# one, a native part built for another Python): say so, with Python's reason.
+if not CRYPTO_OK and not (isinstance(CRYPTO_ERR, ModuleNotFoundError)
+                          and (CRYPTO_ERR.name or "").split(".")[0] == "cryptography"):
+    _why = (str(CRYPTO_ERR).splitlines() or [""])[0][:300]
+    CRYPTO_HINT = ("bot_auth: the 'cryptography' module is installed but failed to "
+                   f"load: {type(CRYPTO_ERR).__name__}: {_why}  — a copy earlier on "
+                   "sys.path is likely broken or built for another Python; check: "
+                   "python3 -c 'import cryptography; print(cryptography.__file__)'")
 
 SCRIPT_NAME = "ircbot_weechat_auth"
 SCRIPT_AUTHOR = "rclemens"

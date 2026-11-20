@@ -21,6 +21,18 @@ our $CRYPTX_OK = eval {
 our $CRYPTX_ERR = $CRYPTX_OK ? '' : "$@";
 
 sub cryptx_hint {
+    # Only "Can't locate X.pm in @INC" means missing.  Anything else is a copy
+    # that was found and failed to load (an XS module built for another perl,
+    # an older copy shadowing a newer one): say so, with perl's own reason.
+    if ($CRYPTX_ERR !~ /^Can't locate \S+ in \@INC/) {
+        my ($why) = split /\n/, $CRYPTX_ERR, 2;
+        $why = '' if !defined $why;
+        $why =~ s/\s+at \(eval[^)]*\) line \d+\.?\s*$//;
+        $why = substr($why, 0, 300) . '…' if length($why) > 300;
+        return 'bot_auth: CryptX is installed but failed to load: ' . $why
+             . '  — a copy earlier on @INC is likely broken or built for another '
+             . 'perl; check: perl -MCrypt::PK::X25519 -le \'print $INC{"Crypt/PK/X25519.pm"}\'';
+    }
     return 'bot_auth: CryptX is not installed — this script cannot do the '
          . 'Curve25519/AES-GCM handshake without it.  Install one of:  '
          . 'sudo apt install libcryptx-perl  |  cpan CryptX  |  cpanm CryptX';
