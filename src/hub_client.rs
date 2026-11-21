@@ -261,6 +261,8 @@ pub fn disconnect(state: &mut BotState) {
     state.hub_connect_time = 0;
     state.hub_auth_state = HubAuthState::None;
     state.hub_session_key.wipe();
+    state.cfg_text = None; // the next hub sends a full config first
+    state.cfg_pull_at = 0;
     state.hub_link_offered = false;
     state.hub_link_tx_seq = false;
     state.hub_link_rx_seq = false;
@@ -483,7 +485,11 @@ pub fn stage_tick(state: &mut BotState) {
         updater::stage_unsaid();
         return;
     }
-    logm!(state, L_DEBUG, "[UPGRADE] Stage of {}: {}\n", id, status);
+    // A build staged after another failed says so at INFO: the operator should
+    // know this host could not take its first choice.  As C.
+    let fell_back = status.starts_with("staged|") && status.contains("; the ");
+    let level = if fell_back { L_INFO } else { L_DEBUG };
+    logm!(state, level, "[UPGRADE] Stage of {}: {}\n", id, status);
     send_upgrade_progress(state, &id, &status);
 }
 
@@ -913,6 +919,109 @@ fn tree_row_uuid(line: &str) -> &str {
     line.split('|').nth(idx).unwrap_or("")
 }
 
+// ---- Config deltas (CMD_CONFIG_DELTA 0x91, 2.5.4) ---------------------------
+// `cfg_text` is the exact byte text the hub's last full config (or the last
+// delta we rebuilt) left us holding.  Plan: irchub/docs/plans/
+// 2026-11-20_config_delta_plan.md §4.3a — a delta is applied only when our
+// text hashes to its base and the rebuilt one to its result, all in scratch,
+// then through the unchanged full-config apply; anything else is one
+// CMD_CONFIG_PULL.  As the C bot's hub_client.c block of the same name.
+
+fn cfg_sha_hex(t: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(t)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// One pull per CFG_PULL_MIN_GAP: a burst of bad frames is one full push.
+fn request_config_pull(state: &mut BotState, why: &str) {
+    let t = now();
+    if state.cfg_pull_at != 0 && t - state.cfg_pull_at < CFG_PULL_MIN_GAP {
+        return;
+    }
+    state.cfg_pull_at = t;
+    logm!(
+        state,
+        L_DEBUG,
+        "[HUB] Config delta not applied ({}); pulling the whole config\n",
+        why
+    );
+    send_frame(state, CMD_CONFIG_PULL, b"");
+}
+
+/// A keepalive's "c|<sha256hex>": the text we should hold.  Ours hashing to
+/// anything else (or holding none) pulls a full config.
+fn check_config_hash(state: &mut BotState, hex: &str) {
+    if hex.len() != crate::cfg_delta::CFGD_HASH_HEX {
+        return;
+    }
+    let Some(held) = state.cfg_text.as_ref() else {
+        request_config_pull(state, "keepalive: no config yet");
+        return;
+    };
+    if cfg_sha_hex(held) != hex {
+        request_config_pull(state, "keepalive hash mismatch");
+    }
+}
+
+/// A CMD_CONFIG_DATA or CMD_CONFIG_DELTA frame, as the raw bytes the hub
+/// sent (the hash must be over its bytes, not a lossy decode of them).
+fn config_frame(state: &mut BotState, cmd: u8, raw: &[u8]) {
+    if cmd == CMD_CONFIG_DATA {
+        logm!(
+            state,
+            L_INFO,
+            "[HUB] Received config from hub ({} bytes)\n",
+            raw.len()
+        );
+        // The text a later CMD_CONFIG_DELTA edits: every full config, never
+        // a PURGE line (its own frame, after the purged config).
+        if !raw.starts_with(b"PURGE|") {
+            state.cfg_text = Some(Zeroizing::new(raw.to_vec()));
+        }
+        let text = Zeroizing::new(String::from_utf8_lossy(raw).into_owned());
+        process_config_data(state, until_nul(&text));
+        return;
+    }
+    // CMD_CONFIG_DELTA: rebuild the full text, check it, apply it.
+    let Some((base_hex, new_hex)) = crate::cfg_delta::header(raw) else {
+        request_config_pull(state, "bad header");
+        return;
+    };
+    let (base_hex, new_hex) = (base_hex.to_string(), new_hex.to_string());
+    let Some(held) = state.cfg_text.as_ref() else {
+        request_config_pull(state, "no base config");
+        return;
+    };
+    if cfg_sha_hex(held) != base_hex {
+        request_config_pull(state, "base mismatch");
+        return;
+    }
+    let rebuilt = match crate::cfg_delta::patch(held, raw, MAX_CONFIG_PAYLOAD) {
+        Ok(t) => t,
+        Err(why) => {
+            request_config_pull(state, why);
+            return;
+        }
+    };
+    if cfg_sha_hex(&rebuilt) != new_hex {
+        request_config_pull(state, "result mismatch");
+        return;
+    }
+    logm!(
+        state,
+        L_INFO,
+        "[HUB] Received config delta from hub ({} bytes -> {})\n",
+        raw.len(),
+        rebuilt.len()
+    );
+    let text = Zeroizing::new(String::from_utf8_lossy(&rebuilt).into_owned());
+    state.cfg_text = Some(rebuilt);
+    process_config_data(state, until_nul(&text));
+}
+
 /// A pull should be rare (a delta always hashes right in order); log why at
 /// debug so a pull rate in the hub stats can be traced to its cause.
 fn request_tree_pull(state: &mut BotState, why: &str) {
@@ -927,8 +1036,8 @@ fn request_tree_pull(state: &mut BotState, why: &str) {
 
 /// A hub keepalive's "t|<fnv64hex>": our tree hashing to it is a refresh (the
 /// stale clock restarts, nothing is sent); anything else pulls the whole tree.
-/// An empty or other payload (an older hub) is ignored.  As C
-/// `hub_client_check_tree_hash`.
+/// A payload without t| (the hub has a tree frame for us still queued, or no
+/// tree yet) is ignored.  As C `hub_client_check_tree_hash`.
 fn check_tree_hash(state: &mut BotState, p: &str) {
     let Some(hex) = p.strip_prefix("t|") else {
         return;
@@ -2655,17 +2764,7 @@ fn handle_response(state: &mut BotState, cmd: u8, payload: &str) {
         CMD_ACTIVITY_REPLY => crate::commands::activity_reply(state, payload),
         CMD_USER_CHAN_RESULT => user_chan_result(state, payload),
         CMD_CONFIG_PULL => logm!(state, L_INFO, "[HUB] Hub requested config sync\n"),
-        CMD_CONFIG_DATA => {
-            logm!(
-                state,
-                L_INFO,
-                "[HUB] Received config from hub ({} bytes)\n",
-                payload.len()
-            );
-            if !payload.is_empty() {
-                process_config_data(state, payload);
-            }
-        }
+        // CMD_CONFIG_DATA / CMD_CONFIG_DELTA arrive as raw bytes: config_frame.
         CMD_UPDATE_PUBKEY => {}
         CMD_BOT_KEY_UPDATE => {
             // Private keys never cross the wire; rekey is bot-local.
@@ -3270,13 +3369,21 @@ fn process_packet(state: &mut BotState, body: &[u8]) {
         return;
     }
     if cmd == CMD_PING {
-        // A hub keepalive may carry "t|<fnv64hex>", the tree we should hold:
-        // the check that replaced the periodic whole-tree push.
+        // A hub keepalive may carry "t|<fnv64hex>", the tree we should hold
+        // (the check that replaced the periodic whole-tree push), and from a
+        // 2.5.4 hub a "c|<sha256hex>" line, the config text we should hold.
+        // Either may be absent; each is its own line.
         if plain.len() > 5 {
             let pl = u32::from_be_bytes([plain[1], plain[2], plain[3], plain[4]]) as usize;
-            if pl > 0 && pl < 64 && pl <= plain.len() - 5 {
+            if pl > 0 && pl < 160 && pl <= plain.len() - 5 {
                 let tp = String::from_utf8_lossy(&plain[5..5 + pl]).into_owned();
-                check_tree_hash(state, &tp);
+                for ln in until_nul(&tp).split('\n').filter(|l| !l.is_empty()) {
+                    if ln.starts_with("t|") {
+                        check_tree_hash(state, ln);
+                    } else if let Some(h) = ln.strip_prefix("c|") {
+                        check_config_hash(state, h);
+                    }
+                }
             }
         }
         // Answer at most once per 5 s.
@@ -3294,6 +3401,12 @@ fn process_packet(state: &mut BotState, body: &[u8]) {
     }
     let payload_len = u32::from_be_bytes([plain[1], plain[2], plain[3], plain[4]]) as usize;
     if payload_len == 0 || payload_len > plain.len() - 5 || payload_len > i32::MAX as usize {
+        return;
+    }
+    if cmd == CMD_CONFIG_DATA || cmd == CMD_CONFIG_DELTA {
+        let raw = Zeroizing::new(plain[5..5 + payload_len].to_vec());
+        drop(plain);
+        config_frame(state, cmd, &raw);
         return;
     }
     let payload = Zeroizing::new(String::from_utf8_lossy(&plain[5..5 + payload_len]).into_owned());
@@ -3419,6 +3532,7 @@ fn retire(state: &mut BotState) {
         "[HUB] This bot was deleted on the hub: wiping its config and exiting\n"
     );
     state.retired = true;
+    state.cfg_text = None;
     let exe = state.executable_path.clone();
     match updater::cron_drop(&exe) {
         0 => {}

@@ -8,6 +8,9 @@ mod access;
 mod auth;
 mod bot_comms;
 mod botflood;
+// Shared byte for byte with irchub.rs: the hub half (diff) is unused here.
+#[allow(dead_code)]
+mod cfg_delta;
 mod chancfg;
 mod chancmd;
 mod chanenf;
@@ -20,6 +23,7 @@ mod consts;
 mod crypto;
 mod cstr;
 mod dcc;
+mod elf_needs;
 mod glob_overlap;
 mod hub_client;
 mod irc_client;

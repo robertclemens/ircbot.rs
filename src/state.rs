@@ -908,6 +908,15 @@ pub struct BotState {
     /// The last tree was larger than TREE_RAW_MAX (C bot_tree_raw_len -1): a
     /// delta pulls, and the keepalive hash is not checked.
     pub bot_tree_raw_big: bool,
+    /// 2.5.4 config deltas: the exact bytes of the last full config the hub
+    /// sent (or the last delta rebuilt), what CMD_CONFIG_DELTA edits and the
+    /// keepalive's c| hashes; None none.  Raw bytes, never the lossy text the
+    /// apply reads, so the hash is the hub's.  A PURGE line is not a config
+    /// text and never replaces it.  Zeroized on replace, disconnect and
+    /// retire.
+    pub cfg_text: Option<Zeroizing<Vec<u8>>>,
+    /// Last CMD_CONFIG_PULL sent (CFG_PULL_MIN_GAP).
+    pub cfg_pull_at: i64,
     pub presence_server: String,
     pub last_presence_sent: i64,
     /// Phase 4: this bot's link-order counter (LINK_ORD_FILE), bumped once per
@@ -1082,6 +1091,8 @@ impl BotState {
             bot_tree_ts: 0,
             bot_tree_raw: String::new(),
             bot_tree_raw_big: false,
+            cfg_text: None,
+            cfg_pull_at: 0,
             presence_server: String::new(),
             last_presence_sent: 0,
             link_ord: 0,

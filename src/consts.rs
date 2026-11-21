@@ -12,7 +12,7 @@ pub const BOT_NAME: &str = "ircbot.rs by trojanman";
 /// made against.
 pub const BOT_VERSION: &str = match option_env!("IRCBOT_VERSION") {
     Some(v) => v,
-    None => "2.5.3",
+    None => "2.5.4",
 };
 pub const PASS_FILE: &str = ".ircbot.pass"; // machine-bound password file
 /// PBKDF2-HMAC-SHA256 rounds for the .ircbot.cnf and .ircbot.pass keys
@@ -61,10 +61,10 @@ pub const UPGRADE_WATCH_SECS: u32 = 20;
 /// channel it held ops in before, opped — at most this long (seconds), then
 /// it reports "ok" anyway with what is missing (bot.h UPGRADE_OPS_WAIT).
 pub const UPGRADE_OPS_WAIT: i64 = 180;
-/// The oldest upgrade target: 2.5.0 cannot link with a 2.5.2 hub
-/// (MESH_MIN_VERSION 2.5.1), and anything older cannot read this config or
+/// The oldest upgrade target: anything below 2.5.3 cannot link with a 2.5.4
+/// hub (MESH_MIN_VERSION 2.5.3), and below 2.5.0 cannot read this config or
 /// pass file (PBKDF2 600k since 2.5.0; bot.h UPGRADE_TARGET_MIN).
-pub const UPGRADE_TARGET_MIN: &str = "2.5.1";
+pub const UPGRADE_TARGET_MIN: &str = "2.5.3";
 /// How long a staged build's `-selftest` may run before it is killed.
 pub const SELFTEST_TIMEOUT: u64 = 15;
 /// The release tree ROOT; one variant subdirectory below it holds that build's
@@ -275,6 +275,14 @@ pub const CMD_CRON_SET: u8 = 0x8B;
 /// tree's hash; a bot whose hash mismatches pulls the whole tree.
 pub const CMD_BOT_TREE_DELTA: u8 = 0x8F;
 pub const CMD_BOT_TREE_PULL: u8 = 0x90;
+/// 2.5.4: the hub sends our config as a line edit of the text we hold
+/// (cfg_delta.rs).  We check the base hash, patch into scratch, check the
+/// result hash, then run the same full-config apply as CMD_CONFIG_DATA; any
+/// doubt is a CMD_CONFIG_PULL.  A keepalive's "c|<sha256hex>" line is the
+/// hash of the text we should hold; a mismatch pulls too.
+pub const CMD_CONFIG_DELTA: u8 = 0x91;
+/// Seconds between two CMD_CONFIG_PULLs.
+pub const CFG_PULL_MIN_GAP: i64 = 5;
 /// Hub -> Bot: id, get the build ready while the old one runs.
 pub const CMD_UPGRADE_STAGE: u8 = 0x88;
 /// Bot -> Hub: id|uuid|phase|code|note.

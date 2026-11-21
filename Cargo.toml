@@ -1,6 +1,6 @@
 [package]
 name = "ircbot"
-version = "2.5.3"
+version = "2.5.4"
 edition = "2024"
 rust-version = "1.89"
 description = "IRC bot with an encrypted hub mesh (safe-Rust port of ircbot.c)"
@@ -30,20 +30,20 @@ test-hooks = []
 [dependencies]
 # Cryptography (RustCrypto + dalek): AES-256-GCM, HKDF/PBKDF2-SHA256,
 # Ed25519 signatures and X25519 key agreement.
-aes-gcm = "0.11"
-ed25519-dalek = "3.0"
-x25519-dalek = { version = "3.0", features = ["static_secrets"] }
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
+ed25519-dalek = { version = "3.0", default-features = false, features = ["zeroize"] }
+x25519-dalek = { version = "3.0", default-features = false, features = ["static_secrets", "zeroize"] }
 hkdf = "0.13"
-pbkdf2 = "0.13"
-sha2 = "0.11"
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+sha2 = { version = "0.11", default-features = false }
 getrandom = "0.4"
-zeroize = "1.9"
-base64 = "0.23"
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 # keygen only: passphrase-protected keys (irchub/docs/console.md §9) --
 # scrypt for the irckey-v2 IRC key, bcrypt_pbkdf + AES-256-CTR for the
 # OpenSSH key.  All pure Rust.
 scrypt = { version = "0.12", default-features = false }
-bcrypt-pbkdf = "0.11"
+bcrypt-pbkdf = { version = "0.11", default-features = false, features = ["alloc"] }
 aes = "0.9"
 ctr = "0.10"
 
@@ -59,12 +59,12 @@ rustls-graviola = "0.4"
 # the updater's HTTPS already uses through ureq -- the same on every host and
 # in the static build.
 webpki-roots = "1"
-ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots", "gzip"] }
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
 
 # OS integration through safe wrappers.
-nix = { version = "0.32", features = ["user", "fs", "process", "signal", "term", "resource", "feature", "socket"] }
-region = "4"
-signal-hook = "0.4"
+nix = { version = "0.32", features = ["user", "fs", "signal", "term", "resource", "socket"] }
+region = { version = "4", default-features = false }
+signal-hook = { version = "0.4", default-features = false }
 jiff = { version = "1", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 
 [lints.rust]
