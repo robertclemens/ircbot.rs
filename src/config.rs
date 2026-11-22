@@ -519,7 +519,7 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
             logm!(
                 state,
                 L_INFO,
-                "[CFG] {} '{}' has no public key and cannot authenticate until given one (chkey, or the hub console's 'userkey' command).\n",
+                "[CFG] {} '{}' has no public key and cannot authenticate until given one (chkey, or the hub console's 'user set <name> key').\n",
                 if u.typ == 'a' { "Admin" } else { "Oper" },
                 u.name
             );

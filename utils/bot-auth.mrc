@@ -11,7 +11,7 @@
 ;
 ; Setup (once, in mIRC):
 ;   /set %bot_auth_exe     C:\path\to\bot-auth.exe
-;   /set %bot_auth_keyfile C:\path\to\20260914120000_robert.private.b64
+;   /set %bot_auth_keyfile C:\path\to\20260914120000_admin.private.b64
 ;   /set %bot_auth_pinfile C:\path\to\bot_pins.txt      ; optional
 ;   /set %bot_auth_tmpdir  C:\path\to\a\private\tempdir ; optional, default $sysdir(temp)
 ;   /set %bot_auth_passwd_expire 1h                     ; optional, see below

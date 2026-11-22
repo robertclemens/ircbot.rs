@@ -244,6 +244,19 @@ pub fn handle_line(state: &mut BotState, line: &str) {
         }
         // RPL_CHANNELMODEIS / RPL_CREATIONTIME: live state only.
         "324" | "329" => chanlive::numeric(state, command, params),
+        // RPL_NOTOPIC / RPL_TOPIC / RPL_TOPICWHOTIME: for `channel who`
+        "331" | "332" | "333" => chanlive::numeric(state, command, params),
+        // "<chan> :<new topic>"
+        "TOPIC" if params.len() < 1024 => {
+            if let Some(p) = prefix {
+                let (chan, text) = match params.find(' ') {
+                    Some(sp) => (&params[..sp], &params[sp + 1..]),
+                    None => (params, ""),
+                };
+                let text = text.strip_prefix(':').unwrap_or(text);
+                chanlive::topic_set(state, chan, p, text);
+            }
+        }
         "367" => {
             chanlive::numeric(state, command, params); // our own ban list copy
             let mut t = Tok::new(params);

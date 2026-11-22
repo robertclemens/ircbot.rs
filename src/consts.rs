@@ -299,13 +299,30 @@ pub const CMD_CHAN_REPLY: u8 = 0x5B;
 //   PROBE_ACK  bot->hub  eid|1| or eid|0|reason
 //   DO         hub->bot  eid|kind|channel|requester|nick|hostmask
 //   DONE       bot->hub  eid|ok|detail or eid|fail|detail
-// kind = op / invite / unban / key.
+// kind = op / invite / unban / key / mode / kick / ban / who.
 pub const CMD_CHAN_PROBE: u8 = 0x6D;
 pub const CMD_CHAN_PROBE_ACK: u8 = 0x6E;
 pub const CMD_CHAN_DO: u8 = 0x6F;
 pub const CMD_CHAN_DONE: u8 = 0x70;
 /// A nick the hub hands us, any network.
 pub const CHAN_DO_NICK_MAX: usize = 30;
+// 2.5.4 `channel who` (irchub docs/plans/2026-11-21_channel_who_plan.md):
+// election kind "who" -- any bot in the channel whose WHO list is complete
+// (315 seen) is ready, ops not needed.  The picked bot sends its view as
+// CMD_CHAN_WHO chunks, then DONE.  Mirrors ircbot/bot.h.
+//   CHAN_WHO   bot->hub  eid|seq|more|<body>, body lines:
+//              t|<topic known 0/1>|<set_at>
+//              B|<setter>          T|<topic>
+//              M|<modes known 0/1>|<limit>|<+modes>
+//              K|<key>             C|<members>|<capped 0/1>
+//              N|<@%+ prefix><nick> ...  (space separated, highest prefix)
+//              Free text (setter, topic, key) is the rest of its own line.
+//              The body is split anywhere into chunks; the hub joins them.
+pub const CMD_CHAN_WHO: u8 = 0x95;
+/// Body bytes per CHAN_WHO frame.
+pub const CHAN_WHO_CHUNK: usize = 8192;
+/// A topic is kept to this (IRC caps ~390).
+pub const CHAN_TOPIC_MAX: usize = 512;
 // ---- Channel modes / settings / bans / floods (irchub docs/modes.md) -----------
 // The 0x76-0x7A ops are console->hub only; a bot never sends or handles them
 // and they are declared so the numbers stay reserved on both sides.

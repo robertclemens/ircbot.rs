@@ -126,7 +126,7 @@ pub fn trusted_bot_by_host(state: &BotState, user_host: &str) -> Option<usize> {
 }
 
 /// Log label for another bot or a user named by uuid (C `bot_who`):
-/// "bot bunny_ (<uuid>)", "admin robert (<uuid>)"; a name nobody knows reads
+/// "bot bunny_ (<uuid>)", "admin admin (<uuid>)"; a name nobody knows reads
 /// "?".  kind: 'b' bot, 'u' admin/oper.
 pub fn who(state: &BotState, kind: char, uuid: &str) -> String {
     let mut word = if kind == 'u' { "user" } else { "bot" };

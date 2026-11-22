@@ -242,6 +242,100 @@ pub fn live_reset(c: &mut Chan) {
     c.ban_list_known = false;
     c.ban_overflow_logged = false;
     c.who_done = false;
+    c.topic.clear();
+    c.topic_by.clear();
+    c.topic_at = 0;
+    c.topic_known = false;
+}
+
+/// A topic / setter as text the hub can show: control bytes go, and so do
+/// the colour digits after ^C ("^C04,12").  Under `size` bytes (C's buffer
+/// size, NUL included), cut at a character boundary.
+fn topic_copy(src: &str, size: usize) -> String {
+    let b = src.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len().min(size));
+    let mut i = 0;
+    while i < b.len() && out.len() + 1 < size {
+        let ch = b[i];
+        if ch == 0x03 {
+            let mut k = 0;
+            while k < 2 && i + 1 < b.len() && b[i + 1].is_ascii_digit() {
+                i += 1;
+                k += 1;
+            }
+            if i + 2 < b.len() && b[i + 1] == b',' && b[i + 2].is_ascii_digit() {
+                i += 1;
+                let mut k = 0;
+                while k < 2 && i + 1 < b.len() && b[i + 1].is_ascii_digit() {
+                    i += 1;
+                    k += 1;
+                }
+            }
+        } else if ch >= 0x20 && ch != 0x7f {
+            out.push(ch);
+        }
+        i += 1;
+    }
+    let mut s = String::from_utf8_lossy(&out).into_owned();
+    while s.len() + 1 > size {
+        s.pop();
+    }
+    s
+}
+
+/// TOPIC from IRC: setter mask, channel, the new topic.
+pub fn topic_set(state: &mut BotState, chan: &str, setter: &str, topic: &str) {
+    let Some(ci) = channel::find(state, chan) else {
+        return;
+    };
+    let c = &mut state.chans[ci];
+    c.topic = topic_copy(topic, CHAN_TOPIC_MAX);
+    c.topic_by = topic_copy(setter, MAX_MASK_LEN);
+    c.topic_at = now();
+    c.topic_known = true;
+}
+
+/// `channel who` body (consts.rs CMD_CHAN_WHO): what this bot sees in the
+/// channel right now.
+pub fn who_body(c: &Chan) -> String {
+    let mut modes = String::from("+");
+    for ch in (b'a'..=b'z').chain(b'A'..=b'Z') {
+        if c.live_flags & live_bit(ch) != 0 {
+            modes.push(ch as char);
+        }
+    }
+    if modes.len() == 1 {
+        modes.clear();
+    }
+    let mut out = format!(
+        "t|{}|{}\nB|{}\nT|{}\nM|{}|{}|{}\nK|{}\nC|{}|{}\nN|",
+        u8::from(c.topic_known),
+        c.topic_at,
+        c.topic_by,
+        c.topic,
+        u8::from(c.live_known),
+        c.live_limit,
+        modes,
+        c.live_key,
+        c.roster.len(),
+        u8::from(c.roster.len() >= MAX_ROSTER_SIZE)
+    );
+    for (i, r) in c.roster.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(if r.is_op {
+            "@"
+        } else if r.is_halfop {
+            "%"
+        } else if r.is_voice {
+            "+"
+        } else {
+            ""
+        });
+        out.push_str(&r.nick);
+    }
+    out
 }
 
 pub fn ban_add(state: &mut BotState, ci: usize, mask: &str, setter: &str, when: i64) {
@@ -417,6 +511,31 @@ pub fn numeric(state: &mut BotState, command: &str, params: &str) {
         "368" => {
             ban_list_end(&mut state.chans[ci]);
             state.chans[ci].enf_dirty = true;
+        }
+        // RPL_TOPIC "<me> <chan> :<topic>"
+        "332" => {
+            let c = &mut state.chans[ci];
+            c.topic = topic_copy(rest.strip_prefix(':').unwrap_or(rest), CHAN_TOPIC_MAX);
+            c.topic_known = true;
+        }
+        // RPL_NOTOPIC
+        "331" => {
+            let c = &mut state.chans[ci];
+            c.topic.clear();
+            c.topic_by.clear();
+            c.topic_at = 0;
+            c.topic_known = true;
+        }
+        // RPL_TOPICWHOTIME "<me> <chan> <setter> <ts>"
+        "333" => {
+            let mut t = Tok::new(rest);
+            let by = t.next(" ");
+            let ts = t.next(" ");
+            let c = &mut state.chans[ci];
+            if let Some(by) = by {
+                c.topic_by = topic_copy(by, MAX_MASK_LEN);
+            }
+            c.topic_at = ts.map_or(0, parse_ts);
         }
         _ => {}
     }

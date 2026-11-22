@@ -3,22 +3,22 @@ ircbot/utils — client tools
 
 Admins and opers command the bot with a Curve25519 keypair.  There are no
 admin, oper or bot passwords any more; the only password left is your bot's
-config-file password.  Design: irchub/docs/passwordless.md.
+config-file password.
 
 
 
 /* keygen :: make a keypair — built by `cargo build --release` (target/release/keygen) */
 
-    ./keygen robert          # or just ./keygen and type the name when asked
+    ./keygen admin           # or just ./keygen and type the name when asked
 
 It asks for an optional passphrase (twice, echo off; empty = none) and
 writes, in the current directory or in -d <dir> (never overwriting a file):
 
-    YYYYMMDDHHMMSS_robert.private.b64   0600 — yours alone: your IRC script and
+    YYYYMMDDHHMMSS_admin.private.b64    0600 — yours alone: your IRC script and
                                         bot-auth use it
-    YYYYMMDDHHMMSS_robert.public.b64    give this to an admin
-    YYYYMMDDHHMMSS_robert_ed25519       0600 — the SSH key for the hub console
-    YYYYMMDDHHMMSS_robert_ed25519.pub        (admins; PuTTYgen imports it)
+    YYYYMMDDHHMMSS_admin.public.b64     give this to an admin
+    YYYYMMDDHHMMSS_admin_ed25519        0600 — the SSH key for the hub console
+    YYYYMMDDHHMMSS_admin_ed25519.pub         (admins; PuTTYgen imports it)
 
 Both private files are under the same passphrase (the IRC key as an
 "irckey-v2 scrypt ..." line, the SSH key as a standard encrypted OpenSSH
@@ -26,7 +26,7 @@ key).  keygen prints the public key, its fingerprint (e.g.
 763e:58a6:2dfd:ae02) and a ~/.ssh/config block; the private key is never
 printed.  Later:
 
-    ./keygen --passwd YYYYMMDDHHMMSS_robert.private.b64
+    ./keygen --passwd YYYYMMDDHHMMSS_admin.private.b64
         add / change / remove the passphrase (rewrites the SSH pair too; the
         public key stays the same, so nothing on the hubs or bots changes)
 
@@ -34,7 +34,6 @@ Scripts: --no-passphrase, --passphrase-file <0600 file>,
 --old-passphrase-file <0600 file>.  keygen (utils/keygen.rs) is the Rust
 port of the shared C keygen.c, byte-identical to irchub.rs/src/bin/keygen.rs:
 same files, same output.
-Formats: irchub/docs/console.md §9.
 
 Without keygen (OpenSSL 1.1.1 or newer; a key without a passphrase):
 

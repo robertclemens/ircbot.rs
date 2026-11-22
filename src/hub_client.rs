@@ -2462,6 +2462,7 @@ fn chan_elect_cannot(state: &BotState, kind: &str, channel: &str) -> Option<&'st
     let c = &state.chans[ci];
     match kind {
         "key" => (c.key.is_empty()).then_some("no key"),
+        "who" => (!c.who_done).then_some("names not synced"),
         "op" | "invite" | "unban" | "mode" | "kick" | "ban" => {
             (!c.i_am_opped).then_some("not opped")
         }
@@ -2485,6 +2486,32 @@ fn chan_done_send(state: &mut BotState, id: &str, ok: bool, detail: &str) {
     if out.len() < 192 {
         send_frame(state, CMD_CHAN_DONE, out.as_bytes());
     }
+}
+
+/// `channel who`: our view of the channel as CMD_CHAN_WHO chunks (the body
+/// split anywhere, CHAN_WHO_CHUNK bytes each), then DONE.  consts.rs has the
+/// body format.
+fn chan_who_send(state: &mut BotState, id: &str, chan: &str) {
+    let Some(ci) = channel::find(state, chan) else {
+        chan_done_send(state, id, false, "not in channel");
+        return;
+    };
+    let body = chanlive::who_body(&state.chans[ci]);
+    let members = state.chans[ci].roster.len();
+    let b = body.as_bytes();
+    let (mut off, mut seq) = (0usize, 0u32);
+    while off < b.len() || seq == 0 {
+        let part = (b.len() - off).min(CHAN_WHO_CHUNK);
+        let more = off + part < b.len();
+        let mut frame = format!("{id}|{seq}|{}|", u8::from(more)).into_bytes();
+        frame.extend_from_slice(&b[off..off + part]);
+        if !send_frame(state, CMD_CHAN_WHO, &frame) {
+            return; // the link is gone: the hub's timeout answers
+        }
+        off += part;
+        seq += 1;
+    }
+    chan_done_send(state, id, true, &format!("{members} nicks"));
 }
 
 /// We were picked: eid|kind|channel|requester|nick|hostmask.  Re-check (the
@@ -2516,6 +2543,11 @@ fn chan_elect_do(state: &mut BotState, payload: &str) {
     let mask = r.get(5).map_or("", |c| c.s());
     if let Some(why) = chan_elect_cannot(state, kind, chan) {
         chan_done_send(state, id, false, why);
+        return;
+    }
+    if kind == "who" {
+        let (id, chan) = (id.to_string(), chan.to_string());
+        chan_who_send(state, &id, &chan);
         return;
     }
     if (kind == "op" || kind == "invite") && !chan_do_nick_ok(nick) {

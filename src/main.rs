@@ -444,16 +444,16 @@ fn run_config_wizard() -> io::Result<()> {
                 state.hubs.len(),
                 if state.hubs.len() == 1 { "" } else { "s" }
             );
-            println!("\n  Admins, usermasks and channels for this bot are added with");
-            println!("  the hub console (admin/mask/chan), not here. This wizard assumes");
-            println!("  the hub network runs with opt 'h' (hub-only mutations), which");
-            println!("  is the default — it cannot verify that until the first sync.");
-            println!("  If your hub does not set opt 'h', you can also add them later");
-            println!("  from IRC with '+admin' and 'join'.");
+            println!("\n  Admins, usermasks and channels for this bot are added on the");
+            println!("  hub console ('user add', 'user mask', 'channel add'), not here.");
+            println!("  This wizard assumes the hub network runs with opt 'h' (hub-only");
+            println!("  mutations), which is the default — it cannot verify that until");
+            println!("  the first sync. If your hub does not set opt 'h', you can also");
+            println!("  add them later from IRC with '+admin' and 'join'.");
         } else {
             println!("\n--- Setup First Admin ---");
             let name = loop {
-                let n = get_input("Enter admin friendly name (no spaces, e.g. robert)", 64);
+                let n = get_input("Enter admin friendly name (no spaces, e.g. admin)", 64);
                 if !n.is_empty() && !n.contains(' ') && !n.contains('|') {
                     break n.to_string();
                 }

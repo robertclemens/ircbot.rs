@@ -570,6 +570,12 @@ pub struct Chan {
     pub ban_overflow_logged: bool,
     /// The channel WHO finished (315) this stay.
     pub who_done: bool,
+    /// `channel who`: the topic as 332/333/331/TOPIC told us, this stay.
+    pub topic: String,
+    pub topic_by: String,
+    pub topic_at: i64,
+    /// A 332/331/TOPIC was seen.
+    pub topic_known: bool,
     /// A key / mode this bot learned (K|) and has not yet got to a hub.
     pub enf_pending: bool,
     /// chanflood.rs: per-source flood windows, MAX_FLOOD_TRACK slots,
