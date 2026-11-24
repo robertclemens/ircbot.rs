@@ -338,11 +338,26 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
         let data = &line[2..];
         match typ {
             b'n' => state.target_nick = trunc_string(data, MAX_NICK),
+            // Server (bot-specific): the local list (pool::servers_rebuild
+            // dials it)
             b's' => {
-                if state.server_list.len() < MAX_SERVERS {
-                    state.server_list.push(data.to_string());
+                if state.local_servers.len() < MAX_SERVERS {
+                    state.local_servers.push(data.to_string());
                 }
             }
+            // N|/S|: the hub's server pool, cached (pool.rs)
+            b'N' | b'S' => {
+                if !crate::pool::ingest_line(state, typ, data) {
+                    logm!(
+                        state,
+                        L_INFO,
+                        "[CFG] Ignoring invalid {}| line\n",
+                        typ as char
+                    );
+                }
+            }
+            // P|1: local s| already offered to the pool
+            b'P' => state.pool_migrated = data == "1",
             b'c' => {
                 if let Some((chan, key, op, ts)) = parse_cfg_chan(data) {
                     // Channel names match regardless of ASCII case (D39): a
@@ -539,7 +554,16 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
         write(state, password);
     }
 
-    if state.target_nick.is_empty() || state.server_list.is_empty() || state.user.is_empty() {
+    // The dial list: the pool when hub-managed, else the local s| lines.
+    crate::pool::servers_rebuild(state);
+
+    // A hub-managed bot needs no IRC server of its own: it waits for the
+    // hub's pool (server pool plan §5.5a).  A standalone one needs at least
+    // one.
+    if state.target_nick.is_empty()
+        || (state.local_servers.is_empty() && state.hubs.is_empty())
+        || state.user.is_empty()
+    {
         logm!(
             state,
             L_INFO,
@@ -572,7 +596,7 @@ fn load_mask_line(state: &mut BotState, data: &str) {
 /// h|<host:port>[|<pubkey_b64>]: the pin is the hub's Ed25519 key, 44-char
 /// (32 raw bytes) or 88-char (combined key; first 32 bytes).
 fn load_hub_line(state: &mut BotState, data: &str) {
-    if state.hubs.len() >= MAX_SERVERS {
+    if state.hubs.len() >= MAX_HUBS {
         return;
     }
     let mut he = HubEntry::default();
@@ -604,9 +628,13 @@ fn serialize(state: &BotState) -> Option<Zeroizing<String>> {
     let mut out = Zeroizing::new(String::with_capacity(4096));
     let mut push = |s: &str| out.push_str(s);
     push(&format!("n|{}\n", state.target_nick));
-    for s in &state.server_list {
+    for s in &state.local_servers {
         push(&format!("s|{s}\n"));
     }
+    if state.pool_migrated {
+        push("P|1\n");
+    }
+    push(&crate::pool::format_lines(state)?);
     for c in &state.chans {
         // A channel known only from its C| line (no c| yet) has no record of
         // its own to write.

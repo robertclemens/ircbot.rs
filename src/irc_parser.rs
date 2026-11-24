@@ -3,10 +3,10 @@
 use crate::botflood::{self, Bf};
 use crate::consts::*;
 use crate::cstr::{Tok, eq_ic, now, starts_with_ic, trunc, trunc_string};
-use crate::state::{BotState, ChanReq, ChanStatus, M_I, M_K, RosterEntry, S_AUTHED};
+use crate::state::{BotState, ChanReq, ChanStatus, M_I, M_K, OWN_REQ_OP, RosterEntry, S_AUTHED};
 use crate::{
     auth, bot_comms, chanenf, chanflood, chanlive, channel, commands, crypto, dcc, hub_client,
-    irc_client, ircf, logm,
+    irc_client, ircf, logm, pool,
 };
 
 /// MODE on a channel: our own op state (with immediate re-read on deop),
@@ -227,7 +227,15 @@ pub fn handle_line(state: &mut BotState, line: &str) {
     }
 
     match command {
-        "001" => on_welcome(state, params),
+        "001" => {
+            on_welcome(state, params);
+            pool::netcheck_arm(state);
+            state.irc_attempt_ok = true;
+            pool::link_note(state, "up", None);
+        }
+        // End of MOTD (or none): the 005 lines are in, so the network is
+        // known.
+        "376" | "422" => pool::netcheck_end_of_motd(state),
         "433" | "432" | "437" => on_nick_refused(state, command, params),
         // ERR_YOUREBANNEDCREEP / ERR_NOPERMFORHOST: recorded; classified
         // when the link drops.
@@ -539,6 +547,9 @@ fn on_who_reply(state: &mut BotState, params: &str) {
     let (is_halfop, is_voice) = (prefix_sym('h'), prefix_sym('v'));
     let is_me = eq_ic(nick, &state.current_nick);
 
+    // An invite waiting on this nick's live mask (channel::invite_check_*).
+    channel::invite_check_who(state, nick, ident, host);
+
     // Self-mask capture first: the reply to `WHO <nick>` has "*" as channel.
     if is_me {
         let self_mask = trunc_string(&format!("{nick}!{ident}@{host}"), MAX_MASK_LEN);
@@ -564,6 +575,10 @@ fn on_who_reply(state: &mut BotState, params: &str) {
 /// fresh roster and ask it -- via the hub when it has a UUID, else ~B2.
 fn on_end_of_who(state: &mut BotState, params: &str) {
     let Some(ch) = second_tok(params) else { return };
+    // end of `WHO <nick>`: a nick no 352 answered for is not on IRC
+    if !ch.starts_with('#') && !ch.starts_with('&') {
+        channel::invite_check_end(state, ch);
+    }
     let Some(ci) = channel::find(state, ch) else {
         return;
     };
@@ -681,34 +696,63 @@ fn on_end_of_who(state: &mut BotState, params: &str) {
     state.chans[ci].op_request_pending = true;
 
     if now - state.last_op_request_sent >= OP_REQUEST_MIN_INTERVAL {
-        let mut sent_via_hub = false;
-        logm!(
-            state,
-            L_DEBUG,
-            "[OP-REQ] Looking up UUID for helper: nick={} hostmask={}\n",
-            chosen.nick,
-            chosen.hostmask
-        );
-        // The trusted entry that matched this helper (auth: an exact mask
-        // before a wildcard) names the bot to ask.
-        let uuid = auth::trusted_bot_by_host(state, &chosen.hostmask)
-            .map(|i| state.trusted_bots[i].uuid.clone())
-            .filter(|u| !u.is_empty());
-        if let Some(uuid) = uuid {
-            logm!(state, L_DEBUG, "[OP-REQ] Found UUID, trying hub request\n");
-            sent_via_hub = hub_client::request_op(state, &uuid, &name);
+        // A 2.5.4 hub: the election picks a bot that can (linked, opped,
+        // +bitch) and answers ok / none / denied (channel::own_*).  An older
+        // hub: the named-helper request, with the same wait for a result.
+        let mut sent_via_hub = channel::own_op_request(state, ci);
+        if sent_via_hub {
             logm!(
                 state,
                 L_DEBUG,
-                "[OP-REQ] hub_client_request_op returned: {}\n",
-                sent_via_hub as i32
+                "[OP-REQ] Asked the hub's election for ops in {}\n",
+                name
             );
+        } else {
+            logm!(
+                state,
+                L_DEBUG,
+                "[OP-REQ] Looking up UUID for helper: nick={} hostmask={}\n",
+                chosen.nick,
+                chosen.hostmask
+            );
+            // The trusted entry that matched this helper (auth: an exact mask
+            // before a wildcard) names the bot to ask.
+            let uuid = auth::trusted_bot_by_host(state, &chosen.hostmask)
+                .map(|i| state.trusted_bots[i].uuid.clone())
+                .filter(|u| !u.is_empty() && hub_client::bot_on_hub(state, u));
+            if let Some(uuid) = uuid {
+                logm!(state, L_DEBUG, "[OP-REQ] Found UUID, trying hub request\n");
+                sent_via_hub = hub_client::request_op(state, &uuid, &name);
+                logm!(
+                    state,
+                    L_DEBUG,
+                    "[OP-REQ] hub_client_request_op returned: {}\n",
+                    sent_via_hub as i32
+                );
+                if sent_via_hub && let Some(c) = state.chans.get_mut(ci) {
+                    c.own_rid[OWN_REQ_OP].clear(); // an older hub: no answer comes
+                    c.own_sent[OWN_REQ_OP] = now;
+                }
+            }
         }
         if !sent_via_hub {
             logm!(
                 state,
                 L_DEBUG,
-                "[OP-REQ] Hub unavailable or no UUID match, falling back to PRIVMSG\n"
+                "[OP-REQ] Hub unavailable, no UUID match or helper on no hub; falling back to PRIVMSG\n"
+            );
+            let why = if state.hub_authenticated {
+                "helper on no hub"
+            } else {
+                "no hub"
+            };
+            logm!(
+                state,
+                L_INFO,
+                "[B2-FAILBACK] op for {} via {} ({})\n",
+                name,
+                chosen.nick,
+                why
             );
             bot_comms::send_to_host(
                 state,

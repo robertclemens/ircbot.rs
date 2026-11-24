@@ -24,7 +24,7 @@ use crate::state::{
 };
 use crate::{
     access, auth, bot_comms, chancfg, chancmd, channel, config, dcc, hub_client, irc_client, ircf,
-    logm, updater,
+    logm, pool, updater,
 };
 
 // ---- Reply helpers ---------------------------------------------------------------
@@ -1032,8 +1032,8 @@ const BOT_CMD_FLAGS: &[(&str, char)] = &[
     ("givenick", 'b'),
     ("chnick", 'b'),
     ("rekey", 'b'),
-    ("+server", 'b'),
-    ("-server", 'b'),
+    ("+server", 's'),
+    ("-server", 's'),
     ("join", 'c'),
     ("part", 'c'),
     ("op", 'c'),
@@ -1067,6 +1067,7 @@ fn bot_flag_word(f: char) -> &'static str {
         'c' => "channels",
         'h' => "hub",
         'o' => "opers",
+        's' => "servers",
         'u' => "upgrades",
         _ => "?",
     }
@@ -1338,7 +1339,7 @@ fn user_chan_command(
         );
         return;
     }
-    bot_comms::user_chan_fallback(state, kind, &chan, nick, user_host);
+    bot_comms::user_chan_fallback(state, kind, &chan, nick, user_host, &uuid);
     ircf!(
         state,
         "PRIVMSG {} :I am not opped in {}; asked the other bots.\r\n",
@@ -1540,50 +1541,57 @@ fn admin_command(
         "-usermask" => cmd_del_usermask(state, nick, a),
         "bots" => cmd_bots(state, nick, a),
         "servers" => cmd_servers(state, nick),
+        // Hub-managed: an S| add pushed to the hub's pool (refused under opt
+        // h).  Standalone: the local s| list.  pool.rs, plan §5.5.
         "+server" => {
             let Some(arg1) = a.a1 else {
-                say(state, nick, "Syntax: +server <irc.server.net:6667>");
+                say(state, nick, "Syntax: +server <irc.server.net[:port]>");
                 return;
             };
-            if state.server_list.len() < MAX_SERVERS {
-                let slot = state.server_list.len();
-                irc_client::server_block_clear(state, slot);
-                state.server_list.push(arg1.to_string());
-                config::write_with_state_pass(state);
-                ircf!(
-                    state,
-                    "PRIVMSG {} :Added server '{}' and saved config.\r\n",
-                    nick,
-                    arg1
-                );
-            } else {
-                say(state, nick, "Error: Server list is full.");
+            // the C reason buffer (err[256])
+            match pool::servers_add(state, arg1) {
+                Ok(()) => {
+                    let to = if state.hubs.is_empty() {
+                        "server list and saved config"
+                    } else {
+                        "hub's pool"
+                    };
+                    ircf!(
+                        state,
+                        "PRIVMSG {} :Added server '{}' to the {}.\r\n",
+                        nick,
+                        arg1,
+                        to
+                    );
+                }
+                Err(e) => {
+                    ircf!(state, "PRIVMSG {} :Error: {}.\r\n", nick, trunc(&e, 256));
+                }
             }
         }
         "-server" => {
             let Some(arg1) = a.a1 else {
-                say(state, nick, "Syntax: -server <server>");
+                say(state, nick, "Syntax: -server <server[:port]|uuid>");
                 return;
             };
-            match state.server_list.iter().position(|s| eq_ic(s, arg1)) {
-                Some(i) => {
-                    irc_client::server_block_remove(state, i);
-                    state.server_list.remove(i);
-                    config::write_with_state_pass(state);
+            // the C reason buffer (err[320])
+            match pool::servers_del(state, arg1) {
+                Ok(()) => {
+                    let from = if state.hubs.is_empty() {
+                        "server list and saved config"
+                    } else {
+                        "hub's pool"
+                    };
                     ircf!(
                         state,
-                        "PRIVMSG {} :Removed server '{}' and saved config.\r\n",
+                        "PRIVMSG {} :Removed server '{}' from the {}.\r\n",
                         nick,
-                        arg1
+                        arg1,
+                        from
                     );
                 }
-                None => {
-                    ircf!(
-                        state,
-                        "PRIVMSG {} :Error: Server '{}' not found.\r\n",
-                        nick,
-                        arg1
-                    );
+                Err(e) => {
+                    ircf!(state, "PRIVMSG {} :Error: {}.\r\n", nick, trunc(&e, 320));
                 }
             }
         }
@@ -1671,20 +1679,37 @@ fn cmd_jump(state: &mut BotState, nick: &str, a: Args<'_>) {
         irc_client::disconnect(state);
         return;
     };
-    // Match by hostname only; ports are ignored.
-    let host_of = |s: &str| -> String {
-        let s = trunc(s, 256);
-        match s.rfind(':') {
-            Some(i) => s[..i].to_string(),
-            None => s.to_string(),
-        }
+    // Jump to a named server: host:port as listed when a port is given
+    // (servers on one host differ by port), else the first slot of that host
+    // whatever its port.
+    let arg_trunc = trunc(arg1, 256);
+    let arg_port = arg_trunc.contains(':') && !arg_trunc.starts_with('[');
+    let arg_host = match arg_trunc.rfind(':') {
+        Some(i) if arg_port => &arg_trunc[..i],
+        _ => arg_trunc,
     };
-    let arg_host = host_of(arg1);
-    let Some(idx) = state
-        .server_list
-        .iter()
-        .position(|s| eq_ic(&host_of(s), &arg_host))
-    else {
+    let target = if arg_port {
+        state.server_list.iter().position(|s| eq_ic(arg1, s))
+    } else {
+        state.server_list.iter().position(|s| {
+            let s = trunc(s, 256);
+            let h = match s.rfind(':') {
+                Some(i) if !s.starts_with('[') => &s[..i],
+                _ => s,
+            };
+            eq_ic(arg_host, h)
+        })
+    };
+    let Some(idx) = target else {
+        if !state.hubs.is_empty() && crate::pool_rec::hostport_parse(arg1).is_some() {
+            // Hub-managed: an operator override to a host outside the pool,
+            // dialed once and not added to it (plan §5.6).
+            state.jump_once = trunc_string(arg1, crate::pool_rec::POOL_HOST_MAX + 8);
+            ircf!(state, "QUIT :Jumping to {}...\r\n", arg1);
+            irc_client::disconnect(state);
+            state.last_irc_attempt = 0;
+            return;
+        }
         ircf!(
             state,
             "PRIVMSG {} :Error: Server '{}' not in list.\r\n",
@@ -1707,6 +1732,8 @@ fn cmd_jump(state: &mut BotState, nick: &str, a: Args<'_>) {
     }
     irc_client::server_block_clear(state, idx);
     state.current_server_index = idx;
+    // hub-managed: the load-based pick would ignore the cursor
+    state.jump_slot1 = idx + 1;
     ircf!(state, "QUIT :Jumping to {}...\r\n", arg1);
     irc_client::disconnect(state);
 }
@@ -3380,9 +3407,16 @@ fn cmd_servers(state: &mut BotState, nick: &str) {
     };
     ircf!(
         state,
-        "PRIVMSG {} :| ircbot {} servers\r\n",
+        "PRIVMSG {} :| ircbot {} servers ({})\r\n",
         nick,
-        BOT_VERSION
+        BOT_VERSION,
+        if pool::local_fallback(state) {
+            "local list, until the hub's pool arrives"
+        } else if state.hubs.is_empty() {
+            "local list"
+        } else {
+            "hub pool"
+        }
     );
     say(state, nick, RULE);
     let mut shown = 0;
@@ -3412,7 +3446,47 @@ fn cmd_servers(state: &mut BotState, nick: &str) {
         );
         shown += 1;
     }
-    if shown == 0 {
+    if !state.hubs.is_empty() && !pool::local_fallback(state) {
+        // Pool entries the dial list leaves out, and the dormant local list.
+        for i in pool::unlisted(state, MAX_POOL_SERVERS) {
+            if shown >= BOT_STATUS_MAX_LINES {
+                break;
+            }
+            let s = state.pool[i].s.clone();
+            ircf!(
+                state,
+                "PRIVMSG {} :|   {}  port {}  [{}{}{}]\r\n",
+                nick,
+                pad_right(&s.host, host_w),
+                pad_right(&s.port.to_string(), 7),
+                crate::pool_rec::state_name(s.state),
+                if s.seen.is_empty() { "" } else { ": " },
+                s.seen
+            );
+            shown += 1;
+        }
+        for l in state.local_servers.clone() {
+            if shown >= BOT_STATUS_MAX_LINES {
+                break;
+            }
+            ircf!(
+                state,
+                "PRIVMSG {} :|   {}  local (unused: hub-managed)\r\n",
+                nick,
+                pad_right(&l, host_w)
+            );
+            shown += 1;
+        }
+        if state.server_list.is_empty() {
+            let t = if state.pool_known {
+                "| no usable server in the pool: waiting for one"
+            } else {
+                "| no server pool from the hub yet"
+            };
+            say(state, nick, t);
+        }
+    }
+    if shown == 0 && state.hubs.is_empty() {
         say(state, nick, "| (no servers configured)");
     } else if connected_idx.is_some() {
         say(state, nick, "| '*' connected, [..] on hold");
@@ -3460,7 +3534,7 @@ fn cmd_add_hub(state: &mut BotState, nick: &str, a: Args<'_>) {
         );
         return;
     };
-    if state.hubs.len() >= MAX_SERVERS {
+    if state.hubs.len() >= MAX_HUBS {
         say(state, nick, "Error: Hub list is full.");
         return;
     }
@@ -3471,6 +3545,11 @@ fn cmd_add_hub(state: &mut BotState, nick: &str, a: Args<'_>) {
         ed_pub,
         ed_pub_set: true,
     });
+    // The first hub: hub-managed from now on, so the dial list is the pool
+    // (none yet: it stays on its current server, plan D13).
+    if state.hubs.len() == 1 {
+        pool::servers_rebuild(state);
+    }
     config::write_with_state_pass(state); // pushes: its hl| list changed
     ircf!(
         state,
@@ -3510,8 +3589,23 @@ fn cmd_del_hub(state: &mut BotState, nick: &str, a: Args<'_>) {
         hub_client::disconnect(state);
     }
     state.hubs.remove(i);
+    // The last hub gone: the bot is standalone and keeps the servers it knew
+    // -- the usable pool becomes its s| list (plan §5.1, Q4).
+    if state.hubs.is_empty() {
+        pool::go_hubless(state);
+    }
     config::write_with_state_pass(state); // pushes: its hl| list changed
     ircf!(state, "PRIVMSG {} :Removed Hub: {}\r\n", nick, addr);
+    if state.hubs.is_empty() {
+        let n = state.local_servers.len();
+        ircf!(
+            state,
+            "PRIVMSG {} :Now standalone: {} local server{}.\r\n",
+            nick,
+            n,
+            if n == 1 { "" } else { "s" }
+        );
+    }
     if is_current && !state.hubs.is_empty() {
         say(state, nick, "Reconnecting to another hub...");
         state.last_hub_connect_attempt = 0;

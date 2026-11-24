@@ -103,26 +103,70 @@ fn strip_ident_tilde(s: &str) -> String {
     }
 }
 
-/// Index of the trusted bot whose stored mask matches `user_host`.
-pub fn trusted_bot_by_host(state: &BotState, user_host: &str) -> Option<usize> {
-    if state.trusted_bots.is_empty() {
-        return None;
+/// Two full masks are the same identity: nick!ident@host part by part, the
+/// nick and the host ignoring ASCII case, the ident exactly.  Nothing is
+/// wildcarded and no '~' is dropped: a bot is the mask the server shows for
+/// it (2026-11-23: bots match exactly, users by their stored patterns).  C
+/// `auth_mask_equal`.
+pub fn mask_equal(a: &str, b: &str) -> bool {
+    let split = |m: &str| -> Option<(String, String, String)> {
+        let bang = m.find('!')?;
+        let at = bang + 1 + m[bang + 1..].find('@')?;
+        let (n, i, h) = (&m[..bang], &m[bang + 1..at], &m[at + 1..]);
+        (!n.is_empty() && !i.is_empty() && !h.is_empty()).then(|| (n.into(), i.into(), h.into()))
+    };
+    match (split(a), split(b)) {
+        (Some((an, ai, ah)), Some((bn, bi, bh))) => {
+            an.eq_ignore_ascii_case(&bn) && ai == bi && ah.eq_ignore_ascii_case(&bh)
+        }
+        _ => false,
     }
-    let norm = strip_ident_tilde(crate::cstr::trunc(user_host, MAX_MASK_LEN));
-    // The entry whose mask IS this host wins over an earlier wildcard that
-    // also matches it: the index picks the uuid and key, and two bots on one
-    // host must not answer for each other.
+}
+
+/// Whether a stored trusted-bot mask stands for live mask `live`.  A
+/// hub-configured bot (any h| line, linked now or not) holds the masks the
+/// other bots published: exactly (mask_equal).  A purely standalone bot
+/// holds the masks an admin typed (+bot, config b|): as patterns, like user
+/// masks -- the ~B2 key is what authenticates.  C `auth_bot_mask_ok`.
+pub fn bot_mask_ok(state: &BotState, stored: &str, live: &str) -> bool {
+    mask_equal(stored, live) || (state.hubs.is_empty() && wildcard_match(stored, live))
+}
+
+/// The stored trusted-bot entry for `user_host` (bot_mask_ok); an entry
+/// whose mask IS the host wins over an earlier pattern that also matches it
+/// (two bots on one host must not answer for each other).
+pub fn trusted_bot_by_host(state: &BotState, user_host: &str) -> Option<usize> {
     let mut first = None;
     for (i, tb) in state.trusted_bots.iter().enumerate() {
-        let m = strip_ident_tilde(&tb.mask);
-        if m.eq_ignore_ascii_case(&norm) {
+        if mask_equal(&tb.mask, user_host) {
             return Some(i);
         }
-        if first.is_none() && wildcard_match(&m, &norm) {
+        if first.is_none() && bot_mask_ok(state, &tb.mask, user_host) {
             first = Some(i);
         }
     }
     first
+}
+
+/// A person's live mask still stands for that user in chan: an active user
+/// record, one of its own active usermask patterns matches the live mask,
+/// and it may act there (an admin anywhere, an oper only where it is bound).
+/// C `auth_user_live_ok`.
+pub fn user_live_ok(state: &BotState, uuid: &str, nuh: &str, chan: &str) -> bool {
+    if uuid.is_empty() || nuh.is_empty() {
+        return false;
+    }
+    let Some(ur) = state
+        .user_records
+        .iter()
+        .find(|u| u.is_active && u.uuid == uuid)
+    else {
+        return false;
+    };
+    let mask_ok = state.mask_records.iter().any(|m| {
+        m.is_active && !m.mask.is_empty() && m.uuid == uuid && wildcard_match(&m.mask, nuh)
+    });
+    mask_ok && (ur.typ == 'a' || crate::access::user_chan_ok(state, uuid, Some(chan)))
 }
 
 /// Log label for another bot or a user named by uuid (C `bot_who`):
@@ -272,8 +316,8 @@ mod tests {
     }
 
     #[test]
-    fn exact_mask_beats_an_earlier_wildcard() {
-        use crate::state::{BotState, TrustedBot};
+    fn trusted_bots_exact_when_hub_configured_patterns_when_standalone() {
+        use crate::state::{BotState, HubEntry, TrustedBot};
         let mut st = BotState::for_test();
         for (mask, uuid) in [("*!*@shared.host", "a"), ("bot6!~b@shared.host", "b")] {
             st.trusted_bots.push(TrustedBot {
@@ -282,14 +326,31 @@ mod tests {
                 ..TrustedBot::default()
             });
         }
+        // standalone (no hub): the admin's masks are patterns; the entry
+        // whose mask IS the host still wins over an earlier pattern
         assert_eq!(
-            super::trusted_bot_by_host(&st, "BOT6!b@shared.host"),
+            super::trusted_bot_by_host(&st, "bot6!~b@shared.host"),
             Some(1)
         );
         assert_eq!(
             super::trusted_bot_by_host(&st, "bot7!c@shared.host"),
             Some(0)
         );
-        assert_eq!(super::trusted_bot_by_host(&st, "bot7!c@other.host"), None);
+        // hub-configured: exact only -- nick and host ignore case, the ident
+        // is exact ('~' included), a stored pattern never matches
+        st.hubs.push(HubEntry {
+            addr: "127.0.0.1:7000".into(),
+            ed_pub: [0; 32],
+            ed_pub_set: false,
+        });
+        assert_eq!(
+            super::trusted_bot_by_host(&st, "BOT6!~b@SHARED.host"),
+            Some(1)
+        );
+        assert_eq!(super::trusted_bot_by_host(&st, "bot6!b@shared.host"), None);
+        assert_eq!(super::trusted_bot_by_host(&st, "bot6!~B@shared.host"), None);
+        assert_eq!(super::trusted_bot_by_host(&st, "bot7!c@shared.host"), None);
+        assert!(!super::mask_equal("a!b@c", "a!b@c.d"));
+        assert!(!super::mask_equal("a!@c", "a!@c"));
     }
 }

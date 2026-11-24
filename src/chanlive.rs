@@ -41,6 +41,14 @@ fn isupport_token(is: &mut Isupport, tok: &str) {
     };
 
     match name {
+        "NETWORK" => {
+            // the network check (pool.rs) compares it; an unusable value reads
+            // as none sent
+            is.network.clear();
+            if !neg && crate::pool_rec::net_name_ok(val) {
+                is.network = val.to_string();
+            }
+        }
         "MODES" => {
             if neg {
                 is.modes = ISUPPORT_MODES_DEFAULT;

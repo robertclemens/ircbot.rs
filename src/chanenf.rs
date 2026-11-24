@@ -1847,7 +1847,7 @@ mod tests {
     fn chan_state(members: &[(String, String)]) -> BotState {
         let mut st = BotState::for_test();
         st.trusted_bots.push(TrustedBot {
-            mask: "alice!*@good.host".into(),
+            mask: "alice!u@good.host".into(),
             uuid: "33333333-3333-4333-8333-333333333333".into(),
             ..TrustedBot::default()
         });
@@ -2001,7 +2001,7 @@ mod tests {
         assert_eq!(e.auth_gen.get(), st.auth_gen.get());
         // a new record is seen once the fingerprint is retaken (<= 200 ms)
         st.trusted_bots.push(TrustedBot {
-            mask: "mallory!*@evil.host".into(),
+            mask: "mallory!u@evil.host".into(),
             uuid: "55555555-5555-4555-8555-555555555555".into(),
             ..TrustedBot::default()
         });

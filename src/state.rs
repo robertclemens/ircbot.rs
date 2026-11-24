@@ -39,6 +39,16 @@ pub enum ChanReq {
 }
 
 pub const CHAN_REQ_KIND_COUNT: usize = 3;
+/// A request of our own the hub answers (CMD_USER_CHAN_RESULT ok / none /
+/// denied, irchub docs/plans/2026-11-23_bot_chan_request_election_plan.md):
+/// one slot per ChanReq plus op.  No answer in the wait (an older hub never
+/// answers) -> the next ask goes over IRC (~B2); never after denied.
+pub const OWN_REQ_OP: usize = CHAN_REQ_KIND_COUNT;
+pub const OWN_REQ_SLOTS: usize = CHAN_REQ_KIND_COUNT + 1;
+/// s: op
+pub const OWN_REQ_WAIT_OP: i64 = 15;
+/// s: invite / key / unban (CHAN_ELECT_TTL 40 + margin)
+pub const OWN_REQ_WAIT_CHAN: i64 = 45;
 
 impl ChanReq {
     pub fn token(self) -> &'static str {
@@ -125,8 +135,30 @@ pub struct UserChanPending {
     pub chan: String,
     pub nick: String,
     pub mask: String,
+    /// the user the request is for (~B2 failback)
+    pub uuid: String,
     pub sent: i64,
 }
+
+/// An invite that waits for `WHO <nick>`: the nick is invited only when the
+/// mask the server shows for it now is the one the request was for (a bot:
+/// its published mask, equal; a person: the validated mask, equal, and still
+/// one of that user's patterns).  id "" = a ~B2 invite (no DONE to send).
+/// C `invite_check_t`.
+#[derive(Clone, Debug, Default)]
+pub struct InviteCheck {
+    pub id: String,
+    pub chan: String,
+    pub nick: String,
+    pub mask: String,
+    /// person's uuid, "" for a bot
+    pub user: String,
+    pub seen: bool,
+    pub sent: i64,
+}
+pub const INVITE_CHECKS: usize = 8;
+/// s for the WHO answer
+pub const INVITE_CHECK_WAIT: i64 = 10;
 
 /// Admin flags, `uf|<user_uuid>|<flags>|<ts>` (C `uflag_record_t`).
 #[derive(Clone, Debug, Default)]
@@ -407,6 +439,8 @@ pub struct Isupport {
     pub cm_d: String,
     /// NICKLEN=, default 30.
     pub nicklen: i32,
+    /// NETWORK=, "" = none sent
+    pub network: String,
 }
 
 impl Default for Isupport {
@@ -422,6 +456,7 @@ impl Default for Isupport {
             cm_c: "l".into(),
             cm_d: "imnpst".into(),
             nicklen: NICKLEN_DEFAULT,
+            network: String::new(),
         }
     }
 }
@@ -533,6 +568,10 @@ pub struct Chan {
     pub op_grant_held: Vec<(String, i64)>,
     pub last_access_request: [i64; CHAN_REQ_KIND_COUNT],
     pub access_retry_count: [i32; CHAN_REQ_KIND_COUNT],
+    /// Our own requests in flight (OWN_REQ_*): the rid the hub answers (""
+    /// on an older hub, which never does) and when it went; 0 = none.
+    pub own_rid: [String; OWN_REQ_SLOTS],
+    pub own_sent: [i64; OWN_REQ_SLOTS],
     /// C| record (modes.md section 2): the stored modes string, the raw
     /// settings field (unknown names kept verbatim) and its parse.  Written
     /// only by the console; cfg_ts 0 = never seen.
@@ -691,15 +730,30 @@ pub enum ServerBlockKind {
     Banned,
     BannedTemp,
     BannedPerm,
+    /// its NETWORK= is not this network's (pool.rs netcheck)
+    WrongNet,
 }
 
-/// Per-server ban/throttle hold, parallel to server_list (runtime only).
+/// One S| record as held by the bot (pool.rs).
+#[derive(Clone, Debug, Default)]
+pub struct PoolEntry {
+    pub s: crate::pool_rec::PoolSrv,
+    pub ts: i64,
+    /// CMD_POOL_VIEW, runtime
+    pub load_up: i32,
+    pub load_conn: i32,
+}
+
+/// Per-server ban/throttle hold, parallel to server_list (runtime only).  A
+/// rebuild of the dial list (pool::servers_rebuild) keeps each server's hold.
 #[derive(Clone, Debug, Default)]
 pub struct ServerBlock {
     pub kind: ServerBlockKind,
     pub until: i64,
     pub strikes: i32,
     pub reason: String,
+    /// last attempt here that never reached 001
+    pub last_fail: i64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -793,7 +847,49 @@ pub struct BotState {
     pub user: String,
     pub gecos: String,
     pub vhost: String,
+    /// The dial list connect picks from (runtime, pool::servers_rebuild): the
+    /// pool's usable entries when hub-managed (hubs non-empty), else the local
+    /// s| list.  dial_uuid[i] names the pool entry of slot i ("" = local).
     pub server_list: Vec<String>,
+    pub dial_uuid: Vec<String>,
+    /// The local s| lines (.cnf).  Dialed only while standalone; dormant
+    /// while hub-managed (plan §5.1).
+    pub local_servers: Vec<String>,
+    /// The hub's server pool, cached in the .cnf (N|/S| lines).
+    pub pool: Vec<PoolEntry>,
+    /// POOL_DEFAULT_NET's N| record
+    pub pool_net: crate::pool_rec::PoolNet,
+    pub pool_net_ts: i64,
+    /// an N| has arrived: the hub keeps a pool
+    pub pool_known: bool,
+    /// P|1: local s| sent to the pool once
+    pub pool_migrated: bool,
+    /// hub-managed with nothing to dial
+    pub pool_idle: bool,
+    /// dialing local s| until the first S| (pool::local_fallback)
+    pub pool_using_local: bool,
+    /// this hub link sent an N|: it is >= 2.5.4 and takes S| pushes and
+    /// 0x86 / 0x96
+    pub pool_hub_seen: bool,
+    /// 0 none, 1 pending, 2 passed (this link)
+    pub net_check: i32,
+    /// connecting / up / down / idle
+    pub irc_link: String,
+    pub irc_link_entry: String,
+    /// last CMD_BOT_IRC_LINK to this hub link
+    pub irc_link_sent: String,
+    /// last CMD_POOL_VIEW, 0 = none this link
+    pub pool_view_at: i64,
+    /// jittered dial time, 0 = not drawn yet
+    pub pool_dial_at: i64,
+    /// the current/last attempt reached 001
+    pub irc_attempt_ok: bool,
+    pub net_check_deadline: i64,
+    pub pool_idle_warned: i64,
+    /// 'jump <host>' to a host not listed
+    pub jump_once: String,
+    /// 'jump <server>' in the list: slot + 1, 0 = none
+    pub jump_slot1: usize,
     pub actual_server_name: String,
     pub actual_hostname: String,
     pub actual_hostname_ts: i64,
@@ -859,6 +955,7 @@ pub struct BotState {
     pub uchan_records: Vec<UchanRecord>,
     /// Person requests waiting for the hub (at most USER_CHAN_PENDING).
     pub user_chan_pending: Vec<UserChanPending>,
+    pub invite_checks: Vec<InviteCheck>,
     pub config_dirty: bool,
     pub last_config_write: i64,
 
@@ -1012,6 +1109,27 @@ impl BotState {
             gecos: String::new(),
             vhost: String::new(),
             server_list: Vec::new(),
+            dial_uuid: Vec::new(),
+            local_servers: Vec::new(),
+            pool: Vec::new(),
+            pool_net: Default::default(),
+            pool_net_ts: 0,
+            pool_known: false,
+            pool_migrated: false,
+            pool_idle: false,
+            pool_using_local: false,
+            pool_hub_seen: false,
+            net_check: 0,
+            irc_link: String::new(),
+            irc_link_entry: String::new(),
+            irc_link_sent: String::new(),
+            pool_view_at: 0,
+            pool_dial_at: 0,
+            irc_attempt_ok: false,
+            net_check_deadline: 0,
+            pool_idle_warned: 0,
+            jump_once: String::new(),
+            jump_slot1: 0,
             actual_server_name: String::new(),
             actual_hostname: String::new(),
             actual_hostname_ts: 0,
@@ -1058,6 +1176,7 @@ impl BotState {
             uflag_records: Vec::new(),
             uchan_records: Vec::new(),
             user_chan_pending: Vec::new(),
+            invite_checks: Vec::new(),
             config_dirty: false,
             last_config_write: 0,
             opt_flags: String::new(),

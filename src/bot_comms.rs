@@ -183,29 +183,85 @@ fn open_and_dispatch(state: &mut BotState, ti: usize, b64: &str, sender_nick: Op
             );
         }
     } else if eq_ic(verb, "INVITE") {
-        if let Some(arg2) = t.next(" ")
+        let arg2 = t.next(" ");
+        let (imask, iuser) = (t.next(" "), t.next(" "));
+        let snick = sender.nick().to_string();
+        if let Some(arg2) = arg2
             && let Some(ci) = channel::find(state, arg1)
             && state.chans[ci].status == ChanStatus::In
             && state.chans[ci].i_am_opped
         {
-            logm!(
-                state,
-                L_INFO,
-                "[BOT-COMMS] Inviting {} to {} (bot req)\n",
-                arg2,
-                arg1
-            );
-            ircf!(state, "INVITE {} {}\r\n", arg2, arg1);
+            if let (Some(m), Some(u)) = (imask, iuser) {
+                // a person the sender validated: its mask, checked live
+                channel::invite_check_start(state, "", arg1, arg2, m, u);
+            } else if eq_ic(arg2, &snick) {
+                // the sender itself: its published mask, checked live
+                let m = sender.mask.clone();
+                channel::invite_check_start(state, "", arg1, arg2, &m, "");
+            } else {
+                // a 2.5.3 sender's person invite (no mask): as before,
+                // unchecked -- 2.5.5 drops this form
+                logm!(
+                    state,
+                    L_INFO,
+                    "[BOT-COMMS] Inviting {} to {} (older bot's request, unchecked)\n",
+                    arg2,
+                    arg1
+                );
+                ircf!(state, "INVITE {} {}\r\n", arg2, arg1);
+            }
         }
     } else if eq_ic(verb, "OPUSER") {
         // OPUSER #chan nick: a person the sender vouched for (an admin or an
         // oper bound to the channel, user_flags plan section 5).  +bitch
         // still holds here: only an authorised member is opped.
-        if let Some(arg2) = t.next(" ")
+        let arg2 = t.next(" ");
+        let (omask, ouser) = (t.next(" "), t.next(" "));
+        if let Some(arg2) = arg2
+            && let Some(ci) = channel::find(state, arg1)
+            && state.chans[ci].status == ChanStatus::In
+            && state.chans[ci].i_am_opped
+            && let (Some(m), Some(u)) = (omask, ouser)
+        {
+            // the nick's mask here must be the one the sender validated, and
+            // still that user's (2026-11-23)
+            let hm = state.chans[ci]
+                .roster
+                .iter()
+                .find(|e| eq_ic(&e.nick, arg2))
+                .map(|e| e.hostmask.clone());
+            match hm {
+                Some(h)
+                    if crate::auth::mask_equal(&h, m)
+                        && crate::auth::user_live_ok(state, u, &h, arg1) =>
+                {
+                    logm!(
+                        state,
+                        L_INFO,
+                        "[BOT-COMMS] Opping {} in {} (bot req, {} checked)\n",
+                        arg2,
+                        arg1,
+                        h
+                    );
+                    ircf!(state, "MODE {} +o {}\r\n", arg1, arg2);
+                }
+                _ => {
+                    logm!(
+                        state,
+                        L_INFO,
+                        "[BOT-COMMS] Not opping {} in {}: not the requester here\n",
+                        arg2,
+                        arg1
+                    );
+                }
+            }
+        } else if let Some(arg2) = arg2
             && let Some(ci) = channel::find(state, arg1)
             && state.chans[ci].status == ChanStatus::In
             && state.chans[ci].i_am_opped
         {
+            // a 2.5.3 sender (no mask): as before, +bitch only -- 2.5.5 drops
+            // this form
             let (found, auth) = crate::chanlive::member_authorised(state, ci, arg2);
             if !crate::chanlive::bitch(state, ci) || (found && auth) {
                 logm!(
@@ -302,8 +358,16 @@ pub fn handle_privmsg(state: &mut BotState, nick: &str, user_host: &str, message
 }
 
 /// Seal `command` to trusted bot `ti` and deliver it to IRC nick
-/// `target_nick` (hub relay when connected, else PRIVMSG).
-fn b2_send(state: &mut BotState, ti: Option<usize>, target_nick: &str, command: &str) {
+/// `target_nick` (hub relay when connected and the target is on a hub, else
+/// PRIVMSG).  irc_only: PRIVMSG whatever the hub link -- a failback because
+/// the hub did not get the job done (bot chan request plan 2026-11-23).
+fn b2_send(
+    state: &mut BotState,
+    ti: Option<usize>,
+    target_nick: &str,
+    irc_only: bool,
+    command: &str,
+) {
     let tb = match ti.map(|i| state.trusted_bots[i].clone()) {
         Some(tb) if tb.has_pub && !tb.uuid.is_empty() => tb,
         _ => {
@@ -352,8 +416,15 @@ fn b2_send(state: &mut BotState, ti: Option<usize>, target_nick: &str, command: 
     if line.len() >= 1024 {
         return;
     }
+    // Route through hub if connected and the target is on a hub (the bot
+    // tree); PRIVMSG for hub-less bots and for a target no hub holds.
     let mut sent_via_hub = false;
-    if state.hub_connected && state.hub_authenticated && state.hub.is_some() {
+    if !irc_only
+        && state.hub_connected
+        && state.hub_authenticated
+        && state.hub.is_some()
+        && hub_client::bot_on_hub(state, &tb.uuid)
+    {
         logm!(
             state,
             L_DEBUG,
@@ -378,21 +449,42 @@ fn b2_send(state: &mut BotState, ti: Option<usize>, target_nick: &str, command: 
 /// To a trusted bot addressed by nick (its mask's nick part).
 pub fn send_command(state: &mut BotState, target_nick: &str, command: &str) {
     let ti = auth::trusted_bot_by_nick(state, target_nick);
-    b2_send(state, ti, target_nick, command);
+    b2_send(state, ti, target_nick, false, command);
+}
+
+/// The same, always over IRC (PRIVMSG), never relayed by the hub.
+pub fn send_command_irc(state: &mut BotState, target_nick: &str, command: &str) {
+    let ti = auth::trusted_bot_by_nick(state, target_nick);
+    b2_send(state, ti, target_nick, true, command);
 }
 
 /// To the trusted bot whose mask matches `hostmask`, at IRC nick
 /// `target_nick` (a roster nick may carry a collision suffix).
 pub fn send_to_host(state: &mut BotState, hostmask: &str, target_nick: &str, command: &str) {
     let ti = auth::trusted_bot_by_host(state, hostmask);
-    b2_send(state, ti, target_nick, command);
+    b2_send(state, ti, target_nick, false, command);
+}
+
+/// The same, always over IRC (PRIVMSG), never relayed by the hub.
+pub fn send_to_host_irc(state: &mut BotState, hostmask: &str, target_nick: &str, command: &str) {
+    let ti = auth::trusted_bot_by_host(state, hostmask);
+    b2_send(state, ti, target_nick, true, command);
 }
 
 /// A person's op / invite / unban with no hub to ask (or a hub that never
 /// answered): every trusted bot gets it over ~B2; one that is in the channel
 /// and opped does it (user_flags plan section 5).  C
 /// `bot_comms_user_chan_fallback`.
-pub fn user_chan_fallback(state: &mut BotState, kind: &str, chan: &str, nick: &str, mask: &str) {
+pub fn user_chan_fallback(
+    state: &mut BotState,
+    kind: &str,
+    chan: &str,
+    nick: &str,
+    mask: &str,
+    uuid: &str,
+) {
+    // op / invite carry the person's validated mask and uuid: the bot that
+    // acts checks the nick's live mask against them first (2026-11-23)
     let nicks: Vec<String> = state
         .trusted_bots
         .iter()
@@ -401,8 +493,8 @@ pub fn user_chan_fallback(state: &mut BotState, kind: &str, chan: &str, nick: &s
         .collect();
     for tb in nicks {
         let cmd = match kind {
-            "invite" => format!("INVITE {chan} {nick}"),
-            "op" => format!("OPUSER {chan} {nick}"),
+            "invite" => format!("INVITE {chan} {nick} {mask} {uuid}"),
+            "op" => format!("OPUSER {chan} {nick} {mask} {uuid}"),
             "unban" => format!("UNBANUSER {chan} {mask}"),
             _ => continue,
         };

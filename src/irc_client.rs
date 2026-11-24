@@ -29,7 +29,7 @@ use crate::consts::*;
 use crate::cstr::{eq_ic, now, trunc, trunc_string};
 use crate::net::{self, ReadOutcome};
 use crate::state::{BotState, S_AUTHED, S_CONNECTED, ServerBlock, ServerBlockKind, is_rfc_nick};
-use crate::{chanlive, channel, crypto, dcc, hub_client, irc_parser, logm, sendq};
+use crate::{chanlive, channel, crypto, dcc, hub_client, irc_parser, logm, pool, sendq};
 
 /// Unsent bytes past which a server that stopped reading is dropped.
 const IRC_WBUF_MAX: usize = 1024 * 1024;
@@ -560,21 +560,6 @@ pub fn server_block_clear(state: &mut BotState, idx: usize) {
     }
 }
 
-/// -server: call BEFORE server_list is compacted.
-pub fn server_block_remove(state: &mut BotState, idx: usize) {
-    let n = state.server_list.len();
-    if idx >= n {
-        return;
-    }
-    state.server_blocks.remove(idx);
-    state.server_blocks.push(ServerBlock::default());
-    match state.irc_server_idx {
-        Some(i) if i == idx => state.irc_server_idx = None,
-        Some(i) if i > idx => state.irc_server_idx = Some(i - 1),
-        _ => {}
-    }
-}
-
 /// "banned 42m", "throttled 55s", "banned, permanent", or "" if eligible.
 pub fn server_block_desc(state: &BotState, idx: usize) -> String {
     let Some(b) = state.server_blocks.get(idx) else {
@@ -582,6 +567,9 @@ pub fn server_block_desc(state: &BotState, idx: usize) -> String {
     };
     if b.kind == ServerBlockKind::BannedPerm {
         return "banned, permanent".into();
+    }
+    if b.kind == ServerBlockKind::WrongNet && b.until > now() {
+        return format!("wrong network: {}", trunc(&b.reason, 41));
     }
     let now = now();
     if b.kind == ServerBlockKind::None || b.until <= now {
@@ -610,6 +598,17 @@ fn pick_server(state: &mut BotState, now: i64) -> Option<usize> {
         0
     };
     let mut soonest = 0i64;
+    let mut n = n;
+    if !state.hubs.is_empty() && !pool::local_fallback(state) {
+        // Hub-managed: by load on the pool's entries (plan §5.3).
+        let (pick, s) = pool::pick_slot(state, now);
+        soonest = s;
+        if let Some(p) = pick {
+            state.irc_blocked_logged = false;
+            return Some(p);
+        }
+        n = 0; // every slot held: the report below
+    }
     for k in 0..n {
         let i = (start + k) % n;
         let b = &state.server_blocks[i];
@@ -677,6 +676,8 @@ pub fn disconnect(state: &mut BotState) {
     state.status = 0;
     sendq::clear(state);
     chanlive::isupport_reset(state);
+    state.net_check = 0; // the next link is checked afresh
+    pool::link_note(state, "down", None);
     channel::reset_status(state);
 }
 
@@ -868,21 +869,122 @@ pub fn connect(state: &mut BotState) {
         return;
     }
     let attempt_now = now();
-    let Some(pick) = pick_server(state, attempt_now) else {
+    // 'jump <host>' to a host outside a hub-managed bot's pool: once, no slot.
+    let once = !state.jump_once.is_empty();
+    // 'jump <server>': that slot, once
+    let jumped = state
+        .jump_slot1
+        .checked_sub(1)
+        .filter(|&j| j < state.server_list.len());
+    state.jump_slot1 = 0;
+    // The last attempt never registered (refused, unreachable, dropped before
+    // 001): the load-based pick passes over that slot for POOL_FAIL_AVOID.
+    if !state.irc_attempt_ok
+        && let Some(i) = state.irc_server_idx
+        && i < state.server_list.len()
+        && i < state.server_blocks.len()
+        && state.last_irc_attempt != 0
+        && state.server_blocks[i].last_fail < state.last_irc_attempt
+    {
+        state.server_blocks[i].last_fail = attempt_now;
+    }
+    let managed =
+        !state.hubs.is_empty() && !once && jumped.is_none() && !state.server_list.is_empty();
+    // Just started: the cached pool is there before the hub link, but the
+    // load on it is not.  Wait a little for the first view, so a restart does
+    // not pick blind (with every hub down it dials after the wait anyway).
+    // ... but only while a hub link is coming up or up: a bot whose hub dial
+    // failed dials IRC at once (a mass restart with the hubs down must not
+    // take every bot off IRC together, test_80 restart storm).
+    if managed
+        && state.pool_view_at == 0
+        && attempt_now - state.bot_start_time < POOL_VIEW_WAIT
+        && (state.hub_connecting || state.hub_connected)
+    {
         return;
+    }
+    // Hub-managed: a random 0..5 s before each dial, so bots that dropped
+    // together do not all land on the server that was least loaded a moment
+    // ago (plan §5.3).
+    if managed {
+        if state.pool_dial_at == 0 {
+            state.pool_dial_at =
+                attempt_now + crypto::random_index(POOL_DIAL_JITTER as usize) as i64;
+            if state.pool_dial_at > attempt_now {
+                return;
+            }
+        } else if attempt_now < state.pool_dial_at {
+            return;
+        }
+        state.pool_dial_at = 0;
+    }
+    let pick = if once {
+        None
+    } else if jumped.is_some() {
+        jumped
+    } else {
+        pick_server(state, attempt_now)
     };
-    state.current_server_index = pick;
-    state.irc_server_idx = Some(pick);
+    if pick.is_none() && !once {
+        // Hub-managed with nothing to dial (server pool plan §5.6): stay
+        // linked to the hub and wait; servers_rebuild logged the start, this
+        // repeats it hourly.
+        if !state.hubs.is_empty()
+            && state.server_list.is_empty()
+            && attempt_now - state.pool_idle_warned >= POOL_IDLE_WARN_EVERY
+        {
+            state.pool_idle_warned = attempt_now;
+            pool::idle_warn(state);
+        }
+        return; // everything held; pick_server logged why
+    }
+    state.irc_attempt_ok = false; // set again by 001
+    if let Some(p) = pick {
+        state.current_server_index = p;
+    }
+    state.irc_server_idx = pick;
+    // Counted as on this entry before the dial, so other bots picking now see
+    // it (plan §5.3).
+    let entry = pick
+        .and_then(|p| state.dial_uuid.get(p).cloned())
+        .unwrap_or_default();
+    pool::link_note(state, "connecting", Some(&entry));
     state.last_irc_attempt = attempt_now;
     state.irc_refusal.clear();
     state.irc_refusal_ban = false;
     state.nick_refused.clear();
 
-    let server_str = trunc_string(&state.server_list[pick], 256);
-    let (host, ports): (&str, Vec<&str>) = match server_str.rfind(':') {
-        Some(i) => (&server_str[..i], vec![&server_str[i + 1..]]),
-        None => (server_str.as_str(), vec!["6667", "6697"]),
+    let server_str = trunc_string(
+        match pick {
+            Some(p) => &state.server_list[p],
+            None => &state.jump_once,
+        },
+        crate::pool_rec::POOL_HOST_MAX + 16,
+    );
+    state.jump_once.clear();
+    // host[:port], or [v6] / [v6]:port: a bracketed literal's own ':'s are
+    // not the port separator, and the resolver wants it without the brackets.
+    let (host, port): (&str, Option<&str>) = if server_str.starts_with('[') {
+        match server_str.find(']') {
+            Some(rb) => (&server_str[1..rb], server_str[rb + 1..].strip_prefix(':')),
+            None => (server_str.as_str(), None),
+        }
+    } else {
+        match server_str.rfind(':') {
+            Some(i) => (&server_str[..i], Some(&server_str[i + 1..])),
+            None => (server_str.as_str(), None),
+        }
     };
+    // If port specified: only try that port. Otherwise try 6667, then 6697
+    let ports: Vec<&str> = match port.filter(|p| !p.is_empty()) {
+        Some(p) => vec![p],
+        None => vec!["6667", "6697"],
+    };
+    if host.len() >= 256 {
+        // > POOL_HOST_MAX: never from a valid entry
+        logm!(state, L_INFO, "[WARN] Server name too long; skipped.\n");
+        return;
+    }
 
     let vhost = match net::vhost_addr(&state.vhost) {
         Some(Ok(ip)) => Some(ip),
@@ -910,7 +1012,9 @@ pub fn connect(state: &mut BotState) {
         started: 0,
     });
     dial_next(state);
-    state.current_server_index += 1;
+    if !once {
+        state.current_server_index += 1;
+    }
 }
 
 /// Review 16: the IRC dial in flight (C irc_client.c `g_dial`).  connect()
@@ -1415,6 +1519,10 @@ pub fn check_status(state: &mut BotState) {
         return;
     }
     if state.status & S_AUTHED != 0 {
+        pool::netcheck_tick(state);
+        if state.status & S_CONNECTED == 0 {
+            return; // the check dropped this link
+        }
         channel::check_joins(state);
         if !state.nick_change_pending {
             if !eq_ic(&state.current_nick, &state.target_nick)

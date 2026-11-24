@@ -60,7 +60,7 @@ cargo build --release      # target/release/ircbot, keygen, bot-auth
 
 # One directory per bot; config, pid and log live beside the binary
 mkdir ~/bot1 && cp target/release/ircbot ~/bot1/ && cd ~/bot1
-./ircbot -setup            # wizard: password, nick, IRC server, hubs (address + key from `irchub -id`)
+./ircbot -setup            # wizard: password, nick, mode; hubs (address + key from `irchub -id`) or an IRC server
 ./ircbot -id               # print the UUID + public key again (the hub's `bot add` line)
 
 # Register it on a hub's console:  bot add bot1 <uuid> <pubkey>
@@ -74,9 +74,9 @@ kill $(cat .ircbot.pid)    # stop
 
 ## Setup
 
-1. **Set it up.** `./ircbot -setup` asks for a config password, the bot's nick, ident and IRC server, and a mode:
-   - **Hub-managed** (recommended): give each hub's `host:port` and public key. `./irchub -id` on the hub prints both. Admins, opers and channels then come from the hub.
-   - **Standalone**: give the first admin's public key and usermask and a channel. Other standalone bots trust this one with `+bot <nick!user@host> <uuid> <pubkey>`.
+1. **Set it up.** `./ircbot -setup` asks for a config password, the bot's nick and ident, and a mode:
+   - **Hub-managed** (recommended): give each hub's `host:port` and public key. `./irchub -id` on the hub prints both. Admins, opers, channels and the IRC servers then come from the hub; the bot joins IRC after its first sync.
+   - **Standalone**: give an IRC server, the first admin's public key and usermask, and a channel. Other standalone bots trust this one with `+bot <nick!user@host> <uuid> <pubkey>`.
 
    The bot makes its own keypair and prints its UUID and public key. Its private key never leaves the machine.
 2. **Register it** (hub-managed): `bot add <nick> <uuid> <pubkey>` in the hub console.

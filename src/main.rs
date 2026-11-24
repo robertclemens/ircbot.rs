@@ -30,6 +30,8 @@ mod irc_client;
 mod irc_parser;
 mod logging;
 mod net;
+mod pool;
+mod pool_rec;
 mod secret;
 mod sendq;
 mod state;
@@ -358,22 +360,15 @@ fn run_config_wizard() -> io::Result<()> {
         )
         .to_string();
 
-        println!("\n--- Setup IRC Server ---");
-        let server = loop {
-            let s = get_input("Enter IRC server (e.g., irc.efnet.org)", MAX_BUFFER);
-            if s.len() > 3 && s.contains('.') {
-                break s.to_string();
-            }
-            println!("🚨 ERROR: Invalid server format.");
-        };
+        let mut server = String::new();
 
         // A hub-managed bot owns none of the hub-authoritative records, so
         // they are not asked for.
         println!("\n--- Management Mode ---");
-        println!("Hub-managed: admins, usermasks and channels live on the hub and are");
-        println!("  managed on the hub console. This bot only needs hub addresses and");
-        println!("  their pinned public keys.");
-        println!("Standalone:  this bot owns its own admin list and channels.\n");
+        println!("Hub-managed: admins, usermasks, channels and IRC servers live on the");
+        println!("  hub and are managed on the hub console. This bot only needs hub");
+        println!("  addresses and their pinned public keys.");
+        println!("Standalone:  this bot owns its own IRC servers, admin list and channels.\n");
         let hub_managed = !get_input("Hub-managed? (Y/n)", 16).starts_with(['n', 'N']);
 
         let mut chan = String::new();
@@ -384,7 +379,7 @@ fn run_config_wizard() -> io::Result<()> {
             println!("the hub's host prints both (as the '+hub' line), so does 'hub show'");
             println!("in its console. Each hub has its own keypair, so the key is pinned");
             println!("per hub.");
-            while state.hubs.len() < MAX_SERVERS {
+            while state.hubs.len() < MAX_HUBS {
                 println!("\n--- Hub #{} Address ---", state.hubs.len() + 1);
                 let addr = loop {
                     let a = get_input("Enter hub address (e.g., 127.0.0.1:6000)", 256);
@@ -425,8 +420,8 @@ fn run_config_wizard() -> io::Result<()> {
                     });
                     println!("\n✓ Hub added: {addr}");
                 }
-                if state.hubs.len() >= MAX_SERVERS {
-                    println!("Reached hub limit ({MAX_SERVERS}).");
+                if state.hubs.len() >= MAX_HUBS {
+                    println!("Reached hub limit ({MAX_HUBS}).");
                     break;
                 }
                 if !get_input("Add another hub? (y/N)", 16).starts_with(['y', 'Y']) {
@@ -451,6 +446,18 @@ fn run_config_wizard() -> io::Result<()> {
             println!("  the first sync. If your hub does not set opt 'h', you can also");
             println!("  add them later from IRC with '+admin' and 'join'.");
         } else {
+            println!("\n--- Setup IRC Server ---");
+            server = loop {
+                let s = get_input(
+                    "Enter IRC server (e.g., irc.efnet.org or irc.efnet.org:6697)",
+                    MAX_BUFFER,
+                );
+                if s.contains('.') && pool_rec::hostport_parse(&s).is_some() {
+                    break s.to_string();
+                }
+                println!("🚨 ERROR: Invalid server format (host or host:port).");
+            };
+
             println!("\n--- Setup First Admin ---");
             let name = loop {
                 let n = get_input("Enter admin friendly name (no spaces, e.g. admin)", 64);
@@ -516,7 +523,11 @@ fn run_config_wizard() -> io::Result<()> {
         println!("     Configuration Summary (Review)         ");
         println!("==========================================");
         println!("Bot Nick: {}", state.target_nick);
-        println!("IRC Server: {server}");
+        if hub_managed {
+            println!("IRC servers: from the hub pool");
+        } else {
+            println!("IRC Server: {server}");
+        }
         if hub_managed {
             println!(
                 "Mode: HUB-MANAGED ({} hub{})",
@@ -577,7 +588,11 @@ fn run_config_wizard() -> io::Result<()> {
             });
         }
     }
-    state.server_list.push(server);
+    // Standalone: its one local server.  Hub-managed: none -- the hub's pool
+    // arrives with the first sync (server pool plan §5.5a).
+    if !hub_managed && !server.is_empty() {
+        state.local_servers.push(server);
+    }
     if !chan.is_empty()
         && let Some(ci) = channel::add(&mut state, &chan)
     {
@@ -594,6 +609,11 @@ fn run_config_wizard() -> io::Result<()> {
     println!("You can now start the bot:");
     println!("  Run './ircbot -p' to create a machine-bound password file, then './ircbot'");
     println!("  Or run './ircbot' directly and enter the password when prompted.");
+    if hub_managed {
+        println!("\nThis bot joins IRC once its first hub sync brings the server pool.");
+        println!("If the hub has no servers yet, add one on the hub console first");
+        println!("('server add <host[:port]>').");
+    }
     Ok(())
 }
 
@@ -927,6 +947,8 @@ fn run(password: Zeroizing<String>, pid_file: fs::File, self_exe: String) -> i32
             hub_client::connect(&mut state);
             hub_client::heartbeat(&mut state);
             hub_client::user_chan_tick(&mut state); // unanswered person requests -> ~B2
+            channel::own_tick(&mut state); // our own unanswered requests -> ~B2
+            channel::invite_check_tick(&mut state); // invites whose WHO never came back
         }
         hub_client::upgrade_ready_tick(&mut state);
         let exe = state.executable_path.clone();

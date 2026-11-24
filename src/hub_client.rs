@@ -20,10 +20,12 @@ use crate::cstr::{
 };
 use crate::net::{self, ReadOutcome};
 use crate::state::{
-    BotState, BotTreeRow, ChanReq, ChanStatus, HubAuthState, MaskRecord, S_AUTHED, S_CONNECTED,
-    UchanRecord, UflagRecord, UserRecord, lww_accepts, opt_accepts,
+    BotState, BotTreeRow, ChanReq, ChanStatus, HubAuthState, MaskRecord, OWN_REQ_OP, S_AUTHED,
+    S_CONNECTED, UchanRecord, UflagRecord, UserRecord, lww_accepts, opt_accepts,
 };
-use crate::{access, bot_comms, chancfg, chanenf, chanlive, channel, config, ircf, logm, updater};
+use crate::{
+    access, bot_comms, chancfg, chanenf, chanlive, channel, config, ircf, logm, pool, updater,
+};
 
 /// Unsent bytes past which a hub that stopped reading is dropped.
 const HUB_WBUF_MAX: usize = 4 * 1024 * 1024;
@@ -258,6 +260,9 @@ pub fn disconnect(state: &mut BotState) {
     state.hub_connected = false;
     state.hub_authenticated = false;
     state.hub_connecting = false;
+    state.pool_hub_seen = false; // the next hub proves it keeps a pool afresh
+    state.irc_link_sent.clear(); // ...and gets the IRC link state again
+    state.pool_view_at = 0;
     state.hub_connect_time = 0;
     state.hub_auth_state = HubAuthState::None;
     state.hub_session_key.wipe();
@@ -1188,7 +1193,7 @@ fn hublist_line(state: &BotState) -> String {
     use sha2::{Digest, Sha256};
     let mut out = String::from("hl|");
     let mut n = 0;
-    for he in state.hubs.iter().take(MAX_SERVERS) {
+    for he in state.hubs.iter().take(MAX_HUBS) {
         if !he.ed_pub_set {
             continue;
         }
@@ -1346,6 +1351,25 @@ pub fn grant_held_ops(state: &mut BotState, ci: usize) {
     }
 }
 
+/// Whether a frame for bot `uuid` can travel through the hub mesh: the bot
+/// tree the hubs sent us shows that bot linked under a hub.  A bot shown
+/// disconnected, or missing, cannot be reached that way (every hub drops an
+/// OP_REQUEST or a relayed ~B2 for it as "not found locally"), so the caller
+/// goes over IRC instead.  No tree yet: assume the hub can.
+pub fn bot_on_hub(state: &BotState, uuid: &str) -> bool {
+    if uuid.is_empty() {
+        return false;
+    }
+    if state.bot_tree.is_empty() {
+        return true;
+    }
+    state
+        .bot_tree
+        .iter()
+        .find(|r| r.uuid == uuid)
+        .is_some_and(|r| r.kind == 'b')
+}
+
 pub fn request_op(state: &mut BotState, target_uuid: &str, channel: &str) -> bool {
     if !state.hub_connected
         || !state.hub_authenticated
@@ -1384,13 +1408,29 @@ pub fn relay_bot_command(state: &mut BotState, target_uuid: &str, frame_line: &s
     true
 }
 
-/// kind|channel only: the hub resolves our nick and mask itself.
-pub fn send_chan_request(state: &mut BotState, kind: &str, channel: &str) -> bool {
+/// A request id the hub hands back in CMD_USER_CHAN_RESULT: 8 random bytes
+/// as 16 hex ([A-Za-z0-9-], USER_CHAN_RID_MAX).  Not a secret: the hub
+/// answers only on the link the request came in on.
+pub fn new_rid() -> Option<String> {
+    let mut rnd = [0u8; 8];
+    crate::crypto::random_bytes(&mut rnd).then(|| rnd.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// kind|channel (an older hub: it reads the channel with %s, so a third
+/// field would become part of it), or kind|channel|rid, answered.  The hub
+/// resolves our nick and mask itself.
+pub fn send_chan_request(state: &mut BotState, kind: &str, channel: &str, rid: &str) -> bool {
     if !state.hub_connected || !state.hub_authenticated || state.hub.is_none() {
         return false;
     }
-    let payload = format!("{kind}|{channel}");
-    if payload.len() >= MAX_CHAN + 16 || !send_frame(state, CMD_CHAN_REQUEST, payload.as_bytes()) {
+    let payload = if rid.is_empty() {
+        format!("{kind}|{channel}")
+    } else {
+        format!("{kind}|{channel}|{rid}")
+    };
+    if payload.len() >= MAX_CHAN + 16 + USER_CHAN_RID_MAX + 2
+        || !send_frame(state, CMD_CHAN_REQUEST, payload.as_bytes())
+    {
         return false;
     }
     logm!(
@@ -1552,6 +1592,22 @@ pub fn push_channel(state: &mut BotState, ci: usize) {
     } else {
         logm!(state, L_INFO, "[HUB] Failed to push channel {}\n", name);
     }
+}
+
+/// One CMD_BOT_IRC_LINK, if this hub link takes them (it sent an N|).
+pub fn send_irc_link(state: &mut BotState, payload: &str) -> bool {
+    if !state.hub_authenticated || !state.pool_hub_seen {
+        return false;
+    }
+    send_frame(state, CMD_BOT_IRC_LINK, payload.as_bytes())
+}
+
+/// One CMD_SERVER_REPORT, if this hub link takes them.
+pub fn send_server_report(state: &mut BotState, payload: &str) -> bool {
+    if !state.hub_authenticated || !state.pool_hub_seen {
+        return false;
+    }
+    send_frame(state, CMD_SERVER_REPORT, payload.as_bytes())
 }
 
 /// Send complete record lines ("B|...\n", "c|...\n") to the hub as one
@@ -2239,6 +2295,7 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
     let mut has_mask_lines = false;
     let mut has_trust_set = false;
     let mut has_access_lines = false;
+    let mut has_pool_lines = false;
     for l in payload.split('\n') {
         let b = l.as_bytes();
         if l.starts_with("uf|") || l.starts_with("uc|") {
@@ -2248,6 +2305,7 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
                 b'a' | b'o' => has_user_lines = true,
                 b'm' => has_mask_lines = true,
                 b'T' => has_trust_set = true,
+                b'N' | b'S' => has_pool_lines = true,
                 _ => {}
             }
         }
@@ -2268,6 +2326,15 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
     let saved_masks = saved(&mut state.mask_records, has_mask_lines);
     let saved_uflags = saved(&mut state.uflag_records, has_access_lines);
     let saved_uchans = saved(&mut state.uchan_records, has_access_lines);
+    // N|/S|: the hub sends its whole pool (a 2.5.4 hub always sends an N|),
+    // so it replaces ours; the old text tells whether anything changed.
+    let pool_before = if has_pool_lines {
+        let b = pool::format_lines(state);
+        pool::clear(state);
+        b
+    } else {
+        None
+    };
 
     let work = crate::cstr::trunc(payload, MAX_CONFIG_PAYLOAD);
     let mut listed: Vec<String> = Vec::new();
@@ -2364,6 +2431,21 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
             },
             b'b' => sync_bot_line(state, data, &mut listed),
             b'T' => false, // end of the complete trusted-bot list: swept below
+            // N|/S|: the server pool (pool.rs)
+            b'N' | b'S' => {
+                if b[0] == b'N' {
+                    state.pool_hub_seen = true;
+                }
+                if !pool::ingest_line(state, b[0], data) {
+                    logm!(
+                        state,
+                        L_DEBUG,
+                        "[HUB-SYNC] Malformed {}| record ignored\n",
+                        b[0] as char
+                    );
+                }
+                false
+            }
             other => {
                 logm!(
                     state,
@@ -2430,6 +2512,10 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
     updates += user_table_changes(state, &saved_users);
     updates += mask_table_changes(state, &saved_masks);
     updates += access_table_changes(state, &saved_uflags, &saved_uchans);
+    if has_pool_lines && pool::format_lines(state) != pool_before {
+        updates += 1;
+        pool::changed(state);
+    }
 
     if updates > 0 {
         logm!(
@@ -2447,6 +2533,10 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
             "[HUB-SYNC] No updates applied (all timestamps older or equal)\n"
         );
     }
+    // The hub keeps a pool now: offer the local s| lines once (P|1), and tell
+    // it where the IRC link stands.
+    pool::after_hub_config(state);
+    pool::link_resend(state);
 }
 
 // ---- Channel-request election (CMD_CHAN_PROBE / CMD_CHAN_DO) -----------
@@ -2481,7 +2571,7 @@ fn chan_do_nick_ok(n: &str) -> bool {
         .all(|&ch| ch.is_ascii_alphanumeric() || b"[]\\`_^{}|-".contains(&ch))
 }
 
-fn chan_done_send(state: &mut BotState, id: &str, ok: bool, detail: &str) {
+pub(crate) fn chan_done_send(state: &mut BotState, id: &str, ok: bool, detail: &str) {
     let out = format!("{id}|{}|{detail}", if ok { "ok" } else { "fail" });
     if out.len() < 192 {
         send_frame(state, CMD_CHAN_DONE, out.as_bytes());
@@ -2592,6 +2682,63 @@ fn chan_elect_do(state: &mut BotState, payload: &str) {
         return;
     }
     if kind == "op" {
+        // A bot's own op (the requester is a trusted bot): op the nick only
+        // when its hostmask here is that same bot -- never a nick someone
+        // else holds.
+        let req = r.get(3).map_or("", |c| c.s());
+        if crate::auth::trusted_bot_by_uuid(state, req).is_some() {
+            let hm = channel::find(state, chan).and_then(|ci| {
+                state.chans[ci]
+                    .roster
+                    .iter()
+                    .find(|e| eq_ic(&e.nick, nick))
+                    .map(|e| e.hostmask.clone())
+            });
+            let who = hm
+                .as_deref()
+                .and_then(|h| crate::auth::trusted_bot_by_host(state, h))
+                .map(|i| state.trusted_bots[i].uuid.clone());
+            if who.as_deref() != Some(req) {
+                logm!(
+                    state,
+                    L_INFO,
+                    "[CHANREQ] Not opping {} in {}: not the requesting bot here\n",
+                    nick,
+                    chan
+                );
+                chan_done_send(state, id, false, "not the requesting bot");
+                return;
+            }
+        }
+        // A person's op (the requester is a user): the nick's mask here must
+        // be the one the requesting bot validated, and still one of that
+        // user's patterns with rights in the channel.  An admin's console op
+        // is the admin's own word ("ADMIN").
+        if crate::auth::trusted_bot_by_uuid(state, req).is_none() && req != "ADMIN" {
+            let hm = channel::find(state, chan).and_then(|ci| {
+                state.chans[ci]
+                    .roster
+                    .iter()
+                    .find(|e| eq_ic(&e.nick, nick))
+                    .map(|e| e.hostmask.clone())
+            });
+            let ok = !mask.is_empty()
+                && hm.as_deref().is_some_and(|h| {
+                    crate::auth::mask_equal(h, mask)
+                        && crate::auth::user_live_ok(state, req, h, chan)
+                });
+            if !ok {
+                logm!(
+                    state,
+                    L_INFO,
+                    "[CHANREQ] Not opping {} in {}: not the requester here\n",
+                    nick,
+                    chan
+                );
+                chan_done_send(state, id, false, "not the requester");
+                return;
+            }
+        }
         // +bitch (D12): only an authorised member may hold ops.  The hub
         // knows the users but not the nick's hostmask -- this bot does.  A
         // nick we cannot find is not vouched for either (fail closed).
@@ -2635,6 +2782,32 @@ fn chan_elect_do(state: &mut BotState, payload: &str) {
         chan_done_send(state, id, false, "no hostmask to match");
         return;
     }
+    // An invite goes to the nick only once `WHO <nick>` shows the requester's
+    // mask on it: a bot's published mask, or the person's validated one (and
+    // still that user's).  DONE follows the check (channel::invite_check_*).
+    // An admin's console invite is the admin's own word.
+    let req = r.get(3).map_or("", |c| c.s());
+    if k == ChanReq::Invite && req != "ADMIN" {
+        let tb = crate::auth::trusted_bot_by_uuid(state, req)
+            .map(|i| state.trusted_bots[i].mask.clone());
+        let want = tb.clone().unwrap_or_else(|| mask.to_string());
+        if want.is_empty() {
+            chan_done_send(state, id, false, "no hostmask to check");
+            return;
+        }
+        let (id, chan, nick, user) = (
+            id.to_string(),
+            chan.to_string(),
+            nick.to_string(),
+            if tb.is_some() {
+                String::new()
+            } else {
+                req.to_string()
+            },
+        );
+        channel::invite_check_start(state, &id, &chan, &nick, &want, &user);
+        return;
+    }
     channel::access_service(state, id, k, chan, Some(nick), Some(mask), None);
     chan_done_send(
         state,
@@ -2664,11 +2837,9 @@ pub fn send_user_chan_request(
     if !state.hub_connected || !state.hub_authenticated || state.hub.is_none() {
         return false;
     }
-    let mut rnd = [0u8; 8];
-    if !crate::crypto::random_bytes(&mut rnd) {
+    let Some(rid) = new_rid() else {
         return false;
-    }
-    let rid: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
+    };
     let payload = format!("{rid}|{kind}|{chan}|{user_uuid}|{nick}|{mask}");
     if payload.len() >= MAX_BUFFER {
         return false;
@@ -2683,6 +2854,7 @@ pub fn send_user_chan_request(
         chan: trunc_string(chan, MAX_CHAN),
         nick: trunc_string(nick, MAX_MEMBER_NICK),
         mask: trunc_string(mask, MAX_MASK_LEN),
+        uuid: trunc_string(user_uuid, 37),
         sent: crate::cstr::now(),
     };
     if state.user_chan_pending.len() < USER_CHAN_PENDING {
@@ -2728,6 +2900,8 @@ fn user_chan_result(state: &mut BotState, payload: &str) {
     let rid = trunc_string(rid, USER_CHAN_RID_MAX + 1);
     let status = trunc_string(status, 8);
     let Some(i) = state.user_chan_pending.iter().position(|p| p.rid == rid) else {
+        // not a person's: maybe one of our own (op / invite / key / unban)
+        channel::own_result(state, &rid, &status, &detail);
         return;
     };
     let p = state.user_chan_pending.remove(i);
@@ -2778,7 +2952,7 @@ pub fn user_chan_tick(state: &mut BotState) {
             p.nick,
             p.chan
         );
-        bot_comms::user_chan_fallback(state, &p.kind, &p.chan, &p.nick, &p.mask);
+        bot_comms::user_chan_fallback(state, &p.kind, &p.chan, &p.nick, &p.mask, &p.uuid);
     }
 }
 
@@ -2796,6 +2970,11 @@ fn handle_response(state: &mut BotState, cmd: u8, payload: &str) {
         CMD_ACTIVITY_REPLY => crate::commands::activity_reply(state, payload),
         CMD_USER_CHAN_RESULT => user_chan_result(state, payload),
         CMD_CONFIG_PULL => logm!(state, L_INFO, "[HUB] Hub requested config sync\n"),
+        CMD_POOL_VIEW => {
+            if !payload.is_empty() {
+                pool::view_apply(state, payload);
+            }
+        }
         // CMD_CONFIG_DATA / CMD_CONFIG_DELTA arrive as raw bytes: config_frame.
         CMD_UPDATE_PUBKEY => {}
         CMD_BOT_KEY_UPDATE => {
@@ -2879,6 +3058,13 @@ fn handle_response(state: &mut BotState, cmd: u8, payload: &str) {
             for c in state.chans.iter_mut().filter(|c| c.op_request_pending) {
                 c.op_request_pending = false;
                 c.last_op_request_time = t;
+            }
+            // the old path (an older hub) said no: ask over IRC now
+            for ci in 0..state.chans.len() {
+                let c = &state.chans[ci];
+                if c.own_sent[OWN_REQ_OP] != 0 && c.own_rid[OWN_REQ_OP].is_empty() {
+                    channel::own_failback(state, ci, OWN_REQ_OP, "the hub's op request failed");
+                }
             }
         }
         CMD_CHAN_PROBE => {

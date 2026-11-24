@@ -108,14 +108,35 @@ pub const IRC_BAN_GRACE: i64 = 30;
 pub const CONNECT_TIMEOUT_SECS: u64 = 10;
 
 // ---- Limits ------------------------------------------------------------------
-pub const MAX_SERVERS: usize = 10;
+/// Server pool (irchub docs/plans/2026-10-29_server_pool_plan.md, 2.5.4).
+/// Mirrors irchub/hub.h: one N| per network, live S| entries and their
+/// tombstones, as the hub sends them (the whole set, replaced wholesale).
+pub const MAX_NETWORKS: usize = 4;
+pub const MAX_POOL_SERVERS: usize = 64;
+pub const MAX_POOL_TOMBS: usize = 64;
+/// pool_rec::POOL_N_LINE_MAX / POOL_S_LINE_MAX, spelled out here: the
+/// testnet's config tools build this file on its own (no crate::pool_rec).
+/// pool.rs tests that the two agree.
+pub const POOL_N_LINE_MAX_CFG: usize = 2 + 16 + 32 + 64 + 8 * (64 + 1) + 4 + 3 + 20 + 16;
+pub const POOL_S_LINE_MAX_CFG: usize = 2 + 36 + 16 + 253 + 5 + 3 + 4 + 8 + 64 + 3 + 20 + 16;
+pub const POOL_RECORDS_MAX: usize =
+    MAX_NETWORKS * POOL_N_LINE_MAX_CFG + (MAX_POOL_SERVERS + MAX_POOL_TOMBS) * POOL_S_LINE_MAX_CFG;
+/// s between "no usable server" warnings
+pub const POOL_IDLE_WARN_EVERY: i64 = 3600;
+/// IRC servers a bot holds: its local s| list (standalone) and its dial list
+/// (the hub pool when hub-managed).  = MAX_POOL_SERVERS (server pool plan D16:
+/// the largest public networks run a few dozen client servers).
+pub const MAX_SERVERS: usize = 64;
+/// Hubs a bot links to (hubs[], the hl| list).  Was MAX_SERVERS before 2.5.4;
+/// kept at 10 so the hl| value the hubs validate (HL_ENTRIES_MAX) is unchanged.
+pub const MAX_HUBS: usize = 10;
 pub const MAX_USER_RECORDS: usize = 40;
 pub const MAX_USER_MASKS: usize = 200;
 /// Admin flags and oper channel bindings (irchub docs/plans/
 /// 2026-10-16_user_flags_plan.md §3.1), mirrored from irchub/hub.h: the
 /// letters in canonical order, one uf| per user, uc| live + tombstones, the
 /// migration stamp.
-pub const USER_FLAG_LETTERS: &str = "abchou";
+pub const USER_FLAG_LETTERS: &str = "abchosu"; // s: server pool (2.5.4)
 pub const MAX_USER_FLAGS: usize = MAX_USER_RECORDS;
 pub const MAX_CHAN_BINDS: usize = 400;
 pub const USER_ACCESS_MIGRATE_TS: i64 = 1;
@@ -147,7 +168,8 @@ pub const CFG_MAX_GLOBALS: usize = 64;
 pub const HL_ADDR_MAX: usize = 80;
 /// hex of SHA-256(hub Ed25519 key)[0..8]
 pub const HL_FP_LEN: usize = 16;
-pub const CFG_BOT_SYNC_FIELDS: usize = 8;
+/// hub.h BOT_SYNC_FIELDS: {t,n,h,pub,seen,d,hl,pm} + slack
+pub const CFG_BOT_SYNC_FIELDS: usize = 9;
 pub const CFG_PAYLOAD_SLACK: usize = 8192;
 // modes.md section 2: C| (per channel), D| (one) and B| (bans) lines.  The
 // ceiling stays derived from these macros, so the C| / D| / B| ingest caps
@@ -176,6 +198,7 @@ pub const MAX_CONFIG_PAYLOAD: usize = CFG_MAX_GLOBALS * CFG_GLOBAL_LINE_MAX
     + MAX_CHAN_BINDS * CFG_UC_LINE_MAX
     + CFG_BOT_SYNC_FIELDS * CFG_BOT_FIELD_LINE
     + MAX_TRUSTED_BOTS * CFG_BLINE_MAX
+    + POOL_RECORDS_MAX
     + CFG_PAYLOAD_SLACK;
 /// Largest inbound hub frame = envelope(5) + payload + GCM tag, plus margin.
 pub const MAX_HUB_FRAME: usize = MAX_CONFIG_PAYLOAD + 64;
@@ -319,6 +342,32 @@ pub const CHAN_DO_NICK_MAX: usize = 30;
 //              Free text (setter, topic, key) is the rest of its own line.
 //              The body is split anywhere into chunks; the hub joins them.
 pub const CMD_CHAN_WHO: u8 = 0x95;
+/// Server pool (2.5.4).  Bot -> hub, only to a hub that sent this link an N|
+/// (pool_hub_seen): what the NETWORK= check found on a pool entry.
+///   <entry_uuid>|<kind>|<network>|<server>   kind ok / wrongnet / unverified
+/// Mirrors irchub/hub.h.
+pub const CMD_SERVER_REPORT: u8 = 0x86;
+/// Bot -> hub, volatile, gated like CMD_SERVER_REPORT: the IRC link's state.
+///   <net_id>|<entry_uuid or ->|<connecting|up|down|idle>|<vs>
+/// vs (servers the bot sees friends on, split detection) is empty until 2.5.5.
+/// Mirrors irchub/hub.h.
+pub const CMD_BOT_IRC_LINK: u8 = 0x96;
+/// Hub -> bot: the load on each pool entry, E|<entry_uuid>|<up>|<connecting>
+/// per line, whole each time (pool.rs view_apply).  Mirrors irchub/hub.h.
+pub const CMD_POOL_VIEW: u8 = 0x85;
+/// dials wait 0..POOL_DIAL_JITTER-1 s (herding)
+pub const POOL_DIAL_JITTER: i64 = 6;
+/// s after start a hub-managed bot waits for its first CMD_POOL_VIEW before
+/// dialing (else it picks blind)
+pub const POOL_VIEW_WAIT: i64 = 5;
+/// s after 001 to decide without 376/422
+pub const NETCHECK_WAIT: i64 = 30;
+/// s a wrong-network server is skipped
+pub const WRONGNET_HOLD: i64 = 3600;
+/// s a slot that failed is passed over
+pub const POOL_FAIL_AVOID: i64 = 120;
+/// S| push frames split at line boundaries
+pub const POOL_PUSH_CHUNK: usize = 8192;
 /// Body bytes per CHAN_WHO frame.
 pub const CHAN_WHO_CHUNK: usize = 8192;
 /// A topic is kept to this (IRC caps ~390).
