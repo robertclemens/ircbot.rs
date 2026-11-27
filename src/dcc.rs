@@ -17,7 +17,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use zeroize::Zeroize;
 
 use crate::consts::*;
-use crate::cstr::{Tok, eq_ic, now, trunc_string};
+use crate::cstr::{Tok, eq_ic, irc_eq, now, trunc_string};
 use crate::net;
 use crate::state::BotState;
 use crate::{commands, crypto, ircf, logm};
@@ -351,7 +351,7 @@ pub fn handle_ctcp(state: &mut BotState, user_host: &str, ctcp: &str) {
     let si = state
         .dcc
         .iter()
-        .position(|s| s.phase == DccPhase::Offered && eq_ic(&s.user_host, user_host));
+        .position(|s| s.phase == DccPhase::Offered && irc_eq(&s.user_host, user_host));
     let Some(i) = si.filter(|_| shape_ok) else {
         logm!(
             state,

@@ -18,7 +18,7 @@
 use zeroize::Zeroizing;
 
 use crate::consts::*;
-use crate::cstr::{Tok, eq_ic, now, trunc_string};
+use crate::cstr::{Tok, eq_ic, irc_eq, now, trunc_string};
 use crate::state::{BotState, CS_COUNT, CsetId, FL_COUNT, FloodKind, lww_next_ts};
 use crate::{chancfg, chanenf, chanlive, channel, hub_client, ircf};
 
@@ -672,7 +672,7 @@ pub fn bans(state: &mut BotState, nick: &str, args: Option<&str>) {
         if !b.active {
             continue;
         }
-        if chan.is_some_and(|c| !eq_ic(&b.chan, c) && b.chan != "*") {
+        if chan.is_some_and(|c| !irc_eq(&b.chan, c) && b.chan != "*") {
             continue;
         }
         if b.expires != 0 && b.expires <= t {

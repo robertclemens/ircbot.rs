@@ -92,11 +92,22 @@ pub const IRC_REGISTER_TIMEOUT: i64 = 90;
 /// Still under a nick over 9 bytes by then: reconnect (10b).
 pub const NICK_OVERLONG_TIMEOUT: i64 = 60;
 pub const ROSTER_REFRESH_INTERVAL: i64 = 120;
+/// Hub dialing (2.5.4): each known hub once per round, in random order; a
+/// failed dial / handshake moves on to the next untried hub at once.  Only a
+/// whole round that failed waits: HUB_RECONNECT_DELAY, doubling per failed
+/// round up to HUB_ROUND_BACKOFF_MAX, plus 0..HUB_ROUND_JITTER-1 s.  A link
+/// that was up and dropped redials a different hub within HUB_DROP_JITTER s.
 pub const HUB_RECONNECT_DELAY: i64 = 30;
+pub const HUB_ROUND_BACKOFF_MAX: i64 = 120;
+pub const HUB_ROUND_JITTER: usize = 10;
+pub const HUB_DROP_JITTER: usize = 3;
 /// A hub link not authenticated this long after its connect is dropped: an
 /// endpoint that took the TCP connection and never finished the handshake
 /// kept the bot on it for good (`connect` waits while a link is set).
-pub const HUB_AUTH_TIMEOUT: i64 = 15;
+pub const HUB_AUTH_TIMEOUT: i64 = 10;
+/// A hub address that does not take the TCP connect in this long is given up
+/// for the next; so is a hub that took it and sent no challenge (frozen).
+pub const HUB_DIAL_TIMEOUT: i64 = 5;
 pub const IRC_RECONNECT_MIN_INTERVAL: i64 = 10;
 pub const IRC_THROTTLE_BACKOFF: i64 = 60;
 pub const IRC_THROTTLE_BACKOFF_MAX: i64 = 1800;
@@ -117,10 +128,13 @@ pub const MAX_POOL_TOMBS: usize = 64;
 /// pool_rec::POOL_N_LINE_MAX / POOL_S_LINE_MAX, spelled out here: the
 /// testnet's config tools build this file on its own (no crate::pool_rec).
 /// pool.rs tests that the two agree.
-pub const POOL_N_LINE_MAX_CFG: usize = 2 + 16 + 32 + 64 + 8 * (64 + 1) + 4 + 3 + 20 + 16;
+pub const POOL_N_LINE_MAX_CFG: usize = 2 + 16 + 32 + 64 + 8 * (64 + 1) + 4 + 3 + 3 + 20 + 16;
 pub const POOL_S_LINE_MAX_CFG: usize = 2 + 36 + 16 + 253 + 5 + 3 + 4 + 8 + 64 + 3 + 20 + 16;
-pub const POOL_RECORDS_MAX: usize =
-    MAX_NETWORKS * POOL_N_LINE_MAX_CFG + (MAX_POOL_SERVERS + MAX_POOL_TOMBS) * POOL_S_LINE_MAX_CFG;
+/// pool_rec::POOL_R_LINE_MAX: the hubs' R| server order.
+pub const POOL_R_LINE_MAX_CFG: usize = 2 + 8 + 4 + 4 + 3 + 4 + 64 * (36 + 1) + 20 + 16;
+pub const POOL_RECORDS_MAX: usize = MAX_NETWORKS * POOL_N_LINE_MAX_CFG
+    + (MAX_POOL_SERVERS + MAX_POOL_TOMBS) * POOL_S_LINE_MAX_CFG
+    + POOL_R_LINE_MAX_CFG;
 /// s between "no usable server" warnings
 pub const POOL_IDLE_WARN_EVERY: i64 = 3600;
 /// IRC servers a bot holds: its local s| list (standalone) and its dial list
@@ -162,6 +176,8 @@ pub const CFG_MASK_LINE_MAX: usize = 352;
 pub const CFG_UF_LINE_MAX: usize = 96; // uf|<uuid>|<flags>|<ts>
 pub const CFG_UC_LINE_MAX: usize = 160; // uc|<uuid>|<chan>|add/del|<ts>
 pub const CFG_BLINE_MAX: usize = 448;
+/// hm|<ts>|<mask>: the bot's own mask as its hub holds it.
+pub const CFG_HM_LINE_MAX: usize = 3 + 20 + 1 + MAX_MASK_LEN + 1;
 pub const CFG_MAX_GLOBALS: usize = 64;
 /// hl|<addr>/<fp>,...: the hubs this bot dials, in every config push, for the
 /// hub console's hub del preview.  Mirrors irchub's hub.h.
@@ -198,6 +214,7 @@ pub const MAX_CONFIG_PAYLOAD: usize = CFG_MAX_GLOBALS * CFG_GLOBAL_LINE_MAX
     + MAX_CHAN_BINDS * CFG_UC_LINE_MAX
     + CFG_BOT_SYNC_FIELDS * CFG_BOT_FIELD_LINE
     + MAX_TRUSTED_BOTS * CFG_BLINE_MAX
+    + CFG_HM_LINE_MAX
     + POOL_RECORDS_MAX
     + CFG_PAYLOAD_SLACK;
 /// Largest inbound hub frame = envelope(5) + payload + GCM tag, plus margin.
@@ -352,14 +369,25 @@ pub const CMD_SERVER_REPORT: u8 = 0x86;
 /// vs (servers the bot sees friends on, split detection) is empty until 2.5.5.
 /// Mirrors irchub/hub.h.
 pub const CMD_BOT_IRC_LINK: u8 = 0x96;
-/// Hub -> bot: the load on each pool entry, E|<entry_uuid>|<up>|<connecting>
-/// per line, whole each time (pool.rs view_apply).  Mirrors irchub/hub.h.
-pub const CMD_POOL_VIEW: u8 = 0x85;
-/// dials wait 0..POOL_DIAL_JITTER-1 s (herding)
+// 0x85: reserved (an unreleased load view, replaced by the R| order).
+/// Hub -> bot (2.5.4, payload = the bot's uuid): `server rebalance force` --
+/// reconnect to the first server of the R| order unless on it already.
+/// Mirrors irchub/hub.h.
+pub const CMD_BOT_MOVE: u8 = 0x98;
+// 0x99 is CMD_CHAN_ELECT_END (hub <-> hub only).
+/// Bot -> Hub: its channels, one token each (bot show).
+pub const CMD_BOT_CHAN_STATE: u8 = 0x9A;
+/// Hub -> Bot: dial this pinned hub next (bot move).
+pub const CMD_BOT_HUB_MOVE: u8 = 0x9B;
+/// no R| under an older hub: 0..5 s
 pub const POOL_DIAL_JITTER: i64 = 6;
-/// s after start a hub-managed bot waits for its first CMD_POOL_VIEW before
-/// dialing (else it picks blind)
-pub const POOL_VIEW_WAIT: i64 = 5;
+/// s: a hub-managed bot with no R| order yet waits 0..29 s before a dial, so
+/// siblings that start together without a hub do not burst one server
+pub const POOL_NO_ORDER_JITTER: i64 = 30;
+/// s after start a hub-managed bot waits for its hub's config before the
+/// first IRC dial -- only while a hub link is coming up or up, or the round's
+/// next hub is about to be dialed
+pub const HUB_SYNC_WAIT: i64 = 10;
 /// s after 001 to decide without 376/422
 pub const NETCHECK_WAIT: i64 = 30;
 /// s a wrong-network server is skipped
@@ -446,6 +474,40 @@ pub const JOB_COUNT: usize = 5;
 pub const JOB_STEP_MS: i64 = 1500; // backup delay = backup index x this
 pub const MAX_PENDING_JOBS: usize = 32;
 pub const JOB_MAX_AGE_MS: i64 = 30000; // a pending job older than this is dropped
+/// A join flood's kick+ban waits this long first: a bot's own join lands
+/// before the hub has told the other bots its hostmask, and the job's
+/// run-time check drops it once the joiner turns out to be a trusted bot.
+pub const JOIN_FLOOD_GRACE_MS: i64 = 5000;
+/// The join gate (channel::join_gate_ready): a hub-linked bot joins no
+/// channel until the other bots can know its displayed mask.  Its own 352
+/// first; a mask its hub already holds (hm|) joins at once; a new one waits
+/// for the hub's hm| to carry it, then JOIN_GATE_SETTLE for the mesh fan-out.
+/// A hub that sends no hm| (older than 2.5.4) gets the settle alone.
+/// JOIN_GATE_MAX caps the wait so a lost confirmation only delays joins.
+pub const JOIN_GATE_SETTLE: i64 = 3;
+/// CMD_BOT_CHAN_STATE (channel::chan_state_tick): one token per managed
+/// channel, `@#a` opped, `%#a` halfop, `+#a` voiced, `#a` in, `-#a:<why>` out;
+/// sent when it changes, at most once per CHAN_STATE_DEBOUNCE seconds, and
+/// again after every hub link.  RFC 2812 channel names hold no ',' ':' ' ';
+/// a list that does not fit ends ",~N" (N more).
+pub const CHAN_STATE_DEBOUNCE: i64 = 5;
+pub const CHAN_STATE_WHY_MAX: usize = 12;
+pub const BOT_CHAN_STATE_MAX: usize = CFG_MAX_CHANNELS * (MAX_CHAN + CHAN_STATE_WHY_MAX + 3) + 1;
+pub const JOIN_GATE_MAX: i64 = 20;
+/// Automatic bans this bot placed (flood, revenge), kept so it can lift its
+/// own ban when the banned nick!user@host becomes a trusted bot later.
+pub const AUTO_BAN_TRACK: usize = 16;
+/// Contributors remembered per host's join window (chanflood::trusted
+/// subtracts only a trusted bot's own joins).
+pub const FLOOD_JOIN_CONTRIB: usize = 4;
+/// NETWORK= link proof (pool::netproof_*): a server whose NETWORK= is not the
+/// pool's is used anyway once a trusted bot on a verified server, reached
+/// over IRC, WHOISes us and names our own server; else WRONGNET_HOLD.
+pub const NETPROOF_WAIT: i64 = 20;
+pub const NETPROOF_PEERS: usize = 3;
+pub const NETPROOF_PEND: usize = 4;
+pub const NETPROOF_NONCE_HEX: usize = 32;
+pub const AUTO_BAN_KEEP_MS: i64 = 600_000; // 10 min
 pub const ENF_SWEEP_SECS: i64 = 5; // per-channel state sweep when nothing happened
 /// Idle clocks (ban_track, grown on demand): one per channel x listed ban, so a
 /// network ban on "*" costs one per channel.  The ceiling covers every

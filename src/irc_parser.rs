@@ -2,7 +2,7 @@
 
 use crate::botflood::{self, Bf};
 use crate::consts::*;
-use crate::cstr::{Tok, eq_ic, now, starts_with_ic, trunc, trunc_string};
+use crate::cstr::{Tok, eq_ic, irc_eq, now, starts_with_ic, trunc, trunc_string};
 use crate::state::{BotState, ChanReq, ChanStatus, M_I, M_K, OWN_REQ_OP, RosterEntry, S_AUTHED};
 use crate::{
     auth, bot_comms, chanenf, chanflood, chanlive, channel, commands, crypto, dcc, hub_client,
@@ -55,11 +55,11 @@ fn handle_mode_change(state: &mut BotState, channel: &str, modes: &str, args: &s
         match mode {
             'o' if has_arg && current_arg.is_some() => {
                 let arg = current_arg.unwrap_or_default();
-                if eq_ic(arg, &state.current_nick) {
+                if irc_eq(arg, &state.current_nick) {
                     let me = state.current_nick.clone();
                     let c = &mut state.chans[ci];
                     c.i_am_opped = adding;
-                    if let Some(r) = c.roster.iter_mut().find(|r| eq_ic(&r.nick, &me)) {
+                    if let Some(r) = c.roster.iter_mut().find(|r| irc_eq(&r.nick, &me)) {
                         r.is_op = adding;
                     }
                     if adding {
@@ -91,7 +91,7 @@ fn handle_mode_change(state: &mut BotState, channel: &str, modes: &str, args: &s
                 } else if let Some(r) = state.chans[ci]
                     .roster
                     .iter_mut()
-                    .find(|r| eq_ic(&r.nick, arg))
+                    .find(|r| irc_eq(&r.nick, arg))
                 {
                     r.is_op = adding;
                     logm!(
@@ -143,9 +143,9 @@ fn handle_mode_change(state: &mut BotState, channel: &str, modes: &str, args: &s
 /// Record our own hostmask -- only ever from our 352 entry or our JOIN
 /// echo, both strings the server shows OTHER clients verbatim.  Pushes to
 /// the hub only when the value actually changes.
-fn update_own_hostmask(state: &mut BotState, mask: &str) {
+fn update_own_hostmask(state: &mut BotState, mask: &str) -> bool {
     if mask.is_empty() || state.actual_hostname == mask {
-        return;
+        return false;
     }
     state.actual_hostname = trunc_string(mask, MAX_MASK_LEN);
     state.actual_hostname_ts = now();
@@ -157,7 +157,9 @@ fn update_own_hostmask(state: &mut BotState, mask: &str) {
     );
     if state.hub_connected && state.hub_authenticated {
         hub_client::sync_hostmask(state);
+        return true;
     }
+    false
 }
 
 /// `WHO <nick>`: answered by a 352 carrying the nick!ident@host other
@@ -241,6 +243,20 @@ pub fn handle_line(state: &mut BotState, line: &str) {
         // when the link drops.
         "465" | "463" => irc_client::note_refusal(state, irc_trailing(params), true),
         "ERROR" => irc_client::note_refusal(state, irc_trailing(params), false),
+        // RPL_ISON "<me> :nick nick ..." -- the link proof's question
+        "303" => {
+            if let Some((_, rest)) = params.split_once(' ') {
+                pool::netproof_ison(state, rest);
+            }
+        }
+        // RPL_WHOISSERVER "<me> <nick> <server> :info" -- a link proof answer
+        "312" => {
+            let mut t = Tok::new(params);
+            t.next(" ");
+            if let (Some(n), Some(srv)) = (t.next(" "), t.next(" ")) {
+                pool::netproof_whois_server(state, n, srv);
+            }
+        }
         "474" => on_lockout(state, params, ChanReq::Unban),
         "475" => on_lockout(state, params, ChanReq::Key),
         // RPL_ISUPPORT: MODES, MAXLIST, PREFIX, CHANMODES for the send queue
@@ -285,6 +301,7 @@ pub fn handle_line(state: &mut BotState, line: &str) {
                 && let Some(ci) = channel::find(state, ch)
             {
                 state.chans[ci].join_disabled = true;
+                state.chans[ci].out_why = "disabled".to_string();
                 logm!(
                     state,
                     L_INFO,
@@ -293,7 +310,21 @@ pub fn handle_line(state: &mut BotState, line: &str) {
                 );
             }
         }
+        // ERR_CHANNELISFULL: +l reached; the join retry keeps trying, the
+        // reason is only shown (bot show).
+        "471" => {
+            if let Some(ch) = second_tok(params)
+                && let Some(ci) = channel::find(state, ch)
+            {
+                state.chans[ci].out_why = "full".to_string();
+            }
+        }
         "473" => {
+            if let Some(ch) = second_tok(params)
+                && let Some(ci) = channel::find(state, ch)
+            {
+                state.chans[ci].out_why = "invite".to_string();
+            }
             if let Some(ch) = second_tok(params)
                 && let Some(ci) = channel::find(state, ch).filter(|&ci| state.chans[ci].is_managed)
             {
@@ -339,7 +370,7 @@ pub fn handle_line(state: &mut BotState, line: &str) {
         "PART" => {
             if let Some(p) = prefix {
                 let nick = Tok::new(p).next("!");
-                if let Some(n) = nick.filter(|n| !eq_ic(n, &state.current_nick)) {
+                if let Some(n) = nick.filter(|n| !irc_eq(n, &state.current_nick)) {
                     let pc = params.strip_prefix(':').unwrap_or(params);
                     let pc = pc.split(' ').next().unwrap_or("");
                     if !pc.is_empty() && pc.len() < MAX_CHAN {
@@ -347,7 +378,7 @@ pub fn handle_line(state: &mut BotState, line: &str) {
                     }
                 }
                 // our own PART only (see JOIN)
-                if nick.is_some_and(|n| eq_ic(n, &state.current_nick)) {
+                if nick.is_some_and(|n| irc_eq(n, &state.current_nick)) {
                     let chan_name = params.strip_prefix(':').unwrap_or(params);
                     let chan_name = chan_name.split(' ').next().unwrap_or("");
                     if let Some(ci) = channel::find(state, chan_name) {
@@ -368,10 +399,11 @@ pub fn handle_line(state: &mut BotState, line: &str) {
                 chanenf::on_kick(state, ch, prefix, kicked);
             }
             if let (Some(ch), Some(kicked)) = (ch, kicked)
-                && eq_ic(kicked, &state.current_nick)
+                && irc_eq(kicked, &state.current_nick)
                 && let Some(ci) = channel::find(state, ch)
             {
                 state.chans[ci].status = ChanStatus::Out;
+                state.chans[ci].out_why = "kicked".to_string();
                 state.chans[ci].i_am_opped = false;
                 chanlive::live_reset(&mut state.chans[ci]);
             }
@@ -393,6 +425,7 @@ pub fn handle_line(state: &mut BotState, line: &str) {
 fn on_welcome(state: &mut BotState, params: &str) {
     state.status |= S_AUTHED;
     irc_client::note_registered(state);
+    channel::join_gate_irc_up(state); // no JOIN until our mask is known
     // 001's first parameter is the nick the server actually registered.
     let srv_nick = params.split(' ').next().unwrap_or("");
     // Registered under anything but the target nick is news for the hub even
@@ -411,7 +444,7 @@ fn on_welcome(state: &mut BotState, params: &str) {
     let renamed = state.current_nick != srv_nick;
     if !srv_nick.is_empty()
         && srv_nick.len() < MAX_NICK
-        && (renamed || !eq_ic(srv_nick, &state.target_nick))
+        && (renamed || !irc_eq(srv_nick, &state.target_nick))
     {
         if renamed {
             logm!(
@@ -449,8 +482,8 @@ fn on_nick_refused(state: &mut BotState, command: &str, params: &str) {
     // 432 is final for that nick on this server: stop re-sending it.
     if let Some(r) = refused
         && command == "432"
-        && eq_ic(r, &state.target_nick)
-        && !eq_ic(&state.nick_refused, r)
+        && irc_eq(r, &state.target_nick)
+        && !irc_eq(&state.nick_refused, r)
     {
         state.nick_refused = state.target_nick.clone();
         logm!(
@@ -475,6 +508,12 @@ fn on_lockout(state: &mut BotState, params: &str, kind: ChanReq) {
         return;
     };
     state.chans[ci].status = ChanStatus::Out;
+    state.chans[ci].out_why = if matches!(kind, ChanReq::Unban) {
+        "banned"
+    } else {
+        "key"
+    }
+    .to_string();
     if state.chans[ci].is_managed {
         match kind {
             ChanReq::Unban => logm!(
@@ -495,7 +534,9 @@ fn on_lockout(state: &mut BotState, params: &str, kind: ChanReq) {
 }
 
 fn on_mode(state: &mut BotState, prefix: Option<&str>, params: &str) {
-    let mut t = Tok::new(params);
+    // "MODE #c +o :nick" / "MODE #c :+nt"
+    let params = crate::cstr::irc_untrail(params);
+    let mut t = Tok::new(&params);
     let target = t.next(" ");
     let modes = t.next(" ");
     let args = t.rest().unwrap_or("");
@@ -545,7 +586,7 @@ fn on_who_reply(state: &mut BotState, params: &str) {
             .is_some_and(|sym| modes.as_bytes().contains(&sym))
     };
     let (is_halfop, is_voice) = (prefix_sym('h'), prefix_sym('v'));
-    let is_me = eq_ic(nick, &state.current_nick);
+    let is_me = irc_eq(nick, &state.current_nick);
 
     // An invite waiting on this nick's live mask (channel::invite_check_*).
     channel::invite_check_who(state, nick, ident, host);
@@ -553,21 +594,39 @@ fn on_who_reply(state: &mut BotState, params: &str) {
     // Self-mask capture first: the reply to `WHO <nick>` has "*" as channel.
     if is_me {
         let self_mask = trunc_string(&format!("{nick}!{ident}@{host}"), MAX_MASK_LEN);
-        update_own_hostmask(state, &self_mask);
+        let pushed = update_own_hostmask(state, &self_mask);
+        channel::join_gate_own_mask(state, &self_mask, pushed);
     }
     let Some(ci) = channel::find(state, chan_name) else {
         return;
     };
     let c = &mut state.chans[ci];
     // Own op status even when the roster is full.
+    let mut newly_opped = false;
     if is_me {
+        newly_opped = is_op && !c.i_am_opped;
         c.i_am_opped = is_op;
+        // an op whose MODE line we missed: act on it as on the MODE
+        if newly_opped {
+            c.op_request_pending = false;
+            c.op_request_retry_count = 0;
+        }
     }
     // add, or replace the entry a JOIN already made (chanenf.rs keeps the
     // roster current between WHOs)
     let who = format!("{nick}!{ident}@{host}");
     if who.len() < MAX_MASK_LEN {
         chanenf::roster_set(c, nick, &who, is_op, is_halfop, is_voice);
+    }
+    if newly_opped {
+        let name = state.chans[ci].name.clone();
+        logm!(
+            state,
+            L_INFO,
+            "[INFO] I am now OP in {} (seen in WHO)\n",
+            name
+        );
+        hub_client::grant_held_ops(state, ci);
     }
 }
 
@@ -684,14 +743,6 @@ fn on_end_of_who(state: &mut BotState, params: &str) {
     }
 
     let chosen = helpers[crypto::random_index(helpers.len())].clone();
-    logm!(
-        state,
-        L_INFO,
-        "[INFO] Found {} trusted ops. Randomly selected: {}. Sending OPME request (attempt {}).\n",
-        helpers.len(),
-        chosen.nick,
-        state.chans[ci].op_request_retry_count + 1
-    );
     state.chans[ci].last_op_request_time = now;
     state.chans[ci].op_request_pending = true;
 
@@ -703,9 +754,11 @@ fn on_end_of_who(state: &mut BotState, params: &str) {
         if sent_via_hub {
             logm!(
                 state,
-                L_DEBUG,
-                "[OP-REQ] Asked the hub's election for ops in {}\n",
-                name
+                L_INFO,
+                "[OP-REQ] Need ops in {} ({} trusted ops here): asked the hub's election (attempt {})\n",
+                name,
+                helpers.len(),
+                state.chans[ci].op_request_retry_count + 1
             );
         } else {
             logm!(
@@ -729,6 +782,16 @@ fn on_end_of_who(state: &mut BotState, params: &str) {
                     "[OP-REQ] hub_client_request_op returned: {}\n",
                     sent_via_hub as i32
                 );
+                if sent_via_hub {
+                    logm!(
+                        state,
+                        L_INFO,
+                        "[OP-REQ] Need ops in {}: asked {} through the hub (attempt {})\n",
+                        name,
+                        chosen.nick,
+                        state.chans[ci].op_request_retry_count + 1
+                    );
+                }
                 if sent_via_hub && let Some(c) = state.chans.get_mut(ci) {
                     c.own_rid[OWN_REQ_OP].clear(); // an older hub: no answer comes
                     c.own_sent[OWN_REQ_OP] = now;
@@ -821,7 +884,7 @@ fn on_privmsg(state: &mut BotState, prefix: &str, params: &str) {
         let ctcp = &message[1..message.len() - 1];
         if starts_with_ic(ctcp, "DCC ") {
             // Only ever the reply to this bot's own passive offer.
-            if user.is_some() && host.is_some() && eq_ic(dest, &state.current_nick) {
+            if user.is_some() && host.is_some() && irc_eq(dest, &state.current_nick) {
                 dcc::handle_ctcp(state, src_nuh.as_deref().unwrap_or(""), ctcp);
             }
         } else if eq_ic(ctcp, "VERSION") {
@@ -865,7 +928,7 @@ fn on_notice(state: &mut BotState, prefix: &str, params: &str) {
     };
     if dest.starts_with(['#', '&']) {
         chanflood::on_text(state, dest, nick, user, host, message);
-    } else if eq_ic(dest, &state.current_nick) && !message.starts_with('\x01') {
+    } else if irc_eq(dest, &state.current_nick) && !message.starts_with('\x01') {
         // services (NickServ, ChanServ, ...) answer every command with a
         // NOTICE: that is not a flood from a host (servers carry no '!')
         let nb = nick.as_bytes();
@@ -884,7 +947,7 @@ fn on_join(state: &mut BotState, prefix: &str, params: &str) {
     let nick = Tok::new(prefix).next("!");
     let Some(nick) = nick else { return };
     if join_mask_ok
-        && eq_ic(nick, &state.current_nick)
+        && irc_eq(nick, &state.current_nick)
         && prefix.contains('!')
         && prefix.contains('@')
     {
@@ -892,7 +955,7 @@ fn on_join(state: &mut BotState, prefix: &str, params: &str) {
     }
     // Our own JOIN: current_nick is what the server knows us as (001, NICK).
     // Whoever holds target_nick while we run on a fallback is someone else.
-    if !eq_ic(nick, &state.current_nick) {
+    if !irc_eq(nick, &state.current_nick) {
         // someone else joined: keep the roster (and the enforcement) current
         if join_mask_ok {
             let jc = params.strip_prefix(':').unwrap_or(params);
@@ -925,6 +988,7 @@ fn on_join(state: &mut BotState, prefix: &str, params: &str) {
     } else {
         let c = &mut state.chans[ci];
         c.status = ChanStatus::In;
+        c.out_why.clear();
         c.roster.clear();
         c.i_am_opped = false;
         chanlive::live_reset(c);
@@ -940,8 +1004,8 @@ fn on_nick(state: &mut BotState, prefix: &str, params: &str) {
     let new_nick = params.strip_prefix(':').unwrap_or(params);
     let Some(old) = old else { return };
     chanenf::on_nick(state, old, new_nick);
-    let me = eq_ic(old, &state.current_nick)
-        || (!state.overlong_nick.is_empty() && eq_ic(old, &state.overlong_nick));
+    let me = irc_eq(old, &state.current_nick)
+        || (!state.overlong_nick.is_empty() && irc_eq(old, &state.overlong_nick));
     if !me {
         return;
     }
@@ -960,7 +1024,7 @@ fn on_nick(state: &mut BotState, prefix: &str, params: &str) {
     // Our mask changed in its nick half: ask, let the 352 supply it.
     request_own_hostmask(state);
     state.nick_change_pending = false;
-    if eq_ic(&state.current_nick, &state.target_nick) {
+    if irc_eq(&state.current_nick, &state.target_nick) {
         state.nick_generation_attempt = 0;
     }
 }

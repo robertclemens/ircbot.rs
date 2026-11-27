@@ -17,7 +17,7 @@
 
 use crate::chancfg;
 use crate::consts::*;
-use crate::cstr::{eq_ic, starts_with_ic, trunc};
+use crate::cstr::{irc_eq, starts_with_ic, trunc};
 use crate::sendq::mono_ms;
 use crate::state::{BotState, ChanStatus, CsetId, FL_CHAN_COUNT, FloodKind, FloodSrc, FloodWindow};
 use crate::{chanenf, channel, hub_client, logm};
@@ -53,6 +53,44 @@ pub fn src_host(nuh: &str) -> Option<String> {
     (!host.is_empty()).then(|| trunc(host, FLOOD_HOST_MAX).to_ascii_lowercase())
 }
 
+/// A bot was just added to (or updated in) the trusted list: its joins seen
+/// before the hub told us who it is were counted as a stranger's.  Take only
+/// its own joins off its host's join window (FloodSrc.jc), so every other
+/// user on that host keeps their count; one not recorded (the table was
+/// full) is subtracted nothing.  Then lift any automatic ban this bot already
+/// placed on it (a join flood's own grace, JOIN_FLOOD_GRACE_MS, normally
+/// drops the kick+ban before it is sent).
+pub fn trusted(state: &mut BotState, mask: &str) {
+    let (Some(host), Some(nu)) = (src_host(mask), src_nu(mask)) else {
+        return;
+    };
+    for c in state.chans.iter_mut() {
+        for f in c.flood.iter_mut() {
+            if f.host.is_empty() || f.host != host {
+                continue;
+            }
+            // only this bot's own joins come off; every other user on the
+            // host keeps their count (flood windows are per host)
+            if let Some(k) = f.jc.iter().position(|(n, _)| irc_eq(n, nu)) {
+                let (_, joins) = f.jc.remove(k);
+                let w = &mut f.w[FloodKind::Join as usize];
+                w.count -= joins;
+                if w.count <= 0 {
+                    *w = FloodWindow::default();
+                }
+            }
+        }
+    }
+    chanenf::trusted_lift(state, mask);
+}
+
+/// "nick!user" of nick!user@host; None without '!' and '@'.
+fn src_nu(nuh: &str) -> Option<&str> {
+    let bang = nuh.find('!')?;
+    let at = bang + nuh[bang..].find('@')?;
+    (at > 0 && at < MAX_MASK_LEN).then(|| &nuh[..at])
+}
+
 fn src_nick(nuh: &str) -> Option<&str> {
     let bang = nuh.find('!')?;
     (bang != 0 && bang < MAX_MEMBER_NICK).then(|| &nuh[..bang])
@@ -63,9 +101,25 @@ fn src_nick(nuh: &str) -> Option<&str> {
 /// Some(a) when it tripped; `a` = an authorised victim was seen since the
 /// last trip of this kind.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn track(
     flood: &mut [FloodSrc],
     host: &str,
+    kind: usize,
+    victim_auth: bool,
+    n: i32,
+    s: i32,
+    now_ms: i64,
+) -> Option<bool> {
+    track_nu(flood, host, "", kind, victim_auth, n, s, now_ms)
+}
+
+/// track() that also notes `nu` (nick!user) as a contributor of a join.
+#[allow(clippy::too_many_arguments)]
+pub fn track_nu(
+    flood: &mut [FloodSrc],
+    host: &str,
+    nu: &str,
     kind: usize,
     victim_auth: bool,
     n: i32,
@@ -101,8 +155,26 @@ pub fn track(
     if victim_auth {
         f.victim_auth |= 1u8 << kind;
     }
+    let join = kind == FloodKind::Join as usize;
+    if join {
+        // the window restarts on this event: its contributors go with it
+        let w = &f.w[kind];
+        if w.count <= 0 || now_ms - w.start_ms >= i64::from(s) * 1000 {
+            f.jc.clear();
+        }
+    }
     if !window_hit(&mut f.w[kind], n, s, now_ms) {
+        if join && !nu.is_empty() {
+            if let Some(e) = f.jc.iter_mut().find(|(x, _)| irc_eq(x, nu)) {
+                e.1 += 1;
+            } else if f.jc.len() < FLOOD_JOIN_CONTRIB {
+                f.jc.push((nu.to_string(), 1));
+            }
+        }
         return None;
+    }
+    if join {
+        f.jc.clear(); // tripped: the window is closed
     }
     let a = f.victim_auth & (1u8 << kind) != 0;
     f.victim_auth &= !(1u8 << kind);
@@ -136,7 +208,7 @@ pub fn count_at(
     );
     if text_kind
         && chancfg::get(state, Some(c), CsetId::DontKickOps) != 0
-        && c.roster.iter().any(|e| eq_ic(&e.nick, nick) && e.is_op)
+        && c.roster.iter().any(|e| irc_eq(&e.nick, nick) && e.is_op)
     {
         return None;
     }
@@ -144,7 +216,8 @@ pub fn count_at(
     if c.flood.is_empty() {
         c.flood = vec![FloodSrc::default(); MAX_FLOOD_TRACK];
     }
-    track(&mut c.flood, &host, k, victim_auth, n, s, now_ms)
+    let nu = src_nu(nuh).unwrap_or("");
+    track_nu(&mut c.flood, &host, nu, k, victim_auth, n, s, now_ms)
 }
 
 const KIND_NAME: [&str; FL_CHAN_COUNT] = ["chan", "ctcp", "join", "nick", "deop", "kick", "ban"];
@@ -171,7 +244,13 @@ fn trip(state: &mut BotState, ci: usize, nuh: &str, kind: FloodKind, auth_victim
     } else {
         JOB_KICK
     };
-    let act = if ban_step {
+    let join_act = format!(
+        "kick+ban unless trusted within {} s",
+        JOIN_FLOOD_GRACE_MS / 1000
+    );
+    let act = if kind == FloodKind::Join {
+        join_act.as_str()
+    } else if ban_step {
         "kick+ban"
     } else if op_flood {
         "deop"
@@ -200,7 +279,12 @@ fn trip(state: &mut BotState, ci: usize, nuh: &str, kind: FloodKind, auth_victim
         }
     );
     let queued = if ban_step {
-        chanenf::request_ban(state, &name, nuh, &reason, true)
+        let hold = if kind == FloodKind::Join {
+            JOIN_FLOOD_GRACE_MS
+        } else {
+            0
+        };
+        chanenf::request_ban(state, &name, nuh, &reason, true, hold)
     } else if op_flood {
         chanenf::request_deop(state, &name, nick, &reason)
     } else {

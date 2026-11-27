@@ -6,7 +6,7 @@
 //! copied and a list can never grow past [`Isupport::ban_cap`].
 
 use crate::consts::*;
-use crate::cstr::{Tok, eq_ic, now, trunc, trunc_string};
+use crate::cstr::{Tok, irc_eq, now, trunc, trunc_string};
 use crate::state::{BotState, Chan, CsetId, Isupport, LiveBan};
 use crate::{auth, chancfg, channel, ircf, logm, sendq};
 
@@ -16,6 +16,7 @@ use crate::{auth, chancfg, channel, ircf, logm, sendq};
 /// have (called on every connect and disconnect).
 pub fn isupport_reset(state: &mut BotState) {
     state.isup = Isupport::default();
+    crate::cstr::set_casemap(crate::cstr::Casemap::Rfc1459);
 }
 
 fn all_digits(s: &str) -> bool {
@@ -32,7 +33,7 @@ fn parse_ts(s: &str) -> i64 {
     s.parse().unwrap_or(0)
 }
 
-fn isupport_token(is: &mut Isupport, tok: &str) {
+pub(crate) fn isupport_token(is: &mut Isupport, tok: &str) {
     let neg = tok.starts_with('-');
     let tok = if neg { &tok[1..] } else { tok };
     let (name, val) = match tok.find('=') {
@@ -41,6 +42,15 @@ fn isupport_token(is: &mut Isupport, tok: &str) {
     };
 
     match name {
+        "CASEMAPPING" => {
+            use crate::cstr::{Casemap, set_casemap};
+            set_casemap(match val {
+                _ if neg => Casemap::Rfc1459,
+                "rfc1459" => Casemap::Rfc1459,
+                "strict-rfc1459" => Casemap::Strict,
+                _ => Casemap::Ascii, // ascii, rfc8265, rfc7613, unknown
+            });
+        }
         "NETWORK" => {
             // the network check (pool.rs) compares it; an unusable value reads
             // as none sent
@@ -350,7 +360,7 @@ pub fn ban_add(state: &mut BotState, ci: usize, mask: &str, setter: &str, when: 
     if mask.is_empty() || mask.len() >= MAX_MASK_LEN {
         return; // never store a clipped mask
     }
-    if state.chans[ci].bans.iter().any(|b| eq_ic(&b.mask, mask)) {
+    if state.chans[ci].bans.iter().any(|b| irc_eq(&b.mask, mask)) {
         return;
     }
     let cap = state.isup.ban_cap();
@@ -377,7 +387,7 @@ pub fn ban_add(state: &mut BotState, ci: usize, mask: &str, setter: &str, when: 
 }
 
 pub fn ban_del(c: &mut Chan, mask: &str) {
-    if let Some(i) = c.bans.iter().position(|b| eq_ic(&b.mask, mask)) {
+    if let Some(i) = c.bans.iter().position(|b| irc_eq(&b.mask, mask)) {
         c.bans.swap_remove(i);
     }
 }
@@ -454,7 +464,7 @@ pub fn apply(state: &mut BotState, ci: usize, modes: &str, args: &str, from_324:
             }
         } else if state.isup.is_prefix_mode(ch) {
             let c = &mut state.chans[ci];
-            let r = a.and_then(|a| c.roster.iter_mut().find(|r| eq_ic(&r.nick, a)));
+            let r = a.and_then(|a| c.roster.iter_mut().find(|r| irc_eq(&r.nick, a)));
             if let Some(r) = r {
                 if ch == b'h' {
                     r.is_halfop = adding;
@@ -482,6 +492,13 @@ pub fn numeric(state: &mut BotState, command: &str, params: &str) {
     if params.len() >= 1024 {
         return; // no real 324/329/367 is this long
     }
+    let untrailed;
+    let params = if matches!(command, "324" | "329" | "367") {
+        untrailed = crate::cstr::irc_untrail(params); // "324 me #c :+nt"
+        &*untrailed
+    } else {
+        params
+    };
     let mut t = Tok::new(params);
     if t.next(" ").is_none() {
         return;
@@ -559,7 +576,11 @@ pub fn request(state: &mut BotState, ci: usize) {
 /// (found, authorised): whether `nick` is in the channel's roster at all, and
 /// whether it is authorised.
 pub fn member_authorised(state: &BotState, ci: usize, nick: &str) -> (bool, bool) {
-    match state.chans[ci].roster.iter().find(|r| eq_ic(&r.nick, nick)) {
+    match state.chans[ci]
+        .roster
+        .iter()
+        .find(|r| irc_eq(&r.nick, nick))
+    {
         Some(r) => (
             true,
             auth::is_authorised(state, &r.hostmask, Some(&state.chans[ci].name)),

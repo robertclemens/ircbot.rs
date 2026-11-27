@@ -19,7 +19,9 @@ pub fn wildcard_match(pattern: &str, text: &str) -> bool {
             star = Some(pi);
             pi += 1;
             star_t = ti;
-        } else if pi < p.len() && (p[pi] == b'?' || p[pi].eq_ignore_ascii_case(&t[ti])) {
+        } else if pi < p.len()
+            && (p[pi] == b'?' || crate::cstr::irc_lower(p[pi]) == crate::cstr::irc_lower(t[ti]))
+        {
             pi += 1;
             ti += 1;
         } else if let Some(s) = star {
@@ -117,7 +119,7 @@ pub fn mask_equal(a: &str, b: &str) -> bool {
     };
     match (split(a), split(b)) {
         (Some((an, ai, ah)), Some((bn, bi, bh))) => {
-            an.eq_ignore_ascii_case(&bn) && ai == bi && ah.eq_ignore_ascii_case(&bh)
+            crate::cstr::irc_eq(&an, &bn) && ai == bi && ah.eq_ignore_ascii_case(&bh)
         }
         _ => false,
     }
@@ -218,7 +220,7 @@ pub fn trusted_bot_by_nick(state: &BotState, nick: &str) -> Option<usize> {
     state
         .trusted_bots
         .iter()
-        .position(|tb| tb.nick().eq_ignore_ascii_case(nick))
+        .position(|tb| crate::cstr::irc_eq(tb.nick(), nick))
 }
 
 pub fn is_trusted_bot(state: &BotState, user_host: &str) -> bool {

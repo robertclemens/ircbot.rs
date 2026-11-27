@@ -16,7 +16,7 @@ use zeroize::Zeroizing;
 use crate::consts::*;
 use crate::crypto::{self, Key32};
 use crate::cstr::{
-    Conv, Fmt, atoi, atoll, eq_ic, has_uuid_dashes, now, sscanf, trunc_string, until_nul,
+    Conv, Fmt, atoi, atoll, has_uuid_dashes, irc_eq, now, sscanf, trunc_string, until_nul,
 };
 use crate::net::{self, ReadOutcome};
 use crate::state::{
@@ -256,13 +256,16 @@ fn close_socket(state: &mut BotState) {
 }
 
 pub fn disconnect(state: &mut BotState) {
+    let was_up = state.hub_authenticated;
+    let was_dialing = state.hub.is_some() || state.hub_dial.is_some() || state.hub_connecting;
     close_socket(state);
     state.hub_connected = false;
     state.hub_authenticated = false;
     state.hub_connecting = false;
     state.pool_hub_seen = false; // the next hub proves it keeps a pool afresh
+    channel::join_gate_hub_down(state); // hm| is this link's word only
+    channel::chan_state_hub_down(state); // the next hub link gets the list afresh
     state.irc_link_sent.clear(); // ...and gets the IRC link state again
-    state.pool_view_at = 0;
     state.hub_connect_time = 0;
     state.hub_auth_state = HubAuthState::None;
     state.hub_session_key.wipe();
@@ -275,6 +278,18 @@ pub fn disconnect(state: &mut BotState) {
     state.hub_link_rx_ctr = 0;
     state.current_hub.clear();
     state.last_hub_connect_attempt = now();
+    state.hub_cfg_synced = false;
+    if was_up {
+        // A link that worked and dropped (the hub restarting, most often): a
+        // different hub next, after a short spread so bots do not all redial
+        // in the same second; a lone hub is tried again.
+        state.hub_tried = state.hub_dial_idx.filter(|&i| i < 32).map_or(0, |i| 1 << i);
+        state.hub_rounds_failed = 0;
+        state.hub_retry_delay = crypto::random_index(HUB_DROP_JITTER) as i64;
+    } else if was_dialing {
+        attempt_failed(state); // refused, timed out or dropped in the handshake
+    }
+    state.hub_dial_idx = None;
     state.last_hub_pong_sent = 0;
     // Keep the tree for 'bots', but re-report presence on the next auth.
     state.presence_server.clear();
@@ -622,7 +637,7 @@ pub fn ops_ready(
         .filter(|w| {
             !chans
                 .iter()
-                .any(|(n, joined, opped)| n.eq_ignore_ascii_case(w) && *joined && *opped)
+                .any(|(n, joined, opped)| irc_eq(n, w) && *joined && *opped)
         })
         .map(String::as_str)
         .collect();
@@ -988,6 +1003,13 @@ fn config_frame(state: &mut BotState, cmd: u8, raw: &[u8]) {
         }
         let text = Zeroizing::new(String::from_utf8_lossy(raw).into_owned());
         process_config_data(state, until_nul(&text));
+        if !state.hub_cfg_synced {
+            state.hub_cfg_synced = true; // the startup gate (HUB_SYNC_WAIT) opens
+            if state.status & S_CONNECTED == 0 {
+                let hub = state.current_hub.clone();
+                logm!(state, L_INFO, "[HUB] Config synced from {}\n", hub);
+            }
+        }
         return;
     }
     // CMD_CONFIG_DELTA: rebuild the full text, check it, apply it.
@@ -1334,7 +1356,7 @@ pub fn grant_held_ops(state: &mut BotState, ci: usize) {
         let c = &state.chans[ci];
         if c.roster
             .iter()
-            .find(|r| eq_ic(&r.nick, &nick))
+            .find(|r| irc_eq(&r.nick, &nick))
             .is_some_and(|r| !r.is_op)
             && !op_grant_bitch_refuses(state, ci, &nick)
         {
@@ -1600,6 +1622,14 @@ pub fn send_irc_link(state: &mut BotState, payload: &str) -> bool {
         return false;
     }
     send_frame(state, CMD_BOT_IRC_LINK, payload.as_bytes())
+}
+
+/// One CMD_BOT_CHAN_STATE, if this hub link takes them (it sent an N|).
+pub fn send_chan_state(state: &mut BotState, payload: &str) -> bool {
+    if !state.hub_authenticated || !state.pool_hub_seen {
+        return false;
+    }
+    send_frame(state, CMD_BOT_CHAN_STATE, payload.as_bytes())
 }
 
 /// One CMD_SERVER_REPORT, if this hub link takes them.
@@ -2004,7 +2034,8 @@ fn sync_channel_line(state: &mut BotState, data: &str) -> bool {
                     c.status = ChanStatus::Out;
                 }
             }
-            if !was_managed && is_add && status != ChanStatus::In {
+            if !was_managed && is_add && status != ChanStatus::In && channel::join_gate_ready(state)
+            {
                 logm!(
                     state,
                     L_INFO,
@@ -2044,7 +2075,7 @@ fn user_rec_same(a: &UserRecord, b: &UserRecord) -> bool {
 fn saved_mask_find<'a>(saved: &'a [MaskRecord], uuid: &str, mask: &str) -> Option<&'a MaskRecord> {
     saved
         .iter()
-        .find(|s| s.uuid == uuid && eq_ic(&s.mask, mask))
+        .find(|s| s.uuid == uuid && irc_eq(&s.mask, mask))
 }
 
 /// Records that differ from (or are missing in) the saved table, plus saved
@@ -2098,7 +2129,7 @@ fn access_table_changes(state: &BotState, sf: &[UflagRecord], sc: &[UchanRecord]
     for c in &state.uchan_records {
         let w = sc
             .iter()
-            .find(|s| s.uuid == c.uuid && eq_ic(&s.chan, &c.chan));
+            .find(|s| s.uuid == c.uuid && irc_eq(&s.chan, &c.chan));
         if w.is_some() {
             matched += 1;
         }
@@ -2131,7 +2162,7 @@ fn sync_mask_line(state: &mut BotState, data: &str, saved: &[MaskRecord]) {
     let mut mi = state
         .mask_records
         .iter()
-        .position(|m| m.uuid == uuid && eq_ic(&m.mask, &mask));
+        .position(|m| m.uuid == uuid && irc_eq(&m.mask, &mask));
     if mi.is_none() && state.mask_records.len() < MAX_USER_MASKS {
         state.mask_records.push(MaskRecord {
             uuid: uuid.clone(),
@@ -2262,6 +2293,7 @@ fn sync_bot_line(state: &mut BotState, data: &str, listed: &mut Vec<String>) -> 
                     mask,
                     if key_is_new { " (new key)" } else { "" }
                 );
+                crate::chanflood::trusted(state, &mask);
                 return true;
             }
             false
@@ -2274,7 +2306,9 @@ fn sync_bot_line(state: &mut BotState, data: &str, listed: &mut Vec<String>) -> 
                 inb.mask,
                 if inb.has_pub { "" } else { " (no key yet)" }
             );
+            let mask = inb.mask.clone();
             state.trusted_bots.push(inb);
+            crate::chanflood::trusted(state, &mask);
             true
         }
         None => false,
@@ -2305,7 +2339,7 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
                 b'a' | b'o' => has_user_lines = true,
                 b'm' => has_mask_lines = true,
                 b'T' => has_trust_set = true,
-                b'N' | b'S' => has_pool_lines = true,
+                b'N' | b'S' | b'R' => has_pool_lines = true,
                 _ => {}
             }
         }
@@ -2346,6 +2380,13 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
         // PURGE is the one line whose type is a word, not a letter.
         if let Some(arg) = line.strip_prefix("PURGE|") {
             apply_purge(state, arg);
+            continue;
+        }
+        // hm|<ts>|<mask>: our own mask as the hub holds it (the join gate)
+        if let Some(body) = line.strip_prefix("hm|") {
+            if !channel::join_gate_hub_mask(state, body) {
+                logm!(state, L_DEBUG, "[HUB-SYNC] Malformed hm| record ignored\n");
+            }
             continue;
         }
         // uf| / uc|: admin flags and oper channel bindings (access.rs)
@@ -2431,11 +2472,14 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
             },
             b'b' => sync_bot_line(state, data, &mut listed),
             b'T' => false, // end of the complete trusted-bot list: swept below
-            // N|/S|: the server pool (pool.rs)
-            b'N' | b'S' => {
+            // N|/S|/R|: the server pool and this bot's order (pool.rs)
+            b'N' | b'S' | b'R' => {
                 if b[0] == b'N' {
                     state.pool_hub_seen = true;
                 }
+                let had = state
+                    .pool_order_known
+                    .then_some(state.pool_order.generation);
                 if !pool::ingest_line(state, b[0], data) {
                     logm!(
                         state,
@@ -2443,6 +2487,9 @@ pub fn process_config_data(state: &mut BotState, payload: &str) {
                         "[HUB-SYNC] Malformed {}| record ignored\n",
                         b[0] as char
                     );
+                } else if b[0] == b'R' && had != Some(state.pool_order.generation) {
+                    state.pool_dial_at = 0; // its turn, not a wait drawn before it
+                    pool::log_order(state);
                 }
                 false
             }
@@ -2691,7 +2738,7 @@ fn chan_elect_do(state: &mut BotState, payload: &str) {
                 state.chans[ci]
                     .roster
                     .iter()
-                    .find(|e| eq_ic(&e.nick, nick))
+                    .find(|e| irc_eq(&e.nick, nick))
                     .map(|e| e.hostmask.clone())
             });
             let who = hm
@@ -2719,7 +2766,7 @@ fn chan_elect_do(state: &mut BotState, payload: &str) {
                 state.chans[ci]
                     .roster
                     .iter()
-                    .find(|e| eq_ic(&e.nick, nick))
+                    .find(|e| irc_eq(&e.nick, nick))
                     .map(|e| e.hostmask.clone())
             });
             let ok = !mask.is_empty()
@@ -2970,9 +3017,60 @@ fn handle_response(state: &mut BotState, cmd: u8, payload: &str) {
         CMD_ACTIVITY_REPLY => crate::commands::activity_reply(state, payload),
         CMD_USER_CHAN_RESULT => user_chan_result(state, payload),
         CMD_CONFIG_PULL => logm!(state, L_INFO, "[HUB] Hub requested config sync\n"),
-        CMD_POOL_VIEW => {
-            if !payload.is_empty() {
-                pool::view_apply(state, payload);
+        // payload: our own uuid
+        // our own uuid: the first server of our order; uuid|entry: that one
+        CMD_BOT_MOVE => {
+            if payload == state.bot_uuid {
+                pool::move_to_first(state);
+            } else if let Some(entry) = payload
+                .strip_prefix(state.bot_uuid.as_str())
+                .and_then(|r| r.strip_prefix('|'))
+                .filter(|e| e.len() == crate::pool_rec::POOL_UUID_LEN && !state.bot_uuid.is_empty())
+            {
+                let entry = entry.to_string();
+                if !pool::move_to_entry(state, &entry) {
+                    logm!(
+                        state,
+                        L_INFO,
+                        "[POOL] Asked to move to server {}: not one I can dial now\n",
+                        entry
+                    );
+                }
+            }
+        }
+        // payload: the target hub's Ed25519 key, base64
+        CMD_BOT_HUB_MOVE => {
+            let raw = (payload.len() < 64)
+                .then(|| crypto::b64_decode(payload))
+                .flatten()
+                .filter(|d| d.len() == 32);
+            let to = raw.and_then(|raw| {
+                state
+                    .hubs
+                    .iter()
+                    .position(|h| h.ed_pub_set && h.ed_pub[..] == raw[..])
+            });
+            match to {
+                // never a hub this bot did not pin itself
+                None => logm!(
+                    state,
+                    L_INFO,
+                    "[HUB] Asked to move to a hub not in my list; staying\n"
+                ),
+                Some(to) if Some(to) == state.hub_dial_idx => {} // already there
+                Some(to) => {
+                    let addr = state.hubs[to].addr.clone();
+                    logm!(
+                        state,
+                        L_INFO,
+                        "[HUB] Moving to hub {} (bot move from the hub console)\n",
+                        addr
+                    );
+                    state.hub_move_to = Some(to);
+                    disconnect(state);
+                    state.last_hub_connect_attempt = 0;
+                    state.hub_retry_delay = 0;
+                }
             }
         }
         // CMD_CONFIG_DATA / CMD_CONFIG_DELTA arrive as raw bytes: config_frame.
@@ -3022,7 +3120,7 @@ fn handle_response(state: &mut BotState, cmd: u8, payload: &str) {
                         // Asked before our own +o arrived: hold it for that +o.
                         let t = now();
                         let held = &mut state.chans[ci].op_grant_held;
-                        held.retain(|(n, at)| t - *at <= OP_GRANT_HOLD_SECS && !eq_ic(n, &nick));
+                        held.retain(|(n, at)| t - *at <= OP_GRANT_HOLD_SECS && !irc_eq(n, &nick));
                         if held.len() < OP_GRANT_HOLD_MAX {
                             held.push((nick.clone(), t));
                             logm!(
@@ -3247,12 +3345,18 @@ pub fn connect(state: &mut BotState) {
         return;
     }
     let now = now();
-    if now - state.last_hub_connect_attempt < HUB_RECONNECT_DELAY {
+    if now - state.last_hub_connect_attempt < state.hub_retry_delay {
         return;
     }
     state.last_hub_connect_attempt = now;
     state.hub_connecting = true;
-    let idx = crypto::random_index(state.hubs.len());
+    // none keyed: says so below
+    let idx = pick(state).unwrap_or_else(|| crypto::random_index(state.hubs.len()));
+    if idx < 32 {
+        state.hub_tried |= 1 << idx;
+    }
+    state.hub_dial_idx = Some(idx);
+    state.hub_retry_delay = HUB_RECONNECT_DELAY; // until the outcome says otherwise
     let hub_original = state.hubs[idx].addr.clone();
 
     // Authenticate against this hub's own pinned key, or not at all.
@@ -3280,6 +3384,7 @@ pub fn connect(state: &mut BotState) {
             hub_original
         );
         state.hub_connecting = false;
+        attempt_failed(state);
         return;
     };
     let (host, port) = (&hub_original[..colon], &hub_original[colon + 1..]);
@@ -3294,6 +3399,7 @@ pub fn connect(state: &mut BotState) {
                 e
             );
             state.hub_connecting = false;
+            attempt_failed(state);
             return;
         }
     };
@@ -3325,7 +3431,72 @@ pub struct HubDial {
     started: i64,
 }
 
-const HUB_DIAL_TIMEOUT: i64 = 10;
+/// Hubs that can be dialed (a pinned key): bit i = hubs[i].
+fn dialable(state: &BotState) -> u32 {
+    let mut m = 0u32;
+    for (i, h) in state.hubs.iter().enumerate().take(MAX_HUBS) {
+        if !h.addr.is_empty() && h.ed_pub_set {
+            m |= 1 << i;
+        }
+    }
+    m
+}
+
+/// A dial or handshake that never became a link: the next untried hub of
+/// the round at once; a round with none left waits (doubling) and restarts.
+fn attempt_failed(state: &mut BotState) {
+    if dialable(state) & !state.hub_tried != 0 {
+        state.hub_retry_delay = 0;
+        return;
+    }
+    state.hub_tried = 0;
+    if state.hub_rounds_failed < 8 {
+        state.hub_rounds_failed += 1;
+    }
+    let mut d = HUB_RECONNECT_DELAY;
+    for _ in 1..state.hub_rounds_failed {
+        if d >= HUB_ROUND_BACKOFF_MAX {
+            break;
+        }
+        d *= 2;
+    }
+    d = d.min(HUB_ROUND_BACKOFF_MAX);
+    state.hub_retry_delay = d + crypto::random_index(HUB_ROUND_JITTER) as i64;
+    logm!(
+        state,
+        L_INFO,
+        "[HUB] No hub answered ({} known); next round in {} s\n",
+        state.hubs.len(),
+        state.hub_retry_delay
+    );
+}
+
+/// A random untried dialable hub; a finished round starts a new one.
+fn pick(state: &mut BotState) -> Option<usize> {
+    let ok = dialable(state);
+    if ok == 0 {
+        return None;
+    }
+    // bot move: the hub an admin named goes first, once
+    if let Some(want) = state.hub_move_to.take()
+        && want < MAX_HUBS
+        && ok & (1 << want) != 0
+    {
+        return Some(want);
+    }
+    let mut left = ok & !state.hub_tried;
+    if left == 0 {
+        state.hub_tried = 0;
+        left = ok;
+    }
+    let idx: Vec<usize> = (0..MAX_HUBS).filter(|i| left & (1 << i) != 0).collect();
+    Some(idx[crypto::random_index(idx.len())])
+}
+
+/// The link is up but the hub's challenge has not come yet.
+pub fn awaiting_challenge(state: &BotState) -> bool {
+    state.hub_auth_state == HubAuthState::SentUuid
+}
 
 /// Close the address in flight.
 fn hub_dial_drop(state: &mut BotState) {
@@ -3352,6 +3523,7 @@ fn hub_dial_next(state: &mut BotState) {
                 port
             );
             state.hub_connecting = false;
+            attempt_failed(state);
             return;
         };
         d.next += 1;
@@ -3473,43 +3645,15 @@ pub fn handle_event(state: &mut BotState, token: mio::Token, readable: bool, wri
             };
             net::read_available(&mut h.sock, &mut h.rbuf, MAX_HUB_FRAME + 4)
         };
-        // Every complete frame, one at a time (a handler may drop the link).
-        loop {
-            let packet = {
-                let Some(h) = state.hub.as_mut().filter(|h| h.token == token) else {
-                    return;
-                };
-                let unread = &h.rbuf[h.roff..];
-                if unread.len() < 4 {
-                    None
-                } else {
-                    let len =
-                        u32::from_be_bytes([unread[0], unread[1], unread[2], unread[3]]) as usize;
-                    if len == 0 || len > MAX_HUB_FRAME || len > i32::MAX as usize {
-                        Some(Err(()))
-                    } else if unread.len() < 4 + len {
-                        None
-                    } else {
-                        let body: Vec<u8> = unread[4..4 + len].to_vec();
-                        h.roff += 4 + len;
-                        Some(Ok(body))
-                    }
-                }
-            };
-            match packet {
-                None => {
-                    if let Some(h) = state.hub.as_mut().filter(|h| h.token == token) {
-                        h.rbuf.drain(..h.roff);
-                        h.roff = 0;
-                    }
-                    break;
-                }
-                Some(Err(())) => {
-                    disconnect(state);
-                    return;
-                }
-                Some(Ok(body)) => process_packet(state, &body),
-            }
+        // Everything one read brings is handled under one send-queue hold,
+        // so the MODE lines it causes (a batched election's CMD_CHAN_DOs)
+        // leave packed, several changes per line, instead of one each
+        // through the burst.
+        crate::sendq::hold(state);
+        let go = rx_frames(state, token);
+        crate::sendq::release(state);
+        if !go {
+            return;
         }
         match outcome {
             Ok(ReadOutcome::Full) => continue,
@@ -3520,6 +3664,47 @@ pub fn handle_event(state: &mut BotState, token: mio::Token, readable: bool, wri
                 }
                 return;
             }
+        }
+    }
+}
+
+/// Every complete frame in the read buffer, one at a time (a handler may drop
+/// the link).  false = the link is gone.
+fn rx_frames(state: &mut BotState, token: mio::Token) -> bool {
+    loop {
+        let packet = {
+            let Some(h) = state.hub.as_mut().filter(|h| h.token == token) else {
+                return false;
+            };
+            let unread = &h.rbuf[h.roff..];
+            if unread.len() < 4 {
+                None
+            } else {
+                let len = u32::from_be_bytes([unread[0], unread[1], unread[2], unread[3]]) as usize;
+                if len == 0 || len > MAX_HUB_FRAME || len > i32::MAX as usize {
+                    Some(Err(()))
+                } else if unread.len() < 4 + len {
+                    None
+                } else {
+                    let body: Vec<u8> = unread[4..4 + len].to_vec();
+                    h.roff += 4 + len;
+                    Some(Ok(body))
+                }
+            }
+        };
+        match packet {
+            None => {
+                if let Some(h) = state.hub.as_mut().filter(|h| h.token == token) {
+                    h.rbuf.drain(..h.roff);
+                    h.roff = 0;
+                }
+                return true;
+            }
+            Some(Err(())) => {
+                disconnect(state);
+                return false;
+            }
+            Some(Ok(body)) => process_packet(state, &body),
         }
     }
 }
@@ -3819,6 +4004,8 @@ fn handle_ack(state: &mut BotState, body: &[u8]) {
     state.hub_auth_state = HubAuthState::Complete;
     state.last_hub_activity = t;
     state.hub_connect_time = t;
+    state.hub_rounds_failed = 0;
+    state.hub_tried = 0;
     // Phase 4: a new hub link — bump the persisted link-order counter before
     // the first presence carries it.
     link_ord_bump(state);

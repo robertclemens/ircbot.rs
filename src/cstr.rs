@@ -21,6 +21,69 @@ pub fn eq_ic(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
+/// 005 CASEMAPPING: which characters the server folds in nicks and channel
+/// names.  No token = rfc1459 (the RFC's own rule); rfc8265 / rfc7613
+/// (Unicode, PRECIS) are taken as ascii, right for every ASCII nick.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Casemap {
+    Rfc1459 = 0,
+    Strict = 1,
+    Ascii = 2,
+}
+
+static CASEMAP: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The server's rule (one IRC link per bot, so one process-wide rule).
+pub fn casemap() -> Casemap {
+    match CASEMAP.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Casemap::Strict,
+        2 => Casemap::Ascii,
+        _ => Casemap::Rfc1459,
+    }
+}
+
+pub fn set_casemap(m: Casemap) {
+    CASEMAP.store(m as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// irc_tolower(): one byte folded under the server's CASEMAPPING.
+pub fn irc_lower(c: u8) -> u8 {
+    if c.is_ascii_uppercase() {
+        return c.to_ascii_lowercase();
+    }
+    match (casemap(), c) {
+        (Casemap::Ascii, _) => c,
+        (_, b'[') => b'{',
+        (_, b']') => b'}',
+        (_, b'\\') => b'|',
+        (Casemap::Rfc1459, b'~') => b'^',
+        _ => c,
+    }
+}
+
+/// irc_casecmp(a, b) == 0: nicks, channels and nick!user@host compared the
+/// server's way; commands, keywords, hosts and hub names stay [`eq_ic`].
+pub fn irc_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .all(|(x, y)| irc_lower(x) == irc_lower(y))
+}
+
+/// irc_untrail(): drop the ':' that marks a line's trailing parameter
+/// (" :x" -> " x") so a space split reads it like the others: a server may
+/// send any last parameter that way ("MODE #c +o :nick", InspIRCd).  A
+/// middle parameter never starts with ':', so only the marker goes.
+pub fn irc_untrail(params: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = params.strip_prefix(':') {
+        return std::borrow::Cow::Borrowed(rest);
+    }
+    match params.find(" :") {
+        Some(i) => std::borrow::Cow::Owned(format!("{} {}", &params[..i], &params[i + 2..])),
+        None => std::borrow::Cow::Borrowed(params),
+    }
+}
+
 /// strncasecmp(s, prefix, strlen(prefix)) == 0.
 pub fn starts_with_ic(s: &str, prefix: &str) -> bool {
     s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())

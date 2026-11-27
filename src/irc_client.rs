@@ -26,7 +26,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme};
 
 use crate::consts::*;
-use crate::cstr::{eq_ic, now, trunc, trunc_string};
+use crate::cstr::{irc_eq, now, trunc, trunc_string};
 use crate::net::{self, ReadOutcome};
 use crate::state::{BotState, S_AUTHED, S_CONNECTED, ServerBlock, ServerBlockKind, is_rfc_nick};
 use crate::{chanlive, channel, crypto, dcc, hub_client, irc_parser, logm, pool, sendq};
@@ -600,7 +600,7 @@ fn pick_server(state: &mut BotState, now: i64) -> Option<usize> {
     let mut soonest = 0i64;
     let mut n = n;
     if !state.hubs.is_empty() && !pool::local_fallback(state) {
-        // Hub-managed: by load on the pool's entries (plan §5.3).
+        // Hub-managed: the first slot in dial order that is free (pool.rs).
         let (pick, s) = pool::pick_slot(state, now);
         soonest = s;
         if let Some(p) = pick {
@@ -678,6 +678,7 @@ pub fn disconnect(state: &mut BotState) {
     chanlive::isupport_reset(state);
     state.net_check = 0; // the next link is checked afresh
     pool::link_note(state, "down", None);
+    channel::join_gate_irc_down(state);
     channel::reset_status(state);
 }
 
@@ -890,26 +891,44 @@ pub fn connect(state: &mut BotState) {
     }
     let managed =
         !state.hubs.is_empty() && !once && jumped.is_none() && !state.server_list.is_empty();
-    // Just started: the cached pool is there before the hub link, but the
-    // load on it is not.  Wait a little for the first view, so a restart does
-    // not pick blind (with every hub down it dials after the wait anyway).
-    // ... but only while a hub link is coming up or up: a bot whose hub dial
-    // failed dials IRC at once (a mass restart with the hubs down must not
-    // take every bot off IRC together, test_80 restart storm).
+    // Hub-managed: hub first, then IRC.  After start the bot waits up to
+    // HUB_SYNC_WAIT for its hub's config (channels, bans, trusted bots, the
+    // pool and its R| server order, all current before the first JOIN) --
+    // only while a hub link is coming up or up, or the round's next hub is
+    // about to be dialed: a bot whose hubs all fail must not stay off IRC
+    // (test_80 restart storm).
     if managed
-        && state.pool_view_at == 0
-        && attempt_now - state.bot_start_time < POOL_VIEW_WAIT
-        && (state.hub_connecting || state.hub_connected)
+        && !state.hub_cfg_synced
+        && attempt_now - state.bot_start_time < HUB_SYNC_WAIT
+        && (state.hub_connecting || state.hub_connected || state.hub_retry_delay == 0)
     {
         return;
     }
-    // Hub-managed: a random 0..5 s before each dial, so bots that dropped
-    // together do not all land on the server that was least loaded a moment
-    // ago (plan §5.3).
+    // Before each dial: with an order, the bot's turn -- slot k of m bots of
+    // this host that share a first server dials only at a second t with
+    // t % (m * gap) == k * gap (one host, one clock: two of them never dial
+    // closer than the gap); alone in its group (most bots) at once.  With no
+    // order: while a hub link is up or coming up (an older hub sends none;
+    // a new one's is on its way) the old 0..5 s jitter; with no hub link at
+    // all a random 0..29 s, so bots of one host that start together do not
+    // burst one server.  A new order clears a wait drawn before it.
     if managed {
         if state.pool_dial_at == 0 {
-            state.pool_dial_at =
-                attempt_now + crypto::random_index(POOL_DIAL_JITTER as usize) as i64;
+            let wait = if state.pool_order_known {
+                let o = &state.pool_order;
+                if o.slots > 1 && o.gap > 0 {
+                    let period = i64::from(o.slots) * i64::from(o.gap);
+                    let at = attempt_now % period;
+                    (i64::from(o.slot) * i64::from(o.gap) - at + period) % period
+                } else {
+                    0
+                }
+            } else if state.hub_connected || state.hub_connecting {
+                crypto::random_index(POOL_DIAL_JITTER as usize) as i64
+            } else {
+                crypto::random_index(POOL_NO_ORDER_JITTER as usize) as i64
+            };
+            state.pool_dial_at = attempt_now + wait;
             if state.pool_dial_at > attempt_now {
                 return;
             }
@@ -949,6 +968,11 @@ pub fn connect(state: &mut BotState) {
         .and_then(|p| state.dial_uuid.get(p).cloned())
         .unwrap_or_default();
     pool::link_note(state, "connecting", Some(&entry));
+    if let Some(p) = pick
+        && let Some(b) = state.server_blocks.get_mut(p)
+    {
+        b.last_dial = attempt_now; // the pace gap
+    }
     state.last_irc_attempt = attempt_now;
     state.irc_refusal.clear();
     state.irc_refusal_ban = false;
@@ -1454,6 +1478,20 @@ pub fn check_status(state: &mut BotState) {
         );
         hub_client::drop_link(state);
     } else if !state.hubs.is_empty()
+        && state.hub_connected
+        && !state.hub_authenticated
+        && hub_client::awaiting_challenge(state)
+        && now - state.last_hub_connect_attempt > HUB_DIAL_TIMEOUT
+        && !hub_client::data_waiting(state)
+    {
+        logm!(
+            state,
+            L_INFO,
+            "[HUB] No challenge from the hub in {} s — dropping the link\n",
+            HUB_DIAL_TIMEOUT
+        );
+        hub_client::disconnect(state);
+    } else if !state.hubs.is_empty()
         && (state.hub.is_some() || hub_client::dialing(state))
         && !state.hub_authenticated
         && now - state.last_hub_connect_attempt > HUB_AUTH_TIMEOUT
@@ -1525,8 +1563,8 @@ pub fn check_status(state: &mut BotState) {
         }
         channel::check_joins(state);
         if !state.nick_change_pending {
-            if !eq_ic(&state.current_nick, &state.target_nick)
-                && !eq_ic(&state.nick_refused, &state.target_nick)
+            if !irc_eq(&state.current_nick, &state.target_nick)
+                && !irc_eq(&state.nick_refused, &state.target_nick)
             {
                 if now - state.nick_release_time > NICK_TAKE_TIME {
                     if now - state.last_nick_attempt > NICK_RETRY_TIME {

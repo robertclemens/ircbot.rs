@@ -3496,8 +3496,10 @@ fn cmd_servers(state: &mut BotState, nick: &str) {
     say(state, nick, FOOT);
 }
 
-/// +hub <host:port> <pubkey-b64>: the hub's pinned Ed25519 key, 44-char raw
-/// or 88-char combined (first 32 bytes).  Pinning is required.
+/// +hub <host:port> <pubkey-b64>: the hub's 88-char combined public key
+/// (./irchub -id, hub show); its first 32 bytes are pinned.  Required.
+/// The 44-char Ed25519 half alone is still taken: it is what the bot's own
+/// h| lines hold, so a decrypted .ircbot.cnf can be restored from.
 fn cmd_add_hub(state: &mut BotState, nick: &str, a: Args<'_>) {
     let (Some(addr), Some(key)) = (a.a1, a.a2) else {
         say(state, nick, "Syntax: +hub <host:port> <pubkey-b64>");
@@ -3530,7 +3532,7 @@ fn cmd_add_hub(state: &mut BotState, nick: &str, a: Args<'_>) {
         say(
             state,
             nick,
-            "Error: pubkey must be base64 of a 32-byte Ed25519 key (44 chars) or 64-byte combined Curve25519 key (88 chars).",
+            "Error: pubkey must be the hub's 88-char public key (./irchub -id or hub show on that hub), or the 44-char key of an h| line in this bot's config.",
         );
         return;
     };
@@ -3854,7 +3856,7 @@ fn admin_help(state: &mut BotState, nick: &str, who: usize, topic: Option<&str>)
         "join" => "Syntax: join <#channel> - Joins a channel.",
         "part" => "Syntax: part <#channel> - Parts a channel.",
         "+hub" => {
-            "Syntax: +hub <host:port> <pubkey-b64> - Add a hub and pin its Ed25519 pubkey (44 or 88 char base64: the public key line of hub show in that hub's console, or of ./irchub -id on its host)."
+            "Syntax: +hub <host:port> <pubkey-b64> - Add a hub and pin its public key (the 88-char public key line of hub show in that hub's console, or of ./irchub -id on its host)."
         }
         "-hub" => "Syntax: -hub <host:port> - Remove a configured hub.",
         "rekey" => {

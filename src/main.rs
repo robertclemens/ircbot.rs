@@ -17,6 +17,7 @@ mod chanenf;
 mod chanflood;
 mod chanlive;
 mod channel;
+mod cli_fmt;
 mod commands;
 mod config;
 mod consts;
@@ -47,6 +48,7 @@ use std::time::Duration;
 use mio::{Events, Poll};
 use zeroize::Zeroizing;
 
+use cli_fmt as cli;
 use consts::*;
 use cstr::{now, trunc_string};
 use state::{
@@ -79,12 +81,6 @@ fn read_line(len: usize) -> Zeroizing<String> {
     Zeroizing::new(trunc_string(&line[..end], len))
 }
 
-fn get_input(prompt: &str, len: usize) -> Zeroizing<String> {
-    print!("{prompt}: ");
-    let _ = io::stdout().flush();
-    read_line(len)
-}
-
 /// Read a password with terminal echo off (plain read when stdin is not a
 /// terminal, e.g. `echo pass | ./ircbot`).
 fn get_password(prompt: &str, len: usize) -> Zeroizing<String> {
@@ -104,18 +100,6 @@ fn get_password(prompt: &str, len: usize) -> Zeroizing<String> {
     }
     println!();
     pass
-}
-
-fn get_confirmed_password(prompt: &str) -> Option<Zeroizing<String>> {
-    let p = get_password(prompt, MAX_PASS);
-    let c = get_password("Confirm password", MAX_PASS);
-    if *p == *c && !p.is_empty() {
-        println!("Passwords match. Accepted.");
-        Some(p)
-    } else {
-        println!("🚨 ERROR: Passwords do not match or are empty. Please try again.");
-        None
-    }
 }
 
 // ---- Machine-bound password file -----------------------------------------------------------
@@ -234,21 +218,20 @@ fn passfile_load(path: &str) -> Option<Zeroizing<String>> {
 /// A user's public key for the wizard: pasted, or a path to .public.b64.
 fn wizard_read_pubkey(who: &str) -> String {
     loop {
-        let input = get_input(
-            "Public key (paste the 88 chars, or a path to the .public.b64)",
-            4096,
-        );
+        let input = cli::ask("public key", 4096);
+        if cli::eof() {
+            cli::err("no public key given: setup stopped");
+            std::process::exit(1);
+        }
         if input.is_empty() {
-            println!(
-                "ERROR: a public key is required. Make one with 'utils/keygen {who}' and give its .public.b64."
-            );
+            cli::err(&format!(
+                "a public key is required: make one with 'utils/keygen {who}' and give its .public.b64"
+            ));
             continue;
         }
         // A keygen private file has the same shape: refuse it by name.
         if input.contains(".private.") {
-            println!(
-                "ERROR: that is a PRIVATE key file — it stays with the admin. Use the matching .public.b64."
-            );
+            cli::err("that is a PRIVATE key file: it stays with the admin; give the .public.b64");
             continue;
         }
         let (key, raw) = match crypto::pubkey_b64_decode(&input) {
@@ -268,148 +251,192 @@ fn wizard_read_pubkey(who: &str) -> String {
                 match crypto::pubkey_b64_decode(&line) {
                     Some(raw) if !line.is_empty() => (line, raw),
                     _ => {
-                        println!(
-                            "ERROR: not an 88-char public key{}. Use the .public.b64 (never the .private.b64).",
+                        cli::err(&format!(
+                            "not an 88-char public key{} (the .public.b64, never the .private.b64)",
                             if file.is_some() { " in that file" } else { "" }
-                        );
+                        ));
                         continue;
                     }
                 }
             }
         };
-        println!(
-            "  Key fingerprint for {}: {}",
-            who,
-            crypto::key_fingerprint(&raw)
-        );
-        let yn = get_input("Use this key? (Y/n)", 16);
-        if !yn.starts_with(['n', 'N']) {
+        cli::kv("fingerprint", &crypto::key_fingerprint(&raw));
+        if cli::ask_yes("use this key?", true) {
             return key;
+        }
+    }
+}
+
+/// A hub's pinned key for a summary line: the fingerprint of an 88-char
+/// combined key, or a 44-char Ed25519 key shortened.
+fn wizard_hub_key_label(input: &str) -> String {
+    match crypto::pubkey_b64_decode(input) {
+        Some(raw) => format!("key {}", crypto::key_fingerprint(&raw)),
+        None => format!("key {}", cli::short(input)),
+    }
+}
+
+/// -setup: can the bot dial out from `vhost`?  An IPv4 or IPv6 literal
+/// (what irc_client binds) of this host: a throwaway socket is bound to it
+/// on port 0 and dropped.  Err gets the reason.
+fn wizard_test_vhost(vhost: &str) -> Result<(), String> {
+    let Ok(ip) = vhost.parse::<std::net::IpAddr>() else {
+        return Err("not an IP address (a hostname is not accepted)".to_string());
+    };
+    match std::net::TcpListener::bind(std::net::SocketAddr::new(ip, 0)) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
+            Err("not an address of this host".to_string())
+        }
+        Err(e) => {
+            let t = e.to_string();
+            Err(t.split(" (os error").next().unwrap_or(&t).to_string())
         }
     }
 }
 
 fn run_config_wizard() -> io::Result<()> {
     let poll = Poll::new()?;
-    println!("--- IRC Bot Initial Setup ---");
-    println!("No config file found. Let's create one.\n");
+    cli::header("ircbot", BOT_VERSION, "setup");
+    cli::note(&format!(
+        "No {CONFIG_FILE} here yet: these steps write one, encrypted with a config password."
+    ));
 
     let (mut state, config_pass, server, chan, hub_managed, admin) = loop {
         let mut state = BotState::new(poll.registry().try_clone()?);
-        println!("==========================================");
-        println!("         Starting Configuration Wizard      ");
-        println!("==========================================");
-        println!("\n--- Setup Config Master Password ---");
+        let mut step = 0;
+        let mut hub_keys: Vec<Zeroizing<String>> = Vec::new();
+
+        step += 1;
+        cli::step(step, "Config password");
         let config_pass = loop {
-            if let Some(p) = get_confirmed_password("Enter new config password") {
+            let p = cli::ask_secret("password", MAX_PASS);
+            let c = cli::ask_secret("confirm", MAX_PASS);
+            if !p.is_empty() && *p == *c {
+                cli::ok("the passwords match");
                 break p;
             }
+            cli::err("the passwords do not match, or are empty: again");
         };
 
-        // Identity first, so the operator can register the UUID and pubkey
-        // on the hub.  The private key never leaves this machine.
-        println!("\n--- Bot Identity (Curve25519) ---");
+        // Identity is generated here up front: the summary shows the exact
+        // 'bot add' line for the hub console.  The private key never leaves
+        // this machine.
+        step += 1;
+        cli::step(step, "Identity (generated here, Curve25519)");
         let Some((priv_key, pub_key)) = crypto::generate_combined_keypair() else {
-            eprintln!("🚨 ERROR: Failed to generate bot keypair.");
+            cli::err("could not generate the bot's keypair");
             return Ok(());
         };
         let Some(uuid) = crypto::gen_uuid_v4() else {
-            eprintln!("🚨 ERROR: RAND_bytes failed.");
+            cli::err("RAND_bytes failed");
             return Ok(());
         };
         state.bot_uuid = uuid;
         *state.hub_key = crypto::b64_encode(priv_key.as_ref());
         state.hub_key_raw.set(&priv_key);
         drop(priv_key);
-        println!("\n  Bot UUID:        {}", state.bot_uuid);
-        println!("  Bot public key:  {}", crypto::b64_encode(&pub_key));
-        println!("  Key fingerprint: {}", crypto::key_fingerprint(&pub_key));
-        println!("\n  Save these — when registering this bot on the hub console");
-        println!("  ('bot add <nick> <uuid> <pubkey>') the hub needs the UUID and pubkey above.");
-        println!("  (Standalone bots: other bots trust this one with");
-        println!("  '+bot <nick!user@host> <UUID> <public key>'.)");
-        print!("\n  Press Enter to continue...");
-        let _ = io::stdout().flush();
-        let _ = read_line(4096);
+        let id_fp = crypto::key_fingerprint(&pub_key);
+        let pub_b64 = crypto::b64_encode(&pub_key);
+        cli::kv("uuid", &state.bot_uuid);
+        cli::kv("public key", &pub_b64);
+        cli::kv("fingerprint", &id_fp);
+        cli::note("The summary at the end has the 'bot add' line for the hub console.");
 
-        println!("\n--- Setup Bot Nickname ---");
+        step += 1;
+        cli::step(step, "On IRC");
         loop {
-            state.target_nick = get_input("Enter bot nick", MAX_NICK).to_string();
+            state.target_nick = cli::ask("nick", MAX_NICK).to_string();
             if is_rfc_nick(&state.target_nick) {
                 state.current_nick = state.target_nick.clone();
                 break;
             }
             if state.target_nick.contains('|') {
-                println!("ERROR: Nick cannot contain '|' (reserved as protocol delimiter).");
+                cli::err("a nick cannot hold '|' (it delimits the records)");
             } else if !is_valid_bot_nick(&state.target_nick) {
-                println!(
-                    "ERROR: Invalid nick length (1-{} characters).",
-                    MAX_NICK - 1
-                );
+                cli::err(&format!("a nick is 1-{} characters", MAX_NICK - 1));
             } else {
-                println!(
-                    "ERROR: Not a valid IRC nick: start with a letter or one of []\\`_^{{}}, then letters, digits, those or '-'."
+                cli::err(
+                    "not an IRC nick: start with a letter or one of []\\`_^{}, then letters, digits, those or '-'",
                 );
             }
         }
-        state.user = get_input("Enter bot username (ident)", 64).to_string();
-        state.gecos = get_input("Enter bot real name (gecos)", 128).to_string();
-        state.vhost = get_input(
-            "Enter VHOST IP (optional, press Enter for default [no vhost])",
-            128,
-        )
-        .to_string();
+        state.user = cli::ask("ident", 64).to_string();
+        state.gecos = cli::ask("real name", 128).to_string();
+        // Optional: most bots dial out from the host's default address.
+        cli::note(
+            "A vhost is optional: a local IP address the bot dials IRC from (for a host with several).",
+        );
+        state.vhost.clear();
+        if cli::ask_yes("do you have a vhost?", false) {
+            loop {
+                state.vhost = cli::ask("vhost ip (empty = none)", 128).to_string();
+                if state.vhost.is_empty() || cli::eof() {
+                    break;
+                }
+                match wizard_test_vhost(&state.vhost) {
+                    Ok(()) => {
+                        cli::ok(&format!("{} can be bound", state.vhost));
+                        break;
+                    }
+                    Err(why) => {
+                        cli::err(&format!("cannot use {}: {why}", state.vhost));
+                        state.vhost.clear();
+                    }
+                }
+            }
+        }
+        if state.vhost.is_empty() {
+            cli::note("no vhost: the system's default address");
+        }
 
         let mut server = String::new();
 
         // A hub-managed bot owns none of the hub-authoritative records, so
         // they are not asked for.
-        println!("\n--- Management Mode ---");
-        println!("Hub-managed: admins, usermasks, channels and IRC servers live on the");
-        println!("  hub and are managed on the hub console. This bot only needs hub");
-        println!("  addresses and their pinned public keys.");
-        println!("Standalone:  this bot owns its own IRC servers, admin list and channels.\n");
-        let hub_managed = !get_input("Hub-managed? (Y/n)", 16).starts_with(['n', 'N']);
+        step += 1;
+        cli::step(step, "Management");
+        cli::note(
+            "hub-managed: admins, usermasks, channels and IRC servers live on the hub and are managed on its console; this bot needs only the hubs' addresses and keys.",
+        );
+        cli::note("standalone: this bot keeps its own IRC server, admin and channel.");
+        let hub_managed = cli::ask_yes("hub-managed?", true);
 
         let mut chan = String::new();
         let mut admin: Option<(String, String, Vec<String>)> = None;
         if hub_managed {
-            println!("\n--- Hub Configuration ---");
-            println!("You'll need each hub's address and public key: './irchub -id' on");
-            println!("the hub's host prints both (as the '+hub' line), so does 'hub show'");
-            println!("in its console. Each hub has its own keypair, so the key is pinned");
-            println!("per hub.");
+            step += 1;
+            cli::step(step, "Hubs");
+            cli::note(
+                "Each hub's address and public key: './irchub -id' on its host prints both (the '+hub' line), and so does 'hub show' on its console.",
+            );
             while state.hubs.len() < MAX_HUBS {
-                println!("\n--- Hub #{} Address ---", state.hubs.len() + 1);
+                println!();
                 let addr = loop {
-                    let a = get_input("Enter hub address (e.g., 127.0.0.1:6000)", 256);
+                    let a = cli::ask(&format!("hub {}", state.hubs.len() + 1), 256);
                     let ok = a.rfind(':').is_some_and(|c| {
                         c > 0 && c + 1 < a.len() && (1..65536).contains(&cstr::atoi(&a[c + 1..]))
                     });
                     if ok {
                         break a.to_string();
                     }
-                    println!("🚨 ERROR: Invalid format. Use HOST:PORT or IP:PORT.");
+                    cli::err("give host:port (e.g. 127.0.0.1:6000)");
                 };
                 if state.hubs.iter().any(|h| h.addr == addr) {
-                    println!("🚨 ERROR: '{addr}' already added; skipping.");
+                    cli::err(&format!("{addr} is already in the list: skipped"));
                 } else {
-                    println!("\n--- Hub #{} Public Key ---", state.hubs.len() + 1);
-                    println!(
-                        "Paste the hub's public key from './irchub -id' or 'hub show' (44 or 88 chars)."
-                    );
-                    let ed_pub = loop {
-                        let k = get_input("Hub public key", 256);
-                        let k = k.trim_end_matches([' ', '\r', '\n', '\t']);
-                        match crypto::b64_decode(k) {
-                            Some(d) if d.len() == 32 || d.len() == HUB_KEY_RAW_LEN => {
+                    let (ed_pub, typed) = loop {
+                        let k = cli::ask("public key", 256);
+                        let k = k.trim_end_matches([' ', '\r', '\n', '\t']).to_string();
+                        match crypto::b64_decode(&k) {
+                            Some(d) if d.len() == HUB_KEY_RAW_LEN => {
                                 // The Ed25519 half is what the handshake verifies.
                                 let mut p = [0u8; 32];
                                 p.copy_from_slice(&d[..32]);
-                                break p;
+                                break (p, k);
                             }
-                            _ => println!(
-                                "🚨 ERROR: Expected base64 of a 32-byte Ed25519 key (44 chars) or 64-byte combined key (88 chars)."
+                            _ => cli::err(
+                                "expected the hub's 88-char public key (./irchub -id or hub show)",
                             ),
                         }
                     };
@@ -418,145 +445,172 @@ fn run_config_wizard() -> io::Result<()> {
                         ed_pub,
                         ed_pub_set: true,
                     });
-                    println!("\n✓ Hub added: {addr}");
+                    hub_keys.push(Zeroizing::new(typed));
+                    cli::ok(&format!("hub {}: {addr}", state.hubs.len()));
                 }
                 if state.hubs.len() >= MAX_HUBS {
-                    println!("Reached hub limit ({MAX_HUBS}).");
+                    cli::note(&format!("That is the most hubs a bot keeps ({MAX_HUBS})."));
                     break;
                 }
-                if !get_input("Add another hub? (y/N)", 16).starts_with(['y', 'Y']) {
+                if !cli::ask_yes("another hub?", false) {
                     break;
                 }
             }
             if state.hubs.is_empty() {
-                println!(
-                    "\n🚨 ERROR: A hub-managed bot needs at least one hub. Restarting setup.\n"
-                );
+                cli::err("a hub-managed bot needs at least one hub: starting over");
                 continue;
             }
-            println!(
-                "\n✓ Hub configuration saved ({} hub{}).",
-                state.hubs.len(),
-                if state.hubs.len() == 1 { "" } else { "s" }
-            );
-            println!("\n  Admins, usermasks and channels for this bot are added on the");
-            println!("  hub console ('user add', 'user mask', 'channel add'), not here.");
-            println!("  This wizard assumes the hub network runs with opt 'h' (hub-only");
-            println!("  mutations), which is the default — it cannot verify that until");
-            println!("  the first sync. If your hub does not set opt 'h', you can also");
-            println!("  add them later from IRC with '+admin' and 'join'.");
         } else {
-            println!("\n--- Setup IRC Server ---");
+            step += 1;
+            cli::step(step, "IRC server");
             server = loop {
-                let s = get_input(
-                    "Enter IRC server (e.g., irc.efnet.org or irc.efnet.org:6697)",
-                    MAX_BUFFER,
-                );
+                let s = cli::ask("server", MAX_BUFFER);
                 if s.contains('.') && pool_rec::hostport_parse(&s).is_some() {
                     break s.to_string();
                 }
-                println!("🚨 ERROR: Invalid server format (host or host:port).");
+                cli::err("give host or host:port (e.g. irc.efnet.org:6697)");
             };
 
-            println!("\n--- Setup First Admin ---");
+            step += 1;
+            cli::step(step, "First admin");
             let name = loop {
-                let n = get_input("Enter admin friendly name (no spaces, e.g. admin)", 64);
+                let n = cli::ask("name", 64);
                 if !n.is_empty() && !n.contains(' ') && !n.contains('|') {
                     break n.to_string();
                 }
-                println!("ERROR: Name cannot contain spaces or '|'.");
+                cli::err("a name with no spaces or '|' (e.g. admin)");
             };
-            println!("\nThe admin signs in with a Curve25519 key, not a password.");
-            println!("On the admin's own machine run 'utils/keygen {name}' (or see");
-            println!("'help +admin' for an openssl recipe) and give its .public.b64 here.");
-            println!("The .private.b64 stays with the admin (chmod 600) for their IRC script.");
+            cli::note(&format!(
+                "The admin signs in with a Curve25519 key, not a password: on the admin's own machine run 'utils/keygen {name}' (or see 'help +admin' for an openssl recipe) and give its .public.b64 here.  The .private.b64 stays with the admin (chmod 600) for their IRC script."
+            ));
             let pubkey = wizard_read_pubkey(&name);
-            println!("\n--- Setup Admin Usermasks ---");
-            println!("Enter usermasks for this admin (e.g. nick!*@*.example.com).");
-            println!("Press Enter with no mask when done (at least one required).\n");
+            cli::note(
+                "Usermasks the admin is known by (e.g. nick!*@*.example.com); an empty line ends the list, at least one.",
+            );
             let mut masks: Vec<String> = Vec::new();
             while masks.len() < 20 {
-                print!(
-                    "Usermask {}{}: ",
-                    masks.len() + 1,
-                    if masks.is_empty() {
-                        " (required)"
-                    } else {
-                        " (or Enter to finish)"
-                    }
-                );
-                let _ = io::stdout().flush();
-                let mut line = String::new();
-                if io::stdin().lock().read_line(&mut line).unwrap_or(0) == 0 {
+                let m = cli::ask(&format!("usermask {}", masks.len() + 1), MAX_MASK_LEN);
+                if cli::eof() {
                     break;
                 }
-                let m = trunc_string(line.split('\n').next().unwrap_or(""), MAX_MASK_LEN);
                 if m.is_empty() {
                     if masks.is_empty() {
-                        println!("ERROR: At least one usermask required.");
+                        cli::err("at least one usermask");
                         continue;
                     }
                     break;
                 }
                 if !m.contains('!') || !m.contains('@') {
-                    println!("ERROR: Mask must contain '!' and '@'. Try again.");
+                    cli::err("a usermask holds '!' and '@' (nick!user@host)");
                     continue;
                 }
-                masks.push(m);
+                masks.push(m.to_string());
             }
-            println!("\n--- Setup Initial Channel ---");
+
+            step += 1;
+            cli::step(step, "First channel");
             loop {
-                chan = get_input(
-                    "Enter channel to join (e.g., #bots) [Optional, Enter to skip]",
-                    MAX_CHAN,
-                )
-                .to_string();
-                if chan.is_empty() || (chan.starts_with('#') && chan.len() > 1) {
+                chan = cli::ask("channel", MAX_CHAN).to_string();
+                if chan.is_empty() {
+                    cli::note("none: add channels later with 'join' from IRC");
                     break;
                 }
-                println!("🚨 ERROR: Channel must start with '#'.");
+                if chan.starts_with('#') && chan.len() > 1 {
+                    break;
+                }
+                cli::err("a channel starts with '#' (or leave it empty)");
             }
             admin = Some((name, pubkey, masks));
         }
 
-        println!("\n==========================================");
-        println!("     Configuration Summary (Review)         ");
-        println!("==========================================");
-        println!("Bot Nick: {}", state.target_nick);
+        // The summary: every answer, and what to paste on the other side.
+        cli::summary("Summary");
         if hub_managed {
-            println!("IRC servers: from the hub pool");
+            cli::skv(
+                "mode",
+                &format!(
+                    "hub-managed {} {} hub{}",
+                    cli::g(cli::Glyph::Dot),
+                    state.hubs.len(),
+                    if state.hubs.len() == 1 { "" } else { "s" }
+                ),
+            );
         } else {
-            println!("IRC Server: {server}");
+            cli::skv("mode", "standalone");
         }
+        cli::skv("nick", &state.target_nick);
+        cli::skv(
+            "ident",
+            if state.user.is_empty() {
+                "(the nick)"
+            } else {
+                &state.user
+            },
+        );
+        cli::skv(
+            "real name",
+            if state.gecos.is_empty() {
+                "(none)"
+            } else {
+                &state.gecos
+            },
+        );
+        cli::skv(
+            "vhost",
+            if state.vhost.is_empty() {
+                "(none)"
+            } else {
+                &state.vhost
+            },
+        );
         if hub_managed {
-            println!(
-                "Mode: HUB-MANAGED ({} hub{})",
-                state.hubs.len(),
-                if state.hubs.len() == 1 { "" } else { "s" }
-            );
-            println!("Admins/channels: managed on the hub");
-        } else if let Some((name, key, masks)) = &admin {
-            println!("Mode: STANDALONE");
-            println!(
-                "Admin: {} ({} usermask{})",
-                name,
-                masks.len(),
-                if masks.len() == 1 { "" } else { "s" }
-            );
-            if let Some(raw) = crypto::pubkey_b64_decode(key) {
-                println!("Admin key: {}", crypto::key_fingerprint(&raw));
+            for (i, h) in state.hubs.iter().enumerate() {
+                let label = wizard_hub_key_label(hub_keys.get(i).map_or("", |k| k.as_str()));
+                cli::skv(
+                    if i == 0 { "hubs" } else { "" },
+                    &format!("{}  {label}", h.addr),
+                );
             }
-            println!(
-                "Channel: {}",
-                if chan.is_empty() {
-                    "(none)"
+            cli::skv("irc servers", "from the hub's pool");
+        } else if let Some((name, key, masks)) = &admin {
+            cli::skv("irc server", &server);
+            let fp = crypto::pubkey_b64_decode(key)
+                .map(|r| crypto::key_fingerprint(&r))
+                .unwrap_or_else(|| "?".to_string());
+            cli::skv(
+                "admin",
+                &format!("{name} {} key {fp}", cli::g(cli::Glyph::Dot)),
+            );
+            for (i, m) in masks.iter().enumerate() {
+                cli::skv(if i == 0 { "usermasks" } else { "" }, m);
+            }
+            cli::skv("channel", if chan.is_empty() { "(none)" } else { &chan });
+        }
+        cli::skv("uuid", &state.bot_uuid);
+        cli::skv("key", &id_fp);
+        if hub_managed {
+            cli::skv("on the hub", "paste this on ONE hub's console:");
+            print!(
+                "\n   bot add {} {} {pub_b64}\n\n",
+                state.target_nick, state.bot_uuid
+            );
+            cli::note("Once is enough: every linked hub learns the bot through the mesh.");
+        } else {
+            cli::skv("other bots", "trust this one with:");
+            print!(
+                "\n   +bot {}!{}@<host> {} {pub_b64}\n\n",
+                state.target_nick,
+                if state.user.is_empty() {
+                    &state.target_nick
                 } else {
-                    chan.as_str()
-                }
+                    &state.user
+                },
+                state.bot_uuid
             );
         }
-        if get_input("Does this look correct? (Y/n)", 16).starts_with(['n', 'N']) {
-            println!("\nRestarting configuration wizard...\n");
+        cli::rule();
+        if !cli::ask_yes(&format!("write {CONFIG_FILE}?"), true) {
+            cli::note("Starting over.");
             continue;
         }
         break (state, config_pass, server, chan, hub_managed, admin);
@@ -602,18 +656,20 @@ fn run_config_wizard() -> io::Result<()> {
         c.status = ChanStatus::Out;
     }
 
-    println!("\n--- Finalizing Configuration ---");
     config::write(&mut state, &config_pass);
     config::key_forget();
-    println!("\nConfiguration saved to {CONFIG_FILE}.");
-    println!("You can now start the bot:");
-    println!("  Run './ircbot -p' to create a machine-bound password file, then './ircbot'");
-    println!("  Or run './ircbot' directly and enter the password when prompted.");
+    println!();
+    cli::ok(&format!("wrote {CONFIG_FILE}"));
+    cli::kv("next", "./ircbot -p, then ./ircbot");
+    cli::note(
+        "-p writes a machine-bound password file, so the bot starts without typing the password; ./ircbot alone asks for it.",
+    );
     if hub_managed {
-        println!("\nThis bot joins IRC once its first hub sync brings the server pool.");
-        println!("If the hub has no servers yet, add one on the hub console first");
-        println!("('server add <host[:port]>').");
+        cli::note(
+            "The bot joins IRC once its first hub sync brings the server pool: if the hub has no servers yet, add one on its console ('server add <host[:port]>').",
+        );
     }
+    println!();
     Ok(())
 }
 
@@ -749,23 +805,30 @@ fn main() {
     }
 
     if do_passfile {
+        cli::header("ircbot", BOT_VERSION, "password file");
+        cli::note(&format!(
+            "{PASS_FILE} holds the config password, bound to this machine, so the bot starts without typing it."
+        ));
+        println!();
         let pass = loop {
-            let p1 = get_password("Config Password", MAX_PASS);
+            let p1 = cli::ask_secret("password", MAX_PASS);
             if p1.is_empty() {
-                eprintln!("Password cannot be empty.");
+                cli::err("the password cannot be empty");
                 std::process::exit(1);
             }
-            let p2 = get_password("Confirm Config Password", MAX_PASS);
+            let p2 = cli::ask_secret("confirm", MAX_PASS);
             if *p1 == *p2 {
                 break p1;
             }
-            println!("Passwords do not match. Try again.");
+            cli::err("the passwords do not match: again");
         };
         if passfile_create(PASS_FILE, &pass) {
-            println!("Saved: {PASS_FILE} (0600, machine-bound)");
+            cli::ok(&format!("wrote {PASS_FILE} (0600, bound to this machine)"));
+            cli::kv("next", "./ircbot");
+            println!();
             return;
         }
-        eprintln!("Failed to create {PASS_FILE}.");
+        cli::err(&format!("could not write {PASS_FILE}"));
         std::process::exit(1);
     }
 
@@ -873,17 +936,19 @@ fn identity(password: Zeroizing<String>) -> i32 {
         return 1;
     }
     let pub_b64 = crypto::b64_encode(&state.self_pub);
-    println!("Bot nick:        {}", state.target_nick);
-    println!("Bot UUID:        {}", state.bot_uuid);
-    println!("Bot public key:  {pub_b64}");
-    println!(
-        "Key fingerprint: {}",
-        crypto::key_fingerprint(&state.self_pub)
-    );
-    println!(
-        "Hub console:     bot add {} {} {pub_b64}",
+    cli::header("ircbot", BOT_VERSION, "identity");
+    println!();
+    cli::skv("nick", &state.target_nick);
+    cli::skv("uuid", &state.bot_uuid);
+    cli::skv("public key", &pub_b64);
+    cli::skv("fingerprint", &crypto::key_fingerprint(&state.self_pub));
+    cli::skv("on the hub", "paste this on ONE hub's console:");
+    print!(
+        "\n   bot add {} {} {pub_b64}\n\n",
         state.target_nick, state.bot_uuid
     );
+    cli::note("Once is enough: every linked hub learns the bot through the mesh.");
+    cli::rule();
     0
 }
 

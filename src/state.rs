@@ -332,6 +332,9 @@ pub struct FloodSrc {
     pub w: [FloodWindow; FL_CHAN_COUNT],
     /// Bit per kind: a victim was authorised (+revenge).
     pub victim_auth: u8,
+    /// Who added to the open join window: (nick!user, joins), at most
+    /// FLOOD_JOIN_CONTRIB; cleared whenever that window restarts.
+    pub jc: Vec<(String, i32)>,
 }
 
 /// One ignore-table entry (botflood.rs); an empty `key` is a free slot.  The
@@ -557,6 +560,8 @@ pub struct Chan {
     pub last_join_attempt: i64,
     /// 405 received: stop retrying this channel this session.
     pub join_disabled: bool,
+    /// why we are out: banned/key/invite/full/disabled/kicked ("" = none)
+    pub out_why: String,
     pub i_am_opped: bool,
     pub op_request_pending: bool,
     pub last_op_request_time: i64,
@@ -650,6 +655,23 @@ pub struct PendingJob {
     pub reason: String,
     /// Monotonic.
     pub created_ms: i64,
+    /// Extra wait before it falls due.
+    pub hold_ms: i64,
+}
+
+/// An automatic ban this bot placed (chanenf.rs, AUTO_BAN_TRACK); an empty
+/// `chan` is a free slot.
+#[derive(Clone, Debug, Default)]
+pub struct AutoBan {
+    pub chan: String,
+    /// Who it was placed for.
+    pub nuh: String,
+    /// The ban as set.
+    pub mask: String,
+    /// Monotonic.
+    pub set_ms: i64,
+    /// Its B| expiry (Unix seconds); 0 = none (untimed).
+    pub expires: i64,
 }
 
 /// Idle clock of a listed ban on a channel (+dynamicbans / banidle); an
@@ -739,9 +761,6 @@ pub enum ServerBlockKind {
 pub struct PoolEntry {
     pub s: crate::pool_rec::PoolSrv,
     pub ts: i64,
-    /// CMD_POOL_VIEW, runtime
-    pub load_up: i32,
-    pub load_conn: i32,
 }
 
 /// Per-server ban/throttle hold, parallel to server_list (runtime only).  A
@@ -754,6 +773,8 @@ pub struct ServerBlock {
     pub reason: String,
     /// last attempt here that never reached 001
     pub last_fail: i64,
+    /// last attempt here (the R| pace gap)
+    pub last_dial: i64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -878,8 +899,13 @@ pub struct BotState {
     pub irc_link_entry: String,
     /// last CMD_BOT_IRC_LINK to this hub link
     pub irc_link_sent: String,
-    /// last CMD_POOL_VIEW, 0 = none this link
-    pub pool_view_at: i64,
+    /// last CMD_BOT_CHAN_STATE to this hub link ("" with _at 0 = none)
+    pub chan_state_sent: String,
+    pub chan_state_sent_at: i64,
+    /// the hubs' R| server order, cached in .cnf
+    pub pool_order: crate::pool_rec::PoolOrder,
+    /// pool_order holds one
+    pub pool_order_known: bool,
     /// jittered dial time, 0 = not drawn yet
     pub pool_dial_at: i64,
     /// the current/last attempt reached 001
@@ -891,8 +917,21 @@ pub struct BotState {
     /// 'jump <server>' in the list: slot + 1, 0 = none
     pub jump_slot1: usize,
     pub actual_server_name: String,
+    /// The link proof (net_check 3 = proving): our nonce and deadline.
+    pub netproof_nonce: String,
+    pub netproof_deadline: i64,
+    /// Probes this bot answers for others: (nonce, prober nick, until).
+    pub netprobe_pend: Vec<(String, String, i64)>,
     pub actual_hostname: String,
     pub actual_hostname_ts: i64,
+    /// The join gate (JOIN_GATE_*): this IRC session's state, and the hub's
+    /// view of our mask from hm| (this hub link only).
+    pub join_gate_since: i64, // 001 of this IRC session; 0 = not on IRC
+    pub join_gate_mask_at: i64,    // our 352 this session; 0 = not yet
+    pub join_gate_confirm_at: i64, // the hub's hm| matched it; 0 = not yet
+    pub join_gate_open: bool,      // opened this session (logged once)
+    pub hub_mask_known: bool,      // this hub link sent hm|
+    pub hub_mask: String,          // hm| mask, "" = the hub holds none
     pub current_nick_ts: i64,
     pub current_server_index: usize,
     pub server_blocks: Vec<ServerBlock>,
@@ -992,6 +1031,18 @@ pub struct BotState {
     pub hub_link_tx_ctr: u64,
     pub hub_link_rx_ctr: u64,
     pub last_hub_connect_attempt: i64,
+    /// s after last_hub_connect_attempt before the next dial.
+    pub hub_retry_delay: i64,
+    /// Bit i: hubs[i] dialed this round.
+    pub hub_tried: u32,
+    /// hubs[] index of the dial / link.
+    pub hub_dial_idx: Option<usize>,
+    /// Whole rounds in a row with no link.
+    pub hub_rounds_failed: u32,
+    /// bot move: the hubs[] index to dial next, once.
+    pub hub_move_to: Option<usize>,
+    /// This link's first full config is applied (the startup gate opens).
+    pub hub_cfg_synced: bool,
     pub last_hub_ping_time: i64,
     pub last_hub_activity: i64,
     pub last_hub_pong_sent: i64,
@@ -1063,6 +1114,7 @@ pub struct BotState {
     pub enf_seen_gen: u32,
     /// Pending in-channel jobs (MAX_PENDING_JOBS slots).
     pub jobs: Vec<PendingJob>,
+    pub auto_bans: Vec<AutoBan>,
     /// Ban idle clocks, grown on demand up to MAX_BAN_TRACK (an emptied slot
     /// has an empty `chan`).
     pub ban_track: Vec<BanTrack>,
@@ -1123,16 +1175,28 @@ impl BotState {
             irc_link: String::new(),
             irc_link_entry: String::new(),
             irc_link_sent: String::new(),
-            pool_view_at: 0,
+            chan_state_sent: String::new(),
+            chan_state_sent_at: 0,
+            pool_order: Default::default(),
+            pool_order_known: false,
             pool_dial_at: 0,
             irc_attempt_ok: false,
             net_check_deadline: 0,
             pool_idle_warned: 0,
             jump_once: String::new(),
             jump_slot1: 0,
+            netproof_nonce: String::new(),
+            netproof_deadline: 0,
+            netprobe_pend: Vec::new(),
             actual_server_name: String::new(),
             actual_hostname: String::new(),
             actual_hostname_ts: 0,
+            join_gate_since: 0,
+            join_gate_mask_at: 0,
+            join_gate_confirm_at: 0,
+            join_gate_open: false,
+            hub_mask_known: false,
+            hub_mask: String::new(),
             current_nick_ts: t,
             current_server_index: 0,
             server_blocks: vec![ServerBlock::default(); MAX_SERVERS],
@@ -1203,6 +1267,12 @@ impl BotState {
             hub_link_tx_ctr: 0,
             hub_link_rx_ctr: 0,
             last_hub_connect_attempt: 0,
+            hub_retry_delay: 0,
+            hub_tried: 0,
+            hub_dial_idx: None,
+            hub_rounds_failed: 0,
+            hub_move_to: None,
+            hub_cfg_synced: false,
             last_hub_ping_time: 0,
             last_hub_activity: 0,
             last_hub_pong_sent: 0,
@@ -1238,6 +1308,7 @@ impl BotState {
             cfg_gen: 0,
             enf_seen_gen: 0,
             jobs: vec![PendingJob::default(); MAX_PENDING_JOBS],
+            auto_bans: vec![AutoBan::default(); AUTO_BAN_TRACK],
             ban_track: Vec::new(),
             auth_gen: Cell::new(0),
             auth_seen_cfg_gen: Cell::new(0),

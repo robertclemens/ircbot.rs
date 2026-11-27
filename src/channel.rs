@@ -10,7 +10,7 @@
 
 use crate::auth::wildcard_match;
 use crate::consts::*;
-use crate::cstr::{eq_ic, now, trunc_string};
+use crate::cstr::{irc_eq, now, trunc_string};
 use crate::state::{
     BotState, Chan, ChanReq, ChanStatus, M_I, M_K, OWN_REQ_OP, OWN_REQ_SLOTS, OWN_REQ_WAIT_CHAN,
     OWN_REQ_WAIT_OP, S_AUTHED, UnbanJob,
@@ -51,7 +51,7 @@ pub fn add(state: &mut BotState, name: &str) -> Option<usize> {
 }
 
 pub fn find(state: &BotState, name: &str) -> Option<usize> {
-    state.chans.iter().position(|c| eq_ic(&c.name, name))
+    state.chans.iter().position(|c| irc_eq(&c.name, name))
 }
 
 /// After a disconnect: every channel is out, and every lockout gets a fresh
@@ -61,6 +61,7 @@ pub fn reset_status(state: &mut BotState) {
         c.status = ChanStatus::Out;
         c.last_join_attempt = 0;
         c.join_disabled = false;
+        c.out_why.clear();
         c.i_am_opped = false;
         crate::chanlive::live_reset(c);
         c.op_request_pending = false;
@@ -73,8 +74,223 @@ pub fn reset_status(state: &mut BotState) {
     }
 }
 
+// ---- the join gate (consts JOIN_GATE_*) ----------------------------------
+// A hub-linked bot that joins before the other bots hold its displayed mask
+// is, to them, a stranger: a ban or a join-flood trip lands on it.  So no
+// JOIN until the mask is known mesh-wide, as far as this bot can tell.
+
+pub fn join_gate_irc_up(state: &mut BotState) {
+    state.join_gate_since = now();
+    state.join_gate_mask_at = 0;
+    state.join_gate_confirm_at = 0;
+    state.join_gate_open = false;
+}
+
+pub fn join_gate_irc_down(state: &mut BotState) {
+    state.join_gate_since = 0;
+    state.join_gate_mask_at = 0;
+    state.join_gate_confirm_at = 0;
+    state.join_gate_open = false;
+}
+
+fn join_gate_match(state: &mut BotState, now: i64, unchanged: bool) {
+    if state.join_gate_since == 0
+        || state.join_gate_mask_at == 0
+        || state.join_gate_confirm_at != 0
+        || !state.hub_mask_known
+        || state.hub_mask != state.actual_hostname
+    {
+        return;
+    }
+    // A mask the hub held before this session needs no settle: the mesh has it.
+    state.join_gate_confirm_at = if unchanged {
+        now - JOIN_GATE_SETTLE
+    } else {
+        now
+    };
+}
+
+/// Our 352 for this session (mask = actual_hostname now).  pushed: the change
+/// already went to the hub.  A mask the hub holds differently but this bot
+/// still had from before goes now, or the confirmation never comes.
+pub fn join_gate_own_mask(state: &mut BotState, mask: &str, pushed: bool) {
+    if state.join_gate_since == 0 || state.join_gate_mask_at != 0 || mask.is_empty() {
+        return;
+    }
+    let now = now();
+    state.join_gate_mask_at = now;
+    if state.hub_mask_known && state.hub_mask != mask && !pushed && state.hub_authenticated {
+        if state.actual_hostname_ts < now {
+            state.actual_hostname_ts = now;
+        }
+        hub_client::sync_hostmask(state);
+    }
+    // the hub held this exact mask before this session (a fresh process
+    // always "changes" from no mask, so pushed says nothing here)
+    let unchanged = state.hub_mask_known && state.hub_mask == mask;
+    join_gate_match(state, now, unchanged);
+}
+
+/// hm|<ts>|<mask>: our mask as the hub holds it ("-" = none).  Sent by 2.5.4+
+/// hubs in every config; any other shape is ignored.
+pub fn join_gate_hub_mask(state: &mut BotState, ts_mask: &str) -> bool {
+    let Some((ts, mask)) = ts_mask.split_once('|') else {
+        return false;
+    };
+    if ts.is_empty() || ts.len() > 20 || !ts.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    if mask.is_empty() || mask.len() >= MAX_MASK_LEN {
+        return false;
+    }
+    let none = mask == "-";
+    if !none && (!mask.contains('!') || !mask.contains('@')) {
+        return false;
+    }
+    state.hub_mask_known = true;
+    state.hub_mask = if none {
+        String::new()
+    } else {
+        mask.to_string()
+    };
+    join_gate_match(state, now(), false);
+    true
+}
+
+pub fn join_gate_hub_down(state: &mut BotState) {
+    state.hub_mask_known = false;
+    state.hub_mask.clear();
+}
+
+pub fn join_gate_ready(state: &mut BotState) -> bool {
+    if state.join_gate_open || state.join_gate_since == 0 {
+        return true;
+    }
+    let now = now();
+    let why = if state.hubs.is_empty() || !state.hub_authenticated {
+        "no hub link"
+    } else if now - state.join_gate_since >= JOIN_GATE_MAX {
+        if state.join_gate_mask_at != 0 {
+            "the hub never confirmed it, joining anyway"
+        } else {
+            "no WHO answer for it, joining anyway"
+        }
+    } else if !state.hub_cfg_synced || state.join_gate_mask_at == 0 {
+        return false;
+    } else if state.hub_mask_known {
+        if state.join_gate_confirm_at == 0 || now - state.join_gate_confirm_at < JOIN_GATE_SETTLE {
+            return false;
+        }
+        "known to the hub"
+    } else {
+        if now - state.join_gate_mask_at < JOIN_GATE_SETTLE {
+            return false;
+        }
+        "hub sends no confirmation, settled"
+    };
+    state.join_gate_open = true;
+    let mask = if state.actual_hostname.is_empty() {
+        "(unknown)".to_string()
+    } else {
+        state.actual_hostname.clone()
+    };
+    logm!(
+        state,
+        L_INFO,
+        "[JOIN] Hostmask {}: {}, {} s after connect: joining channels\n",
+        mask,
+        why,
+        now - state.join_gate_since
+    );
+    true
+}
+
+// ---- CMD_BOT_CHAN_STATE (consts CHAN_STATE_*) -----------------------------
+// The list rebuilt every tick and sent only when it changed, at most once
+// per CHAN_STATE_DEBOUNCE: every join, part, op, kick and refusal shows up
+// without a hook at each.  A list that does not fit ends ",~N" (N more; no
+// channel name starts with '~').
+
+fn chan_state_token(state: &mut BotState, ci: usize) -> String {
+    let c = &state.chans[ci];
+    if c.status == ChanStatus::In {
+        let mark = if c.i_am_opped {
+            "@"
+        } else {
+            match c
+                .roster
+                .iter()
+                .find(|e| irc_eq(&e.nick, &state.current_nick))
+            {
+                Some(e) if e.is_halfop => "%",
+                Some(e) if e.is_voice => "+",
+                _ => "",
+            }
+        };
+        return format!("{mark}{}", c.name);
+    }
+    let name = c.name.clone();
+    let (disabled, why) = (c.join_disabled, c.out_why.clone());
+    let why = if state.status & S_AUTHED == 0 {
+        "noirc".to_string()
+    } else if disabled {
+        "disabled".to_string()
+    } else if !join_gate_ready(state) {
+        "gate".to_string()
+    } else if !why.is_empty() {
+        why
+    } else {
+        "joining".to_string()
+    };
+    format!("-{name}:{why}")
+}
+
+pub fn chan_state_hub_down(state: &mut BotState) {
+    state.chan_state_sent.clear();
+    state.chan_state_sent_at = 0;
+}
+
+pub fn chan_state_tick(state: &mut BotState) {
+    crate::pool::link_resend(state); // the 005 NETWORK= lands after the "up" note
+    if !state.hub_authenticated || !state.pool_hub_seen {
+        return;
+    }
+    let now = now();
+    if state.chan_state_sent_at != 0 && now - state.chan_state_sent_at < CHAN_STATE_DEBOUNCE {
+        return;
+    }
+    let mut buf = String::new();
+    let mut left = 0;
+    for ci in 0..state.chans.len() {
+        if !state.chans[ci].is_managed {
+            continue;
+        }
+        let tok = chan_state_token(state, ci);
+        // room for this token, its comma and a ",~NNN" tail
+        if left > 0 || buf.len() + tok.len() + 1 + 12 >= BOT_CHAN_STATE_MAX {
+            left += 1;
+            continue;
+        }
+        if !buf.is_empty() {
+            buf.push(',');
+        }
+        buf.push_str(&tok);
+    }
+    if left > 0 {
+        buf.push_str(&format!("{}~{left}", if buf.is_empty() { "" } else { "," }));
+    }
+    if state.chan_state_sent_at != 0 && buf == state.chan_state_sent {
+        return;
+    }
+    if hub_client::send_chan_state(state, &buf) {
+        state.chan_state_sent = buf;
+        state.chan_state_sent_at = now;
+    }
+}
+
 /// JOIN what we should be in, keep rosters fresh while seeking ops.
 pub fn check_joins(state: &mut BotState) {
+    chan_state_tick(state);
     if state.status & S_AUTHED == 0 {
         return;
     }
@@ -84,6 +300,9 @@ pub fn check_joins(state: &mut BotState) {
     }
     let now = now();
     unban_expire(state);
+    if !join_gate_ready(state) {
+        return;
+    }
 
     for i in 0..state.chans.len() {
         let Some(c) = state.chans.get(i) else { break };
@@ -176,7 +395,7 @@ fn access_fallback(
             continue;
         }
         // Our own record may be in the roster; asking ourselves achieves nothing.
-        if !state.current_nick.is_empty() && eq_ic(&tb_nick, &state.current_nick) {
+        if !state.current_nick.is_empty() && irc_eq(&tb_nick, &state.current_nick) {
             continue;
         }
         let cmd = match kind {
@@ -519,7 +738,7 @@ pub fn invite_check_who(state: &mut BotState, nick: &str, ident: &str, host: &st
     }
     let mut i = 0;
     while i < state.invite_checks.len() {
-        if !eq_ic(&state.invite_checks[i].nick, nick) {
+        if !irc_eq(&state.invite_checks[i].nick, nick) {
             i += 1;
             continue;
         }
@@ -549,7 +768,7 @@ pub fn invite_check_end(state: &mut BotState, nick: &str) {
     let mut i = 0;
     while i < state.invite_checks.len() {
         let k = &state.invite_checks[i];
-        if !k.seen && eq_ic(&k.nick, nick) {
+        if !k.seen && irc_eq(&k.nick, nick) {
             let k = state.invite_checks.remove(i);
             invite_check_close(state, k, false, "the nick is not on IRC");
         } else {
@@ -575,7 +794,7 @@ fn unban_job_find(state: &BotState, channel: &str) -> Option<usize> {
     state
         .unban_jobs
         .iter()
-        .position(|j| j.active && eq_ic(&j.channel, channel))
+        .position(|j| j.active && irc_eq(&j.channel, channel))
 }
 
 /// Close out ban-list walks whose 368 never arrived.

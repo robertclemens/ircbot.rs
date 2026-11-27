@@ -11,7 +11,7 @@
 //! frame that opens, so the b| pubkey is the whole trust anchor.
 
 use crate::consts::*;
-use crate::cstr::{Tok, eq_ic, now};
+use crate::cstr::{Tok, eq_ic, irc_eq, now};
 use crate::state::{BotState, ChanReq, ChanStatus, has_control_bytes, is_rfc_nick};
 use crate::{auth, channel, config, crypto, hub_client, ircf, logm};
 
@@ -155,7 +155,17 @@ fn open_and_dispatch(state: &mut BotState, ti: usize, b64: &str, sender_nick: Op
     let (Some(verb), Some(arg1)) = (t.next(" "), t.next(" ")) else {
         return;
     };
-    if eq_ic(verb, "OPME") {
+    if eq_ic(verb, "NETPROBE") {
+        // the link proof: over IRC only (a hub relay proves nothing)
+        if let Some(n) = sender_nick {
+            crate::pool::netproof_probe(state, n, arg1);
+        }
+    } else if eq_ic(verb, "NETPROBE-OK") {
+        let srv = t.next(" ");
+        if let Some(n) = sender_nick {
+            crate::pool::netproof_ok(state, arg1, srv, n);
+        }
+    } else if eq_ic(verb, "OPME") {
         // Only where we can: in the channel and opped (as OPUSER).  The sender
         // is a trusted bot, so +bitch does not apply to it.
         if let Some(n) = sender_nick
@@ -194,7 +204,7 @@ fn open_and_dispatch(state: &mut BotState, ti: usize, b64: &str, sender_nick: Op
             if let (Some(m), Some(u)) = (imask, iuser) {
                 // a person the sender validated: its mask, checked live
                 channel::invite_check_start(state, "", arg1, arg2, m, u);
-            } else if eq_ic(arg2, &snick) {
+            } else if irc_eq(arg2, &snick) {
                 // the sender itself: its published mask, checked live
                 let m = sender.mask.clone();
                 channel::invite_check_start(state, "", arg1, arg2, &m, "");
@@ -228,7 +238,7 @@ fn open_and_dispatch(state: &mut BotState, ti: usize, b64: &str, sender_nick: Op
             let hm = state.chans[ci]
                 .roster
                 .iter()
-                .find(|e| eq_ic(&e.nick, arg2))
+                .find(|e| irc_eq(&e.nick, arg2))
                 .map(|e| e.hostmask.clone());
             match hm {
                 Some(h)

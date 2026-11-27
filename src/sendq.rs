@@ -315,7 +315,7 @@ fn take_protection(state: &mut BotState) -> Option<Vec<u8>> {
         let Some(it) = mode_item_parse(&q.q[lane][items.len()]) else {
             break;
         };
-        if !it.chan.eq_ignore_ascii_case(&items[0].chan) {
+        if !crate::cstr::irc_eq(&it.chan, &items[0].chan) {
             break;
         }
         let add = 2 + it.arg.len() + 1;

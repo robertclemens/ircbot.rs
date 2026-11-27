@@ -110,7 +110,7 @@ pub fn uchan_find(state: &BotState, uuid: &str, chan: &str) -> Option<usize> {
     state
         .uchan_records
         .iter()
-        .position(|r| r.uuid == uuid && r.chan.eq_ignore_ascii_case(chan))
+        .position(|r| r.uuid == uuid && crate::cstr::irc_eq(&r.chan, chan))
 }
 
 /// C `access_uflag_put`.
@@ -207,7 +207,7 @@ pub fn user_chan_ok(state: &BotState, uuid: &str, chan: Option<&str>) -> bool {
     state.uchan_records.iter().any(|r| {
         r.is_active
             && r.uuid == uuid
-            && (r.chan == "*" || chan.is_some_and(|c| r.chan.eq_ignore_ascii_case(c)))
+            && (r.chan == "*" || chan.is_some_and(|c| crate::cstr::irc_eq(&r.chan, c)))
     })
 }
 
@@ -313,7 +313,7 @@ pub fn prune(state: &mut BotState) {
         if users.contains(&r.uuid)
             && !kept
                 .iter()
-                .any(|k| k.uuid == r.uuid && k.chan.eq_ignore_ascii_case(&r.chan))
+                .any(|k| k.uuid == r.uuid && crate::cstr::irc_eq(&k.chan, &r.chan))
         {
             kept.push(r);
         }
@@ -434,7 +434,7 @@ pub fn chan_cascade(state: &mut BotState, chan: &str, ts: i64) -> usize {
     let hits: Vec<(String, String)> = state
         .uchan_records
         .iter()
-        .filter(|r| r.is_active && r.chan != "*" && r.chan.eq_ignore_ascii_case(chan))
+        .filter(|r| r.is_active && r.chan != "*" && crate::cstr::irc_eq(&r.chan, chan))
         .map(|r| (r.uuid.clone(), r.chan.clone()))
         .collect();
     hits.into_iter()

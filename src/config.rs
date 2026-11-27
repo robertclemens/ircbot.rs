@@ -345,8 +345,8 @@ pub fn load(state: &mut BotState, password: &str, filename: &str) -> bool {
                     state.local_servers.push(data.to_string());
                 }
             }
-            // N|/S|: the hub's server pool, cached (pool.rs)
-            b'N' | b'S' => {
+            // N|/S|/R|: the hub's server pool and our order, cached (pool.rs)
+            b'N' | b'S' | b'R' => {
                 if !crate::pool::ingest_line(state, typ, data) {
                     logm!(
                         state,

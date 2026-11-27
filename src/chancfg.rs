@@ -16,7 +16,7 @@
 //! Reading a value is [`get`]: channel override -> D| -> built-in.
 
 use crate::consts::*;
-use crate::cstr::{eq_ic, now, trunc_string};
+use crate::cstr::{irc_eq, now, trunc_string};
 use crate::state::{
     BotState, CS_COUNT, CfgBan, Chan, ChanSettings, CsetId, FL_CHAN_COUNT, FL_COUNT, FloodKind,
     FloodSpec, lww_accepts, lww_next_ts,
@@ -406,7 +406,7 @@ fn ban_find<'a>(state: &'a BotState, chan: &str, mask: &str) -> Option<&'a CfgBa
     state
         .cfg_bans
         .iter()
-        .find(|b| eq_ic(&b.chan, chan) && eq_ic(&b.mask, mask))
+        .find(|b| irc_eq(&b.chan, chan) && irc_eq(&b.mask, mask))
 }
 
 /// Room for one more active ban on `chan` under the per-channel / global caps.
@@ -414,7 +414,7 @@ fn ban_active_room(state: &BotState, chan: &str) -> bool {
     let n = state
         .cfg_bans
         .iter()
-        .filter(|b| b.active && eq_ic(&b.chan, chan))
+        .filter(|b| b.active && irc_eq(&b.chan, chan))
         .count();
     n < if chan == "*" {
         MAX_GLOBAL_BANS
@@ -444,7 +444,7 @@ fn ban_store(state: &mut BotState, inb: &CfgBan) -> bool {
     let found = state
         .cfg_bans
         .iter()
-        .position(|b| eq_ic(&b.chan, &inb.chan) && eq_ic(&b.mask, &inb.mask));
+        .position(|b| irc_eq(&b.chan, &inb.chan) && irc_eq(&b.mask, &inb.mask));
     if let Some(i) = found {
         let b = &state.cfg_bans[i];
         if !lww_accepts(inb.ts, inb.active, b.ts, b.active) {
@@ -548,7 +548,7 @@ pub fn ban_mark_used(state: &mut BotState, chan: &str, mask: &str, t: i64) {
     let Some(b) = state
         .cfg_bans
         .iter_mut()
-        .find(|b| eq_ic(&b.chan, chan) && eq_ic(&b.mask, mask))
+        .find(|b| irc_eq(&b.chan, chan) && irc_eq(&b.mask, mask))
     else {
         return;
     };
@@ -606,7 +606,7 @@ pub fn bans_for<'a>(state: &'a BotState, chan: &str, max: usize) -> Vec<&'a CfgB
         .cfg_bans
         .iter()
         .filter(|b| b.active && !(b.expires > 0 && b.expires <= t))
-        .filter(|b| b.chan == "*" || eq_ic(&b.chan, chan))
+        .filter(|b| b.chan == "*" || irc_eq(&b.chan, chan))
         .take(max)
         .collect()
 }
@@ -707,7 +707,7 @@ pub fn bot_ban(
         && let Some(i) = state
             .cfg_bans
             .iter()
-            .position(|x| eq_ic(&x.chan, &b.chan) && eq_ic(&x.mask, &b.mask))
+            .position(|x| irc_eq(&x.chan, &b.chan) && irc_eq(&x.mask, &b.mask))
     {
         state.cfg_bans[i].push_pending = false;
     }
@@ -764,7 +764,7 @@ pub fn ban_get<'a>(state: &'a BotState, chan: &str, mask: &str) -> Option<&'a Cf
     state
         .cfg_bans
         .iter()
-        .find(|b| b.active && eq_ic(&b.chan, chan) && eq_ic(&b.mask, mask))
+        .find(|b| b.active && irc_eq(&b.chan, chan) && irc_eq(&b.mask, mask))
 }
 
 /// Add (or, with `del`, remove) a network ban written by an admin command:

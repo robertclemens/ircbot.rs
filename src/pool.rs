@@ -11,8 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::consts::*;
 use crate::cstr::{eq_ic, now, strtoll, trunc};
 use crate::pool_rec::{
-    self, POOL_DEFAULT_NET, POOL_N_LINE_MAX, POOL_S_LINE_MAX, POOL_UUID_LEN, PoolNet, PoolSrv,
-    PoolState,
+    self, POOL_DEFAULT_NET, POOL_S_LINE_MAX, POOL_UUID_LEN, PoolNet, PoolSrv, PoolState,
 };
 use crate::state::{BotState, PoolEntry, S_CONNECTED, ServerBlock, ServerBlockKind, lww_next_ts};
 use crate::{config, hub_client, irc_client, ircf, logm};
@@ -45,11 +44,23 @@ fn split_ts(data: &str, cap: usize) -> Option<(&str, i64)> {
     Some((&data[..bar], v))
 }
 
-/// Store one N| or S| line's data ("<value>|<ts>"); false if malformed.
+/// Store one N|, S| or R| line's data ("<value>|<ts>"); false if malformed.
 pub fn ingest_line(state: &mut BotState, tag: u8, data: &str) -> bool {
-    let Some((value, ts)) = split_ts(data, POOL_S_LINE_MAX.max(POOL_N_LINE_MAX)) else {
+    // the longest of N|/S|/R|
+    let Some((value, ts)) = split_ts(data, pool_rec::POOL_R_LINE_MAX) else {
         return false;
     };
+    if tag == b'R' {
+        // The hubs' server order for this bot: computed, so no stamp to
+        // compare; the newest one wins (a pool refresh that does not carry
+        // one leaves it).
+        let Some(o) = pool_rec::order_parse(value) else {
+            return false;
+        };
+        state.pool_order = o;
+        state.pool_order_known = true;
+        return true;
+    }
     if tag == b'N' {
         let Some(n) = pool_rec::net_parse(value) else {
             return false;
@@ -104,6 +115,11 @@ pub fn format_lines(state: &BotState) -> Option<String> {
         let v = pool_rec::srv_format(&e.s)?;
         out.push_str(&format!("S|{}|{}\n", v, e.ts));
     }
+    if state.pool_order_known {
+        let mut o = state.pool_order.clone();
+        let v = pool_rec::order_format(&mut o)?;
+        out.push_str(&format!("R|{v}|0\n"));
+    }
     (out.len() < POOL_RECORDS_MAX).then_some(out)
 }
 
@@ -123,8 +139,8 @@ fn entry_dial(s: &PoolSrv) -> String {
     format!("{}:{}", s.host, s.port)
 }
 
-/// Rendezvous score of (this bot, entry): every bot orders the pool its own
-/// way, so bots that see no load view yet still spread out.
+/// Rendezvous score of (this bot, entry): with no R| order from the hubs,
+/// every bot orders the pool its own way, so bots still spread out.
 fn hrw(bot_uuid: &str, entry_uuid: &str) -> u64 {
     let d = Sha256::digest(format!("{bot_uuid}|{entry_uuid}").as_bytes());
     let mut b = [0u8; 8];
@@ -132,14 +148,27 @@ fn hrw(bot_uuid: &str, entry_uuid: &str) -> u64 {
     u64::from_be_bytes(b)
 }
 
-/// Eligible entries (pool indexes) in this bot's HRW order.
+/// Eligible entries (pool indexes) in this bot's dial order: the hubs' R|
+/// order first (a higher score for an earlier place), then any entry the
+/// order does not name yet (a server added since) in HRW order behind it.
 fn ranked(state: &BotState) -> Vec<usize> {
     let mut r: Vec<(usize, u64)> = state
         .pool
         .iter()
         .enumerate()
         .filter(|(_, e)| entry_eligible(e))
-        .map(|(i, e)| (i, hrw(&state.bot_uuid, &e.s.uuid)))
+        .map(|(i, e)| {
+            let at = if state.pool_order_known {
+                state.pool_order.ids.iter().position(|id| *id == e.s.uuid)
+            } else {
+                None
+            };
+            let score = match at {
+                Some(k) => u64::MAX - k as u64,
+                None => hrw(&state.bot_uuid, &e.s.uuid) >> 1,
+            };
+            (i, score)
+        })
         .collect();
     r.sort_by(|x, y| {
         y.1.cmp(&x.1)
@@ -148,12 +177,33 @@ fn ranked(state: &BotState) -> Vec<usize> {
     r.into_iter().map(|(i, _)| i).collect()
 }
 
-/// Slot i's identity across rebuilds: its pool uuid, else its dial string.
-fn slot_same(uuid_a: &str, dial_a: &str, uuid_b: &str, dial_b: &str) -> bool {
-    if !uuid_a.is_empty() || !uuid_b.is_empty() {
+fn dial_count(list: &[String], dial: &str) -> usize {
+    list.iter().filter(|d| eq_ic(d, dial)).count()
+}
+
+/// Slot identity across rebuilds: two pool slots by uuid, two local slots by
+/// dial string.  A local slot and a pool slot (the hub's first pool landing
+/// while the bot is on, or dialing, a local s| server) are the same server
+/// only when their host:port is identical and names exactly one slot on each
+/// side; anything else is no match, never a guess.
+fn slot_same(
+    uuid_a: &str,
+    dial_a: &str,
+    list_a: &[String],
+    uuid_b: &str,
+    dial_b: &str,
+    list_b: &[String],
+) -> bool {
+    if !uuid_a.is_empty() && !uuid_b.is_empty() {
         return uuid_a == uuid_b;
     }
-    eq_ic(dial_a, dial_b)
+    if !eq_ic(dial_a, dial_b) {
+        return false;
+    }
+    if uuid_a.is_empty() && uuid_b.is_empty() {
+        return true;
+    }
+    dial_count(list_a, dial_a) == 1 && dial_count(list_b, dial_b) == 1
 }
 
 fn idle_text(state: &BotState) -> String {
@@ -181,11 +231,15 @@ pub fn servers_rebuild(state: &mut BotState) {
     let old_uuid = std::mem::take(&mut state.dial_uuid);
     let old_n = old_dial.len();
     let old_block: Vec<ServerBlock> = state.server_blocks.iter().take(old_n).cloned().collect();
-    let live_old = if state.status & S_CONNECTED != 0 {
+    // The live link's slot: registered, or still dialing / registering (an R|
+    // order can land then, and the slot must survive it).
+    let live_old = if state.status & S_CONNECTED != 0 || state.irc.is_some() {
         state.irc_server_idx
     } else {
         None
     };
+    // A pending `jump <server>` names a slot: follow its server, not its index.
+    let jump_old = state.jump_slot1.checked_sub(1).filter(|&j| j < old_n);
 
     let mut list = Vec::new();
     let mut uuids = Vec::new();
@@ -229,14 +283,17 @@ pub fn servers_rebuild(state: &mut BotState) {
     state.dial_uuid = uuids;
 
     let mut live_new = None;
+    let mut jump_new = None;
     state.server_blocks = vec![ServerBlock::default(); MAX_SERVERS];
     for i in 0..n {
         for (j, od) in old_dial.iter().enumerate() {
             if !slot_same(
                 &state.dial_uuid[i],
                 &state.server_list[i],
+                &state.server_list,
                 old_uuid.get(j).map_or("", |s| s.as_str()),
                 od,
+                &old_dial,
             ) {
                 continue;
             }
@@ -246,6 +303,9 @@ pub fn servers_rebuild(state: &mut BotState) {
             if Some(j) == live_old {
                 live_new = Some(i);
             }
+            if Some(j) == jump_old {
+                jump_new = Some(i);
+            }
             break;
         }
     }
@@ -254,7 +314,16 @@ pub fn servers_rebuild(state: &mut BotState) {
     // just has no slot for a refusal to land on.
     state.irc_server_idx = live_new;
     state.current_server_index = live_new.map_or(0, |i| i + 1);
-    state.jump_slot1 = 0; // slots moved: a pending jump by index is void
+    state.jump_slot1 = jump_new.map_or(0, |i| i + 1); // 0 when its server is gone
+    // A local slot matched to its pool entry: the hub learns which entry the
+    // link is on (it was told "-" at the dial).
+    if let Some(u) = live_new.map(|i| state.dial_uuid[i].clone())
+        && !u.is_empty()
+        && state.irc_link_entry != u
+    {
+        state.irc_link_entry = u;
+        link_send(state);
+    }
 
     let connected = state.status & S_CONNECTED != 0;
     let idle = !state.hubs.is_empty() && n == 0;
@@ -517,8 +586,6 @@ pub fn servers_add(state: &mut BotState, hostport: &str) -> Result<(), String> {
             deleted: false,
         },
         ts: lww_next_ts(old.as_ref().map_or(0, |e| e.ts)),
-        load_up: old.as_ref().map_or(0, |e| e.load_up),
-        load_conn: old.as_ref().map_or(0, |e| e.load_conn),
     };
     if !push_entry(state, &next) {
         return Err("could not send it to the hub".into());
@@ -618,6 +685,168 @@ fn netcheck_report(state: &mut BotState, kind: &str) {
     hub_client::send_server_report(state, &payload);
 }
 
+// ---- the link proof --------------------------------------------------------
+// The server says another NETWORK=, but it may be ours misconfigured.  Ask
+// the server which trusted bots it can see (ISON); up to NETPROOF_PEERS of
+// them get a sealed ~B2 NETPROBE <nonce> over IRC.  A peer on a verified
+// server WHOISes us and answers NETPROBE-OK <nonce> <server it sees us on>:
+// our own server name there proves the two servers are one network (a relay
+// bridge can forward messages, but our client is in no WHOIS on a network it
+// is not on).  Proven: used for this connection, reported "linked"; never
+// persisted.  Not within NETPROOF_WAIT: the hold, as before.
+
+fn netproof_start(state: &mut BotState) -> bool {
+    if state.hubs.is_empty() || state.trusted_bots.is_empty() {
+        return false;
+    }
+    let mut rnd = [0u8; NETPROOF_NONCE_HEX / 2];
+    if !crate::crypto::random_bytes(&mut rnd) {
+        return false;
+    }
+    let mut line = String::from("ISON");
+    for t in &state.trusted_bots {
+        let nick = crate::cstr::mask_nick(&t.mask, MAX_NICK);
+        if nick.is_empty() || line.len() + 1 + nick.len() >= 400 {
+            continue;
+        }
+        line.push(' ');
+        line.push_str(nick);
+    }
+    if line.len() == 4 {
+        return false;
+    }
+    state.netproof_nonce = rnd.iter().map(|b| format!("{b:02x}")).collect();
+    state.net_check = 3;
+    state.netproof_deadline = now() + NETPROOF_WAIT;
+    let srv = if state.actual_server_name.is_empty() {
+        "server".to_string()
+    } else {
+        state.actual_server_name.clone()
+    };
+    let (net, expected) = (state.isup.network.clone(), state.pool_net.name.clone());
+    logm!(
+        state,
+        L_INFO,
+        "[POOL] {} says NETWORK={}, expected {}: proving the link through other bots\n",
+        srv,
+        net,
+        expected
+    );
+    ircf!(state, "{}\r\n", line);
+    true
+}
+
+/// 303 RPL_ISON while proving: the trusted bots this server sees.
+pub fn netproof_ison(state: &mut BotState, nicks: &str) {
+    if state.net_check != 3 {
+        return;
+    }
+    let nonce = state.netproof_nonce.clone();
+    let mut sent = 0;
+    for n in nicks.split([' ', ':']).filter(|n| !n.is_empty()) {
+        if sent >= NETPROOF_PEERS {
+            break;
+        }
+        if crate::cstr::irc_eq(n, &state.current_nick) {
+            continue;
+        }
+        crate::bot_comms::send_command_irc(state, n, &format!("NETPROBE {nonce}"));
+        sent += 1;
+    }
+    if sent == 0 {
+        let srv = state.actual_server_name.clone();
+        logm!(
+            state,
+            L_INFO,
+            "[POOL] No trusted bot is visible from {} to prove it\n",
+            srv
+        );
+    }
+}
+
+/// Our own server's NETWORK= is the pool's (not merely proven linked: a
+/// proof never vouches for another).
+fn netcheck_ok_here(state: &BotState) -> bool {
+    !state.isup.network.is_empty()
+        && state.pool_known
+        && pool_rec::net_matches(&state.pool_net, &state.isup.network)
+}
+
+fn nonce_ok(s: &str) -> bool {
+    s.len() == NETPROOF_NONCE_HEX
+        && s.bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+/// A peer asks (over IRC, sealed): WHOIS it, if our own server is verified.
+pub fn netproof_probe(state: &mut BotState, from_nick: &str, nonce: &str) {
+    if !nonce_ok(nonce) || state.net_check != 2 || !netcheck_ok_here(state) {
+        return;
+    }
+    let t = now();
+    state.netprobe_pend.retain(|(_, _, until)| t <= *until);
+    if state.netprobe_pend.len() >= NETPROOF_PEND {
+        return; // busy: the prober asks others too
+    }
+    state.netprobe_pend.push((
+        nonce.to_string(),
+        crate::cstr::trunc_string(from_nick, MAX_NICK),
+        t + NETPROOF_WAIT,
+    ));
+    ircf!(state, "WHOIS {}\r\n", from_nick);
+}
+
+/// 312 RPL_WHOISSERVER: answer a pending probe with the server we see.
+pub fn netproof_whois_server(state: &mut BotState, nick: &str, server: &str) {
+    let mine: Vec<String> = state
+        .netprobe_pend
+        .iter()
+        .filter(|(_, p, until)| *until != 0 && crate::cstr::irc_eq(p, nick))
+        .map(|(n, _, _)| n.clone())
+        .collect();
+    state
+        .netprobe_pend
+        .retain(|(_, p, _)| !crate::cstr::irc_eq(p, nick));
+    for nonce in mine {
+        crate::bot_comms::send_command_irc(state, nick, &format!("NETPROBE-OK {nonce} {server}"));
+    }
+}
+
+/// A peer's answer: our own server, seen from a verified one, is the proof.
+pub fn netproof_ok(state: &mut BotState, nonce: &str, server: Option<&str>, by: &str) {
+    if state.net_check != 3 || !nonce_ok(nonce) || nonce != state.netproof_nonce {
+        return;
+    }
+    let mine = state.actual_server_name.clone();
+    match server {
+        Some(s) if eq_ic(s, &mine) => {}
+        other => {
+            logm!(
+                state,
+                L_INFO,
+                "[POOL] {} sees me on {}, not {}: no proof\n",
+                by,
+                other.unwrap_or("?"),
+                mine
+            );
+            return;
+        }
+    }
+    state.net_check = 2;
+    state.netproof_nonce.clear();
+    let (net, expected) = (state.isup.network.clone(), state.pool_net.name.clone());
+    logm!(
+        state,
+        L_INFO,
+        "[POOL] {} says NETWORK={}; linked to {} (proven by {}): using it\n",
+        mine,
+        net,
+        expected,
+        by
+    );
+    netcheck_report(state, "linked");
+}
+
 fn netcheck_decide(state: &mut BotState) {
     let net = state.isup.network.clone();
     let learned = state.pool_known && !state.pool_net.name.is_empty();
@@ -629,6 +858,7 @@ fn netcheck_decide(state: &mut BotState) {
                 net_id: POOL_DEFAULT_NET.to_string(),
                 label: POOL_DEFAULT_NET.to_string(),
                 name: net.clone(),
+                pace_gap: pool_rec::POOL_PACE_GAP_DEFAULT,
                 ..PoolNet::default()
             };
             state.pool_net_ts = now();
@@ -644,7 +874,17 @@ fn netcheck_decide(state: &mut BotState) {
         }
         return;
     }
-    // The wrong network, or none named once one is known: off at once.
+    // The wrong network, or none named once one is known: prove the link
+    // first when trusted bots can vouch for it, else off at once.
+    if !net.is_empty() && netproof_start(state) {
+        return;
+    }
+    netcheck_hold(state);
+}
+
+/// Off this server for WRONGNET_HOLD: its NETWORK= is not ours, unproven.
+fn netcheck_hold(state: &mut BotState) {
+    let net = state.isup.network.clone();
     let idx = state.irc_server_idx;
     let srv = if state.actual_server_name.is_empty() {
         "server".to_string()
@@ -699,6 +939,18 @@ pub fn netcheck_tick(state: &mut BotState) {
     if state.net_check == 1 && now() >= state.net_check_deadline {
         netcheck_decide(state);
     }
+    if state.net_check == 3 && now() >= state.netproof_deadline {
+        let srv = state.actual_server_name.clone();
+        logm!(
+            state,
+            L_INFO,
+            "[POOL] No trusted bot proved {} linked within {} s\n",
+            srv,
+            NETPROOF_WAIT
+        );
+        state.netproof_nonce.clear();
+        netcheck_hold(state);
+    }
 }
 
 // ---- the IRC link state to the hub (CMD_BOT_IRC_LINK) --------------------
@@ -707,15 +959,22 @@ fn link_send(state: &mut BotState) {
     if state.irc_link.is_empty() {
         return;
     }
+    // 4th field: the server's 005 NETWORK= (bot show), "-" until it is in;
+    // a hub reading three fields stops before it.
     let payload = format!(
-        "{}|{}|{}|",
+        "{}|{}|{}|{}",
         POOL_DEFAULT_NET,
         if state.irc_link_entry.is_empty() {
             "-"
         } else {
             state.irc_link_entry.as_str()
         },
-        state.irc_link
+        state.irc_link,
+        if state.isup.network.is_empty() {
+            "-"
+        } else {
+            state.isup.network.as_str()
+        }
     );
     if payload == state.irc_link_sent {
         return;
@@ -740,102 +999,143 @@ pub fn link_resend(state: &mut BotState) {
     link_send(state);
 }
 
-// ---- load-aware pick (plan §5.3) -----------------------------------------
+// ---- the pick: the order, held slots out, the pace gap --------------------
 
-/// One "%d" of sscanf: optional C whitespace and sign, then digits; the
-/// value and the rest.  Values past i64 saturate (rejected by the caller's
-/// range check).
-fn scan_int(s: &str) -> Option<(i64, &str)> {
-    let (v, used) = strtoll(s);
-    (used > 0).then(|| (v, &s[used..]))
-}
-
-/// "E|<uuid>|<up>|<conn>" as sscanf("%36[0-9a-f-]|%d|%d%c") == 3 reads it.
-fn view_line(line: &str) -> Option<(&str, i64, i64)> {
-    let rest = line.strip_prefix("E|")?;
-    let ul = rest
-        .bytes()
-        .take(POOL_UUID_LEN)
-        .take_while(|&c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c) || c == b'-')
-        .count();
-    if ul == 0 {
-        return None;
-    }
-    let uuid = &rest[..ul];
-    let rest = rest[ul..].strip_prefix('|')?;
-    let (up, rest) = scan_int(rest)?;
-    let rest = rest.strip_prefix('|')?;
-    let (conn, rest) = scan_int(rest)?;
-    rest.is_empty().then_some((uuid, up, conn))
-}
-
-/// CMD_POOL_VIEW: the hub's per-entry load, whole each time.
-pub fn view_apply(state: &mut BotState, payload: &str) {
-    for e in &mut state.pool {
-        e.load_up = 0;
-        e.load_conn = 0;
-    }
-    for line in payload.split('\n') {
-        let ll = line.len();
-        if ll >= POOL_UUID_LEN + 48 || ll <= 2 {
-            continue;
-        }
-        let Some((uuid, up, conn)) = view_line(line) else {
-            continue;
-        };
-        if !(0..=100_000).contains(&up) || !(0..=100_000).contains(&conn) {
-            continue;
-        }
-        if let Some(i) = find(state, uuid) {
-            state.pool[i].load_up = up as i32;
-            state.pool[i].load_conn = conn as i32;
-        }
-    }
-    state.pool_view_at = now();
-}
-
-/// Hub-managed pick: the eligible slot with the lowest load per weight (its
-/// HRW order breaks ties), skipping slots at their max unless all are; None
-/// if every slot is held.  The second value is the earliest hold to end.
+/// The first slot to dial: slots are in dial order (servers_rebuild).  A
+/// slot held by a ban or throttle is out; one dialed less than the R| pace
+/// gap ago is out too (the second value says when the first one is back);
+/// one whose last attempt failed lately goes after every other one.  None =
+/// nothing to dial now.
 pub fn pick_slot(state: &BotState, now: i64) -> (Option<usize>, i64) {
-    let mut best: Option<(usize, i64)> = None;
-    let mut best_over: Option<(usize, i64)> = None;
+    let gap = if state.pool_order_known {
+        i64::from(state.pool_order.gap)
+    } else {
+        0
+    };
+    let mut lagging: Option<usize> = None;
     let mut soonest = 0i64;
-    for i in 0..state.server_list.len().min(state.server_blocks.len()) {
-        let b = &state.server_blocks[i];
+    let n = state.server_list.len().min(state.server_blocks.len());
+    for (i, b) in state.server_blocks.iter().enumerate().take(n) {
         if b.kind == ServerBlockKind::BannedPerm {
             continue;
         }
+        let mut back = 0i64;
         if b.kind != ServerBlockKind::None && b.until > now {
-            if soonest == 0 || b.until < soonest {
-                soonest = b.until;
+            back = b.until;
+        }
+        if gap > 0 && b.last_dial != 0 && now - b.last_dial < gap && b.last_dial + gap > back {
+            back = b.last_dial + gap;
+        }
+        if back != 0 {
+            if soonest == 0 || back < soonest {
+                soonest = back;
             }
             continue;
         }
-        let e = entry_of_slot(state, Some(i)).map(|k| &state.pool[k]);
-        let load = e.map_or(0, |e| i64::from(e.load_up) + i64::from(e.load_conn));
-        let w = e.map_or(1, |e| {
-            if e.s.weight > 0 {
-                i64::from(e.s.weight)
-            } else {
-                1
-            }
-        });
-        // slots are in HRW order: first wins a tie
-        let mut cost = load * 1000 / w;
-        // a slot whose last attempt failed lately goes behind every other one
         if b.last_fail != 0 && now - b.last_fail < POOL_FAIL_AVOID {
-            cost += 1_000_000_000;
+            if lagging.is_none() {
+                lagging = Some(i);
+            }
+            continue;
         }
-        let over = e.is_some_and(|e| e.s.max > 0 && load >= i64::from(e.s.max));
-        if !over && best.is_none_or(|(_, c)| cost < c) {
-            best = Some((i, cost));
-        }
-        if over && best_over.is_none_or(|(_, c)| cost < c) {
-            best_over = Some((i, cost));
-        }
+        return (Some(i), soonest);
     }
-    (best.or(best_over).map(|(i, _)| i), soonest)
+    (lagging, soonest)
+}
+
+/// The hub's new R| order, logged (hub_client.c's 'R' line).
+pub fn log_order(state: &mut BotState) {
+    let o = &state.pool_order;
+    let (n, first, slot, slots, generation) = (
+        o.ids.len(),
+        o.ids[0].clone(),
+        o.slot + 1,
+        o.slots,
+        o.generation,
+    );
+    logm!(
+        state,
+        L_INFO,
+        "[POOL] Server order from the hub: {} server{}, first {}, slot {} of {} (gen {:08x})\n",
+        n,
+        if n == 1 { "" } else { "s" },
+        first,
+        slot,
+        slots,
+        generation
+    );
+}
+
+/// CMD_BOT_MOVE (`server rebalance force`): onto the order's first server
+/// (QUIT + redial); false when already there or there is no order.
+/// bot move <bot> server <s>: go to that pool entry now (one bot, so no
+/// burst); the R| order may move it back at its next rebalance.  C
+/// `pool_move_to_entry`.
+pub fn move_to_entry(state: &mut BotState, entry: &str) -> bool {
+    if state.hubs.is_empty() || entry.is_empty() {
+        return false;
+    }
+    let to = (0..state.server_list.len()).find(|&i| {
+        state.dial_uuid.get(i).is_some_and(|d| d == entry)
+            && state
+                .server_blocks
+                .get(i)
+                .is_none_or(|b| b.kind != ServerBlockKind::BannedPerm)
+    });
+    let Some(to) = to else {
+        return false;
+    };
+    let connected = state.status & S_CONNECTED != 0;
+    if connected && state.irc_server_idx == Some(to) {
+        return false;
+    }
+    let dial = state.server_list[to].clone();
+    logm!(
+        state,
+        L_INFO,
+        "[POOL] Moving to {} (bot move from the hub console)\n",
+        dial
+    );
+    state.current_server_index = to;
+    state.jump_slot1 = to + 1;
+    if connected {
+        ircf!(state, "QUIT :Moving servers\r\n");
+        irc_client::disconnect(state);
+    }
+    true
+}
+
+pub fn move_to_first(state: &mut BotState) -> bool {
+    if state.hubs.is_empty() || !state.pool_order_known || (state.status & S_CONNECTED) == 0 {
+        return false;
+    }
+    let on = state
+        .irc_server_idx
+        .and_then(|c| state.dial_uuid.get(c))
+        .cloned()
+        .unwrap_or_default();
+    // the first entry of the order this bot can dial
+    let to = state.pool_order.ids.iter().find_map(|id| {
+        (0..state.server_list.len()).find(|&i| state.dial_uuid.get(i).is_some_and(|d| d == id))
+    });
+    let Some(to) = to else {
+        return false;
+    };
+    if on == state.dial_uuid[to] {
+        return false;
+    }
+    let dial = state.server_list[to].clone();
+    logm!(
+        state,
+        L_INFO,
+        "[POOL] Rebalance: moving to {}, the first server of my order\n",
+        dial
+    );
+    state.current_server_index = to;
+    state.jump_slot1 = to + 1;
+    ircf!(state, "QUIT :Rebalancing servers\r\n");
+    irc_client::disconnect(state);
+    true
 }
 
 #[cfg(test)]
@@ -852,16 +1152,75 @@ mod tests {
             crate::consts::POOL_S_LINE_MAX_CFG,
             crate::pool_rec::POOL_S_LINE_MAX
         );
+        assert_eq!(
+            crate::consts::POOL_R_LINE_MAX_CFG,
+            crate::pool_rec::POOL_R_LINE_MAX
+        );
+    }
+
+    fn srv(host: &str) -> String {
+        let u = pool_rec::srv_uuid("main", host, 6667).unwrap();
+        format!("{u}|main|{host}|6667|1|0|ok||add")
     }
 
     #[test]
-    fn view_lines() {
-        let u = "60be3bd3-8d40-8411-81ac-96a777cd8710";
-        assert_eq!(view_line(&format!("E|{u}|3|1")), Some((u, 3, 1)));
-        assert_eq!(view_line(&format!("E|{u}| 3|+1")), Some((u, 3, 1)));
-        assert!(view_line(&format!("E|{u}|3|1 ")).is_none());
-        assert!(view_line(&format!("E|{u}|3")).is_none());
-        assert!(view_line("E||3|1").is_none());
+    fn order_ingest_rank_and_cache() {
+        let mut s = BotState::for_test();
+        for h in ["a.x.net", "b.x.net", "c.x.net"] {
+            assert!(ingest_line(&mut s, b'S', &format!("{}|100", srv(h))));
+        }
+        let ids: Vec<String> = ["c.x.net", "a.x.net"]
+            .iter()
+            .map(|h| pool_rec::srv_uuid("main", h, 6667).unwrap())
+            .collect();
+        let mut o = pool_rec::PoolOrder {
+            slot: 0,
+            slots: 1,
+            gap: 15,
+            ids: ids.clone(),
+            ..Default::default()
+        };
+        let v = pool_rec::order_format(&mut o).unwrap();
+        assert!(!ingest_line(&mut s, b'R', "00000000|0|1|15|x|0"));
+        assert!(ingest_line(&mut s, b'R', &format!("{v}|0")));
+        assert!(s.pool_order_known);
+        // the order first, then what it does not name
+        let r: Vec<String> = ranked(&s)
+            .iter()
+            .map(|&i| s.pool[i].s.host.clone())
+            .collect();
+        assert_eq!(r, ["c.x.net", "a.x.net", "b.x.net"]);
+        // cached in the .cnf lines, and read back
+        let lines = format_lines(&s).unwrap();
+        assert!(lines.contains(&format!("R|{v}|0\n")));
+        // a pool refresh keeps the order
+        clear(&mut s);
+        assert!(s.pool_order_known);
+    }
+
+    #[test]
+    fn pick_follows_order_and_pace() {
+        let mut s = BotState::for_test();
+        s.pool_order_known = true;
+        s.pool_order = pool_rec::PoolOrder {
+            slots: 1,
+            gap: 15,
+            ..Default::default()
+        };
+        s.server_list = vec!["a:6667".into(), "b:6667".into(), "c:6667".into()];
+        s.server_blocks = vec![ServerBlock::default(); 3];
+        assert_eq!(pick_slot(&s, 1000), (Some(0), 0));
+        // dialed 5 s ago: out for the pace gap, the next slot instead
+        s.server_blocks[0].last_dial = 995;
+        assert_eq!(pick_slot(&s, 1000), (Some(1), 1010));
+        // a recent failure goes behind every other slot
+        s.server_blocks[1].last_fail = 990;
+        assert_eq!(pick_slot(&s, 1000), (Some(2), 1010));
+        s.server_blocks[2].kind = ServerBlockKind::BannedPerm;
+        assert_eq!(pick_slot(&s, 1000), (Some(1), 1010));
+        // pace 0: no pacing
+        s.pool_order.gap = 0;
+        assert_eq!(pick_slot(&s, 1000).0, Some(0));
     }
 
     #[test]

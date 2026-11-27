@@ -29,7 +29,7 @@ use std::cmp::Ordering;
 use sha2::{Digest, Sha256};
 
 use crate::consts::*;
-use crate::cstr::{Tok, eq_ic, now, trunc, trunc_string};
+use crate::cstr::{Tok, irc_eq, now, trunc, trunc_string};
 use crate::sendq::mono_ms;
 use crate::state::FloodKind;
 use crate::state::{BotState, Chan, ChanStatus, CsetId, JobAct, RosterEntry, S_CONNECTED};
@@ -68,11 +68,11 @@ fn nuh_nick(nuh: &str) -> Option<&str> {
 }
 
 fn is_me(state: &BotState, nick: &str) -> bool {
-    eq_ic(nick, &state.current_nick)
+    irc_eq(nick, &state.current_nick)
 }
 
 fn rfind(c: &Chan, nick: &str) -> Option<usize> {
-    c.roster.iter().position(|r| eq_ic(&r.nick, nick))
+    c.roster.iter().position(|r| irc_eq(&r.nick, nick))
 }
 
 fn rremove(c: &mut Chan, nick: &str) {
@@ -161,7 +161,7 @@ pub fn chan_nuh_authorised(state: &BotState, ci: usize, nuh: &str) -> bool {
     }
     if let Some(c) = state.chans.get(ci)
         && let Some(i) = rfind(c, nick)
-        && eq_ic(&c.roster[i].hostmask, nuh)
+        && irc_eq(&c.roster[i].hostmask, nuh)
     {
         return entry_authorised(state, &c.name, &c.roster[i]);
     }
@@ -204,7 +204,7 @@ pub fn roster_set(
 }
 
 fn live_has_ban(c: &Chan, mask: &str) -> bool {
-    c.bans.iter().any(|b| eq_ic(&b.mask, mask))
+    c.bans.iter().any(|b| irc_eq(&b.mask, mask))
 }
 
 fn cset(state: &BotState, ci: usize, id: CsetId) -> i64 {
@@ -495,7 +495,7 @@ fn track_get(state: &mut BotState, chan: &str, mask: &str, t: i64) -> usize {
             free_slot.get_or_insert(i);
             continue;
         }
-        if eq_ic(&tr.chan, chan) && eq_ic(&tr.mask, mask) {
+        if irc_eq(&tr.chan, chan) && irc_eq(&tr.mask, mask) {
             return i;
         }
         if oldest.is_none_or(|o| tr.last_match < state.ban_track[o].last_match) {
@@ -804,6 +804,12 @@ fn exec_ban_nuh(state: &mut BotState, ci: usize, nuh: &str, reason: &str) {
     {
         return;
     }
+    // a live ban already covers it (the holder's, when this is a backup): no
+    // second one, even if the mask computed now differs (a trust that arrived
+    // meanwhile narrows the type; the placer's reban_narrowed handles that)
+    if c.bans.iter().any(|b| auth::wildcard_match(&b.mask, nuh)) {
+        return;
+    }
     let name = c.name.clone();
     let Some(mask) = auto_ban_mask(state, ci, nuh) else {
         logm!(
@@ -829,16 +835,164 @@ fn exec_ban_nuh(state: &mut BotState, ci: usize, nuh: &str, reason: &str) {
             false,
         );
     }
-    act_ban(
+    let why = if reason.is_empty() {
+        "auto ban"
+    } else {
+        reason
+    };
+    let mut who = String::new();
+    // noted only when this bot sent it: a backup that finds it live is not
+    // its placer and leaves the lifting to the one that is
+    if ban_set(state, ci, &mask, why, &mut who) == BanSet::Sent {
+        auto_ban_note(state, &name, nuh, &mask);
+    }
+}
+
+/// Remember an automatic ban (oldest entry goes when full).
+fn auto_ban_note(state: &mut BotState, chan: &str, nuh: &str, mask: &str) {
+    let mut slot: Option<usize> = None;
+    for (i, a) in state.auto_bans.iter().enumerate() {
+        if !a.chan.is_empty() && irc_eq(&a.chan, chan) && a.mask == mask {
+            slot = Some(i); // the same ban again: refresh
+            break;
+        }
+        let better = match slot {
+            None => true,
+            Some(s) => {
+                let b = &state.auto_bans[s];
+                a.chan.is_empty() || (!b.chan.is_empty() && a.set_ms < b.set_ms)
+            }
+        };
+        if better {
+            slot = Some(i);
+        }
+    }
+    let Some(i) = slot else { return };
+    let bt = chancfg::get(
         state,
-        ci,
-        &mask,
-        if reason.is_empty() {
-            "auto ban"
-        } else {
-            reason
-        },
+        in_chan(state, chan).and_then(|ci| state.chans.get(ci)),
+        CsetId::BanTime,
     );
+    state.auto_bans[i] = crate::state::AutoBan {
+        chan: chan.to_string(),
+        nuh: trunc_string(nuh, MAX_MASK_LEN),
+        mask: trunc_string(mask, BAN_MASK_MAX + 1),
+        set_ms: mono_ms(),
+        expires: if bt > 0 { now() + bt * 60 } else { 0 },
+    };
+}
+
+/// -b of an automatic ban this bot placed, by a bot (by_bot: the unban a
+/// trusted bot's 474 asked for): lifted because it caught that trusted bot,
+/// the offender is banned again with the next safe narrower mask -- the bot's
+/// mask is known now, so auto_ban_mask narrows past it -- keeping the
+/// original expiry.  Lifted by a person, or its B| record deleted (an admin's
+/// `ban del`), or for any other reason: forgotten, as before.
+fn reban_narrowed(state: &mut BotState, ci: usize, lifted: &str, by_bot: bool) {
+    let name = state.chans[ci].name.clone();
+    let Some(i) = state
+        .auto_bans
+        .iter()
+        .position(|a| !a.chan.is_empty() && irc_eq(&a.chan, &name) && a.mask == lifted)
+    else {
+        return;
+    };
+    let deleted = state
+        .cfg_bans
+        .iter()
+        .any(|b| !b.active && b.mask == lifted && (b.chan == "*" || irc_eq(&b.chan, &name)));
+    if !by_bot || deleted {
+        state.auto_bans[i] = crate::state::AutoBan::default();
+        return;
+    }
+    let caught = state
+        .trusted_bots
+        .iter()
+        .find(|t| auth::wildcard_match(lifted, &t.mask))
+        .map(|t| t.mask.clone());
+    let a = state.auto_bans[i].clone();
+    let Some(caught) =
+        caught.filter(|_| (a.expires == 0 || now() < a.expires) && state.chans[ci].i_am_opped)
+    else {
+        state.auto_bans[i] = crate::state::AutoBan::default();
+        return;
+    };
+    let Some(mask) = auto_ban_mask(state, ci, &a.nuh).filter(|m| m != lifted) else {
+        logm!(
+            state,
+            L_INFO,
+            "[BAN] {} in {} caught trusted bot {}; no narrower mask is safe for {}\n",
+            lifted,
+            name,
+            caught,
+            a.nuh
+        );
+        state.auto_bans[i] = crate::state::AutoBan::default();
+        return;
+    };
+    logm!(
+        state,
+        L_INFO,
+        "[BAN] {} in {} caught trusted bot {}: banning {} with {} instead\n",
+        lifted,
+        name,
+        caught,
+        a.nuh,
+        mask
+    );
+    chancfg::bot_ban(state, &name, lifted, 0, None, None, true);
+    if a.expires != 0 {
+        chancfg::bot_ban(
+            state,
+            &name,
+            &mask,
+            a.expires,
+            Some(""),
+            Some("auto ban (narrowed)"),
+            false,
+        );
+    }
+    let mut who = String::new();
+    if ban_set(state, ci, &mask, "auto ban (narrowed)", &mut who) == BanSet::Sent {
+        state.auto_bans[i].mask = trunc_string(&mask, BAN_MASK_MAX + 1);
+    } else {
+        state.auto_bans[i] = crate::state::AutoBan::default();
+    }
+}
+
+/// A bot just became trusted under `mask`: lift the automatic bans this bot
+/// placed on it (its B| record too), see AUTO_BAN_TRACK.
+pub fn trusted_lift(state: &mut BotState, mask: &str) {
+    if mask.is_empty() {
+        return;
+    }
+    let t = mono_ms();
+    for i in 0..state.auto_bans.len() {
+        if state.auto_bans[i].chan.is_empty() {
+            continue;
+        }
+        if t - state.auto_bans[i].set_ms > AUTO_BAN_KEEP_MS {
+            state.auto_bans[i] = crate::state::AutoBan::default();
+            continue;
+        }
+        if !auth::wildcard_match(mask, &state.auto_bans[i].nuh) {
+            continue;
+        }
+        let copy = std::mem::take(&mut state.auto_bans[i]);
+        logm!(
+            state,
+            L_INFO,
+            "[BAN] Lifting my ban {} in {}: {} is a trusted bot\n",
+            copy.mask,
+            copy.chan,
+            copy.nuh
+        );
+        // no-op unless this bot wrote a timed B| record for it
+        chancfg::bot_ban(state, &copy.chan, &copy.mask, 0, None, None, true);
+        if let Some(ci) = in_chan(state, &copy.chan) {
+            act_unban(state, ci, &copy.mask, "trusted bot");
+        }
+    }
 }
 
 fn exec_mode(state: &mut BotState, ci: usize) {
@@ -906,15 +1060,27 @@ fn job_exec(state: &mut BotState, ci: usize, act: JobAct, target: &str, reason: 
     }
 }
 
-/// Hand a piece of work to the election: run it now when this bot holds the
-/// job, otherwise queue it for backup-index x JOB_STEP_MS.  false = this bot
-/// takes no part (not opped / not in the deal) or the queue is full.
 fn job_submit(state: &mut BotState, ci: usize, act: JobAct, target: &str, reason: &str) -> bool {
+    job_submit_held(state, ci, act, target, reason, 0)
+}
+
+/// Hand a piece of work to the election: run it now when this bot holds the
+/// job, otherwise queue it for backup-index x JOB_STEP_MS (+ hold_ms; a held
+/// job waits even for the holder).  false = this bot takes no part (not
+/// opped / not in the deal) or the queue is full.
+fn job_submit_held(
+    state: &mut BotState,
+    ci: usize,
+    act: JobAct,
+    target: &str,
+    reason: &str,
+    hold_ms: i64,
+) -> bool {
     let rank = deal_rank(state, ci, act_job(act));
     if rank < 0 {
         return false;
     }
-    if rank == 0 {
+    if rank == 0 && hold_ms <= 0 {
         job_exec(state, ci, act, target, reason);
         return true;
     }
@@ -925,7 +1091,7 @@ fn job_submit(state: &mut BotState, ci: usize, act: JobAct, target: &str, reason
             slot.get_or_insert(i);
             continue;
         }
-        if j.act == act && eq_ic(&j.chan, &name) && eq_ic(&j.target, target) {
+        if j.act == act && irc_eq(&j.chan, &name) && irc_eq(&j.target, target) {
             return true; // already waiting
         }
     }
@@ -945,6 +1111,7 @@ fn job_submit(state: &mut BotState, ci: usize, act: JobAct, target: &str, reason
         target: trunc_string(target, MAX_MASK_LEN),
         reason: trunc_string(reason, BAN_REASON_MAX + 1),
         created_ms: mono_ms(),
+        hold_ms: hold_ms.max(0),
     };
     true
 }
@@ -953,7 +1120,7 @@ fn job_submit(state: &mut BotState, ci: usize, act: JobAct, target: &str, reason
 fn jobs_drop(state: &mut BotState, ci: usize, act: JobAct) {
     let name = state.chans[ci].name.clone();
     for j in state.jobs.iter_mut() {
-        if j.used && j.act == act && eq_ic(&j.chan, &name) {
+        if j.used && j.act == act && irc_eq(&j.chan, &name) {
             j.used = false;
         }
     }
@@ -979,7 +1146,7 @@ fn jobs_tick(state: &mut BotState) {
         }
         // the limit job comes from each bot's own sweep, up to a sweep apart:
         // its backups give the holder one whole sweep first
-        let mut wait = i64::from(rank) * JOB_STEP_MS;
+        let mut wait = i64::from(rank) * JOB_STEP_MS + state.jobs[i].hold_ms;
         if state.jobs[i].act == JobAct::Limit {
             wait += ENF_SWEEP_SECS * 1000;
         }
@@ -1022,13 +1189,14 @@ pub fn request_deop(state: &mut BotState, chan: &str, nick: &str, reason: &str) 
 
 /// Automatic ban of the host in `nuh` (bantype, bantime, section 6.2
 /// narrowing retry, bot-written B|); `kick_too` also requests the kick for
-/// that nick.
+/// that nick; `hold_ms` delays both, even for the job holder.
 pub fn request_ban(
     state: &mut BotState,
     chan: &str,
     nuh: &str,
     reason: &str,
     kick_too: bool,
+    hold_ms: i64,
 ) -> bool {
     let Some(ci) = in_chan(state, chan) else {
         return false;
@@ -1039,9 +1207,9 @@ pub fn request_ban(
     let Some(nick) = nuh_nick(nuh).filter(|n| valid_nick(state, n)) else {
         return false;
     };
-    let ok = job_submit(state, ci, JobAct::BanNuh, nuh, reason);
+    let ok = job_submit_held(state, ci, JobAct::BanNuh, nuh, reason, hold_ms);
     if kick_too {
-        job_submit(state, ci, JobAct::Kick, nick, reason);
+        job_submit_held(state, ci, JobAct::Kick, nick, reason, hold_ms);
     }
     ok
 }
@@ -1100,7 +1268,7 @@ pub fn admin_ban(state: &mut BotState, chan: &str, mask: &str) -> (bool, String)
     let rec = state
         .cfg_bans
         .iter()
-        .find(|b| b.active && eq_ic(&b.mask, mask) && (b.chan == "*" || eq_ic(&b.chan, &name)));
+        .find(|b| b.active && irc_eq(&b.mask, mask) && (b.chan == "*" || irc_eq(&b.chan, &name)));
     let reason = rec
         .filter(|b| !b.reason.is_empty())
         .map_or_else(|| "banned".to_string(), |b| b.reason.clone());
@@ -1150,7 +1318,7 @@ fn revenge(state: &mut BotState, ci: usize, prefix: &str) {
     if offence(state, &name, prefix) <= 1 {
         job_submit(state, ci, JobAct::Deop, nick, "revenge");
     } else {
-        request_ban(state, &name, prefix, "revenge", true);
+        request_ban(state, &name, prefix, "revenge", true, 0);
     }
 }
 
@@ -1250,7 +1418,7 @@ pub fn on_nick(state: &mut BotState, old_nick: &str, new_nick: &str) {
             Some(mask) => {
                 // a stale entry under the new name -- but a case-only change
                 // (Bob -> bob) names the same entry, which is renamed in place
-                if !eq_ic(old_nick, new_nick) {
+                if !irc_eq(old_nick, new_nick) {
                     rremove(c, new_nick);
                 }
                 if let Some(e) = rfind(c, old_nick) {
@@ -1397,6 +1565,15 @@ fn on_mode_inner(state: &mut BotState, chan: &str, prefix: Option<&str>, modes: 
             }
         } else if ch == b'b' {
             bans_changed = true;
+            if !adding
+                && let Some(a) = a
+                && safe_token(a, BAN_MASK_MAX)
+            {
+                let by_bot = src_me
+                    || (user_src
+                        && prefix.is_some_and(|p| auth::trusted_bot_by_host(state, p).is_some()));
+                reban_narrowed(state, ci, a, by_bot);
+            }
             if adding
                 && let Some(a) = a
                 && rev
@@ -1582,7 +1759,7 @@ fn ban_sweep(state: &mut BotState, ci: usize, t: i64) {
         .cfg_bans
         .iter()
         .filter(|b| !(b.active && !(b.expires > 0 && b.expires <= t)))
-        .filter(|b| b.chan == "*" || eq_ic(&b.chan, &name))
+        .filter(|b| b.chan == "*" || irc_eq(&b.chan, &name))
         .filter(|b| live_has_ban(&state.chans[ci], &b.mask))
         .map(|b| (b.mask.clone(), b.active))
         .collect();
